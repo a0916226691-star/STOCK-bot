@@ -1,14 +1,18 @@
-name: Daily Stock Bot
+name: 台股每日趨勢與資金報告
 
 on:
-  schedule:
-    # 這是排程設定，採用 UTC 時間 (台灣時間減 8 小時)
-    # 預設設定為台灣時間每天早上 09:00 (對應 UTC 01:00)
-    - cron: '0 1 * * *'
-  # 讓你也可以手動執行
   workflow_dispatch:
+  schedule:
+    - cron: "0 11 * * 1-5"
+
+permissions:
+  contents: write
 
 jobs:
+  你原本的工作名稱:
+    runs-on: ubuntu-latest
+
+
   build:
     runs-on: ubuntu-latest
     permissions:
