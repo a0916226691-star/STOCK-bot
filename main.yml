@@ -1,0 +1,35 @@
+name: Daily Stock Bot
+
+on:
+  schedule:
+    # 這是排程設定，採用 UTC 時間 (台灣時間減 8 小時)
+    # 預設設定為台灣時間每天早上 09:00 (對應 UTC 01:00)
+    - cron: '0 1 * * *'
+  # 讓你也可以手動執行
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install yfinance pandas requests
+
+      - name: Run the script
+        env:
+          MAIL_USER: ${{ secrets.MAIL_USER }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+        run: python main.py
