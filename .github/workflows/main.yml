@@ -3,7 +3,7 @@ name: Stock Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 8 * * 1-5'
+    - cron: '0 11 * * 1-5'
 
 jobs:
   run-stock-bot:
