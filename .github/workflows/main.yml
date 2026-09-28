@@ -4,7 +4,7 @@ on:
   push:
     branches: [ main ]
   schedule:
-    - cron: '30 0 * * 1-5'  # 台灣時間週一到週五早上 8:30
+    - cron: '30 0 * * 1-5'
   workflow_dispatch:
 
 jobs:
@@ -18,15 +18,16 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
-          pip install pandas requests yfinance
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests lxml html5lib
 
       - name: Run stock script
         env:
-          MAIL_USER: ${{ secrets.MAIL_USER }}
-          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
-          MAIL_RECEIVER: ${{ secrets.MAIL_RECEIVER }}
-        run: |
-          python 主.py
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        run: python 主.py
