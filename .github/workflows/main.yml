@@ -2,7 +2,7 @@ name: Stock Trading Bot
 
 on:
   schedule:
-    - cron: "7 11 * * 1-5"  # 台灣時間每週一至週五 19:07 自動執行
+    - cron: "7 23 * * 0-4"  # 台灣時間每週一至週五早上 07:07 自動執行（資料最完整）
   workflow_dispatch:        # 保留手動觸發按鈕
 
 permissions:
