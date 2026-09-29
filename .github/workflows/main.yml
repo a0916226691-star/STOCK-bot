@@ -1,32 +1,73 @@
 name: Stock Trading Bot
 
 on:
-  push:
-    branches: [ main ]
   schedule:
-    - cron: '30 0 * * 1-5'
-  workflow_dispatch:
+    - cron: "7 11 * * 1-5"  # 台灣時間每週一至週五 19:07 自動執行
+  workflow_dispatch:        # 保留手動觸發按鈕
+
+permissions:
+  contents: write
 
 jobs:
-  run-bot:
+  run-stock-bot:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Python packages
         run: |
           python -m pip install --upgrade pip
           pip install pandas numpy requests lxml html5lib
+
+      - name: Create output folder
+        run: |
+          mkdir -p output
 
       - name: Run stock script
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
-        run: python 主.py
+        run: |
+          python main.py
+
+      - name: Check generated CSV files
+        if: always()
+        run: |
+          echo "===== output folder ====="
+          ls -lah output || true
+          echo "===== CSV files ====="
+          find output -maxdepth 1 -type f -name "*.csv"
+
+      - name: Save CSV files to GitHub
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "4189282+github-actions[bot]@users.noreply.github.com"
+          
+          git add output/
+          
+          if git diff --cached --quiet; then
+            echo "No CSV changes to save."
+          else
+            git commit -m "Save stock data"
+            git push origin HEAD:${{ github.ref_name }}
+          fi
+
+      - name: Backup output files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stock-bot-output-${{ github.run_number }}
+          path: output/
+          if-no-files-found: warn
+          retention-days: 14
