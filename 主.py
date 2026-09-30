@@ -490,8 +490,8 @@ def fetch_google_alerts(days=3, max_mails=10):
                 except:
                     body_html = str(msg.get_payload())
 
-            combined = body_html + "
-" + body_text
+            combined = body_html + chr(10) + body_text
+
             if not combined:
                 continue
 
