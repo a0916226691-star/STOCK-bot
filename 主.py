@@ -1,26 +1,35 @@
 # -*- coding: utf-8 -*-
 """
-台股主動資金雷達 v5.4 (雲端強固容錯與 API 防禦版)
-v5.3 -> v5.4 更新：
-1. 新增 Session + Referer 反爬蟲策略，解決 GA IP 被 TWSE 擋
-2. TWSE/TPEx 行情雙源備援 (openapi -> open_data)
-3. 新增 TPEx 上櫃法人，補齊 6919 等上櫃股數據
-4. 交易日過濾與舊檔自動清理
-5. 高波動股過熱閾值放寬
+台股主動資金雷達 v5.5 (雲端強固 + Google快訊整合版)
+整合內容：
+- v5.3 原始邏輯保留
+- v5.4 反封鎖 Session + 雙源備援 + TPEx法人 + 交易日過濾
+- v5.5 新增 Gmail IMAP 抓取 Google 快訊，整合進 8 大核心健檢
+需求: pip install pandas numpy requests beautifulsoup4 lxml
 """
 
 import os
 import smtplib
 import time
 import random
+import re
 import traceback
+import imaplib
+import email
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
 import requests
+
+try:
+    from bs4 import BeautifulSoup
+    HAS_BS4 = True
+except ImportError:
+    HAS_BS4 = False
 
 # ==========================================================
 # 0. 基本設定
@@ -32,9 +41,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 GMAIL_USER = os.getenv("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
-FINMIND_TOKEN = os.getenv("FINMIND_TOKEN") # 可選，備援用
 
-# 強化版 Headers，TWSE T86 沒這個一定被擋
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -49,10 +56,13 @@ MIN_TRUST_5D_VOLUME_RATIO = 0.01
 MIN_FOREIGN_5D_VOLUME_RATIO = 0.03
 MAX_HEDGE_5D_VOLUME_RATIO = 0.03
 MAX_HISTORY_FILES = 90
-HIGH_VOLATILITY_STOCKS = {"6919", "4763"} # 生技、材料類放寬過熱標準
+HIGH_VOLATILITY_STOCKS = {"6919", "4763"}
 
-#... 你原本的 FOCUS_STOCKS, FOCUS_PROFILES, THEMES, THEME_MAP, EXCLUDE_TOOL_STOCKS 保持不變...
+# ==========================================================
+# 1. 核心關注清單、題材與排除清單
+# ==========================================================
 FOCUS_STOCKS = ["2383","2368","6197","3293","4763","1808","6919","1503"]
+
 FOCUS_PROFILES = {
     "2383": {"name": "台光電", "theme": "AI伺服器／高速CCL", "valuation": "合理偏高（高成長支撐）", "good_catalyst": "高速材料需求與產品組合", "risk_catalyst": "銅箔、玻纖布等原料成本波動", "rating": "持續研究"},
     "2368": {"name": "金像電", "theme": "AI伺服器／交換器PCB", "valuation": "合理區間", "good_catalyst": "高階伺服器與交換器PCB需求", "risk_catalyst": "產能擴充與客戶拉貨節奏", "rating": "持續研究"},
@@ -63,6 +73,7 @@ FOCUS_PROFILES = {
     "6919": {"name": "康霈", "theme": "生技新藥", "valuation": "高不確定性題材估值", "good_catalyst": "臨床、授權與研發進展", "risk_catalyst": "臨床結果與資金需求風險", "rating": "高風險研究"},
     "1503": {"name": "士電", "theme": "重電／變壓器／綠能", "valuation": "成長型估值", "good_catalyst": "電網投資、外銷訂單與產能", "risk_catalyst": "原物料、交期與評價修正", "rating": "持續研究"},
 }
+
 THEMES = {
     "AI伺服器／ODM": ["2317", "2382", "3231", "6669", "6805"],
     "散熱": ["3017", "3324", "6205", "6131"],
@@ -75,10 +86,11 @@ THEME_MAP = {}
 for theme_name, stock_ids in THEMES.items():
     for stock_id in stock_ids:
         THEME_MAP.setdefault(stock_id, []).append(theme_name)
+
 EXCLUDE_TOOL_STOCKS = {"2330","2454","2308","3711","2881","2882","2884","2886","2891","2892","2880","0050","0056","00878","006208","00919","00929"}
 
 # ==========================================================
-# 2. 共用強固防呆函式 (v5.4 升級)
+# 2. 共用強固防呆函式
 # ==========================================================
 def now_tw(): return datetime.now(TZ)
 def today_str(): return now_tw().strftime("%Y-%m-%d")
@@ -86,6 +98,7 @@ def normalize_stock_id(value):
     text = str(value).strip()
     if text.endswith(".0"): text = text[:-2]
     return text.zfill(4) if text.isdigit() and len(text) < 4 else text
+
 def safe_float(value):
     if value is None: return np.nan
     try:
@@ -95,15 +108,15 @@ def safe_float(value):
         if text.startswith("+"): text = text[1:]
         return float(text)
     except Exception: return np.nan
+
 def safe_int(value):
     number = safe_float(value)
     return np.nan if pd.isna(number) else int(number)
 
 def get_recent_trading_dates(days=20):
-    """只取交易日，跳過六日，減少無效請求"""
     dates, cur = [], now_tw()
     while len(dates) < days:
-        if cur.weekday() < 5: # Mon=0
+        if cur.weekday() < 5:
             dates.append(cur.strftime("%Y%m%d"))
         cur -= timedelta(days=1)
     return dates
@@ -113,7 +126,6 @@ def request_get(url, params=None, timeout=30):
     for attempt in range(4):
         try:
             response = SESSION.get(url, params=params, timeout=timeout)
-            # 關鍵：TWSE 回 403/429 代表被風控
             if response.status_code in (403, 429):
                 wait = 30 + random.uniform(1,5)
                 print(f"⚠️ 被風控 {response.status_code}，等待 {wait:.1f} 秒後重試...")
@@ -132,10 +144,8 @@ def request_json(url, params=None, timeout=30):
     response = request_get(url, params=params, timeout=timeout)
     if not response.text or len(response.text.strip()) < 10:
         raise RuntimeError(f"API 回傳內容完全空白：{url}")
-    # 擋掉被導向到 HTML 驗證頁
     if response.text.strip().startswith("<"):
-        print(f"❌ API 回傳 HTML 非 JSON，疑似被擋！網址：{url}")
-        print(f"📄 預覽：{response.text[:200]}")
+        print(f"❌ API 回傳 HTML 非 JSON，疑似被擋！網址：{url} 預覽：{response.text[:200]}")
         raise RuntimeError("回傳 HTML，可能被防火牆阻擋")
     try:
         return response.json()
@@ -152,7 +162,7 @@ def cleanup_old_files(prefix):
     except Exception: pass
 
 # ==========================================================
-# 3. 行情 - 雙源備援
+# 3. 行情（雙源備援）
 # ==========================================================
 def _parse_twse_openapi(data):
     rows=[]
@@ -160,7 +170,15 @@ def _parse_twse_openapi(data):
         stock_id = normalize_stock_id(item.get("Code", ""))
         close = safe_float(item.get("ClosingPrice"))
         if not stock_id.isdigit() or len(stock_id)!=4 or pd.isna(close): continue
-        rows.append({"stock_id": stock_id, "stock_name": str(item.get("Name","")).strip(), "market": "TWSE", "close": close, "change": safe_float(item.get("Change")), "volume": safe_int(item.get("TradeVolume")), "turnover": safe_float(item.get("TradeValue"))})
+        rows.append({
+            "stock_id": stock_id,
+            "stock_name": str(item.get("Name","")).strip(),
+            "market": "TWSE",
+            "close": close,
+            "change": safe_float(item.get("Change")),
+            "volume": safe_int(item.get("TradeVolume")),
+            "turnover": safe_float(item.get("TradeValue")),
+        })
     return pd.DataFrame(rows)
 
 def get_twse_quotes_primary():
@@ -169,6 +187,7 @@ def get_twse_quotes_primary():
     data = request_json(url)
     df = _parse_twse_openapi(data)
     if df.empty: raise RuntimeError("TWSE 主源解析後為空")
+    print(f"TWSE 主源完成：{len(df)} 檔")
     return df
 
 def get_twse_quotes_backup():
@@ -177,6 +196,7 @@ def get_twse_quotes_backup():
     data = request_json(url)
     df = _parse_twse_openapi(data)
     if df.empty: raise RuntimeError("TWSE 備援解析後為空")
+    print(f"TWSE 備援完成：{len(df)} 檔")
     return df
 
 def get_twse_quotes():
@@ -191,12 +211,21 @@ def get_tpex_quotes():
     data = request_json(url)
     rows=[]
     for item in data:
-        stock_id = normalize_stock_id(item.get("SecuritiesCompanyCode") or item.get("SecuritiesCode") or "")
-        close = safe_float(item.get("Close"))
+        stock_id = normalize_stock_id(item.get("SecuritiesCompanyCode") or item.get("SecuritiesCode") or item.get("Code") or "")
+        close = safe_float(item.get("Close") or item.get("ClosingPrice"))
         if not stock_id.isdigit() or len(stock_id)!=4 or pd.isna(close): continue
-        rows.append({"stock_id": stock_id, "stock_name": str(item.get("CompanyName") or "").strip(), "market": "TPEx", "close": close, "change": safe_float(item.get("Change")), "volume": safe_int(item.get("Volume")), "turnover": safe_float(item.get("Amount"))})
+        rows.append({
+            "stock_id": stock_id,
+            "stock_name": str(item.get("CompanyName") or item.get("SecuritiesName") or "").strip(),
+            "market": "TPEx",
+            "close": close,
+            "change": safe_float(item.get("Change")),
+            "volume": safe_int(item.get("Volume")),
+            "turnover": safe_float(item.get("Amount")),
+        })
     df = pd.DataFrame(rows)
     if df.empty: raise RuntimeError("TPEx 行情解析後為空")
+    print(f"TPEx 行情完成：{len(df)} 檔")
     return df
 
 def get_all_quotes():
@@ -213,7 +242,7 @@ def get_all_quotes():
     return quotes.drop_duplicates(subset=["stock_id"], keep="first")
 
 # ==========================================================
-# 4. 法人 - 上市 + 上櫃 合併
+# 4. 法人資料 (上市+上櫃)
 # ==========================================================
 def get_twse_institutional():
     print("取得 TWSE 法人資料...")
@@ -237,7 +266,14 @@ def get_twse_institutional():
         item=dict(zip(fields,r))
         sid=normalize_stock_id(item.get("證券代號",""))
         if not sid.isdigit() or len(sid)!=4: continue
-        rows.append({"stock_id": sid, "date": fmt_date, "foreign_net": safe_int(item.get("外陸資買賣超股數(不含外資自營商)")), "trust_net": safe_int(item.get("投信買賣超股數")), "dealer_proprietary_net": safe_int(item.get(prop_col)) if prop_col else np.nan, "dealer_hedge_net": safe_int(item.get(hedge_col)) if hedge_col else np.nan, "hedge_data_available": hedge_col is not None})
+        rows.append({
+            "stock_id": sid, "date": fmt_date,
+            "foreign_net": safe_int(item.get("外陸資買賣超股數(不含外資自營商)")),
+            "trust_net": safe_int(item.get("投信買賣超股數")),
+            "dealer_proprietary_net": safe_int(item.get(prop_col)) if prop_col else np.nan,
+            "dealer_hedge_net": safe_int(item.get(hedge_col)) if hedge_col else np.nan,
+            "hedge_data_available": hedge_col is not None
+        })
     df=pd.DataFrame(rows)
     for c in ["foreign_net","trust_net","dealer_proprietary_net","dealer_hedge_net"]:
         df[c]=pd.to_numeric(df[c], errors="coerce")
@@ -246,7 +282,6 @@ def get_twse_institutional():
 
 def get_tpex_institutional():
     print("取得 TPEx 上櫃法人資料...")
-    # TPEx 使用民國年
     rows=[]
     for date_code in get_recent_trading_dates(10):
         try:
@@ -257,13 +292,16 @@ def get_tpex_institutional():
             result = request_json(url, params={"l":"zh-tw","o":"json","se":"AL","t":"D","d":roc_date}, timeout=20)
             if not result.get("aaData"): continue
             for r in result["aaData"]:
-                # aaData 是 list, 依官方文件：0=代號, 1=名稱, 外資, 投信...
-                # 為了容錯用關鍵字抓欄位
                 sid = normalize_stock_id(r[0])
                 if not sid.isdigit() or len(sid)!=4: continue
-                # TPEx 欄位順序常變，嘗試抓
-                # 根據 2024 版： [代號, 名稱, 外資及陸資買賣超, 投信買賣超, 自營商(自行), 自營商(避險), 三大法人合計]
-                rows.append({"stock_id": sid, "date": f"{date_code[:4]}-{date_code[4:6]}-{date_code[6:]}", "foreign_net": safe_int(r[2]), "trust_net": safe_int(r[3]), "dealer_hedge_net": safe_int(r[5]) if len(r)>5 else np.nan, "hedge_data_available": True})
+                rows.append({
+                    "stock_id": sid,
+                    "date": f"{date_code[:4]}-{date_code[4:6]}-{date_code[6:]}",
+                    "foreign_net": safe_int(r[2]),
+                    "trust_net": safe_int(r[3]),
+                    "dealer_hedge_net": safe_int(r[5]) if len(r)>5 else np.nan,
+                    "hedge_data_available": True
+                })
             if rows: break
         except Exception as e:
             print(f"TPEx {date_code} 失敗 {e}")
@@ -287,7 +325,7 @@ def get_all_institutional():
     return pd.concat(frames, ignore_index=True).drop_duplicates(subset=["stock_id","date"], keep="last")
 
 # ==========================================================
-# 5,6,7 後面分類、報告、寄信沿用你 v5.3 邏輯，僅微調過熱判斷
+# 5. 歷史與特徵
 # ==========================================================
 def load_history(prefix):
     filenames = sorted([f for f in os.listdir(OUTPUT_DIR) if f.startswith(prefix) and f.endswith(".csv")])[-MAX_HISTORY_FILES:]
@@ -331,7 +369,6 @@ def make_price_features(quotes, history, date_text):
     return full.loc[full["date"]==date_text, ["stock_id","ma10","ma20","return_5d_pct","range_10d_pct","avg_volume_5d","volume_ratio_5d","distance_ma10_pct","distance_ma20_pct"]].copy()
 
 def make_institutional_features(history, price_features):
-    # 沿用 v5.3 邏輯
     output_columns=["stock_id","trust_buy_days_5","trust_5d_net","foreign_buy_days_5","foreign_5d_net","dealer_hedge_5d_abs","trust_volume_ratio","foreign_volume_ratio","hedge_volume_ratio","hedge_data_status","hedge_dominant","trust_accumulation","foreign_support","trust_20d_net","foreign_20d_net","trust_buy_days_20","foreign_buy_days_20","institutional_days_20","midterm_inflow_to_verify"]
     if history is None or history.empty: return pd.DataFrame(columns=output_columns)
     df=history.copy()
@@ -371,6 +408,85 @@ def make_institutional_features(history, price_features):
         rows.append({"stock_id":stock_id,"trust_buy_days_5":trust_buy_5,"trust_5d_net":trust_5d,"foreign_buy_days_5":foreign_buy_5,"foreign_5d_net":foreign_5d,"dealer_hedge_5d_abs":hedge_abs,"trust_volume_ratio":trust_vr,"foreign_volume_ratio":foreign_vr,"hedge_volume_ratio":hedge_vr,"hedge_data_status":hedge_status,"hedge_dominant":hedge_dom,"trust_accumulation":trust_acc,"foreign_support":foreign_sup,"trust_20d_net":trust_20d,"foreign_20d_net":foreign_20d,"trust_buy_days_20":trust_buy_20,"foreign_buy_days_20":foreign_buy_5,"institutional_days_20":inst_days_20,"midterm_inflow_to_verify":midterm})
     return pd.DataFrame(rows, columns=output_columns)
 
+# ==========================================================
+# 6. Google 快訊整合 (v5.5 新增)
+# ==========================================================
+def fetch_google_alerts(days=3, max_mails=5):
+    if not all([GMAIL_USER, GMAIL_APP_PASSWORD]):
+        print("未設定 Gmail，跳過 Google 快訊")
+        return {}
+    alerts_by_stock = defaultdict(list)
+    risk_keywords = ["資安","入侵","重訊","重大","減資","違約","處置","警示","下市","搜索","檢調"]
+
+    try:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+        mail.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        mail.select("INBOX")
+        since_date = (now_tw() - timedelta(days=days)).strftime("%d-%b-%Y")
+        status, data = mail.search(None, f'(FROM "googlealerts-noreply@google.com" SINCE "{since_date}")')
+        if status != "OK" or not data[0]:
+            print("找不到 Google 快訊郵件")
+            mail.logout()
+            return {}
+        mail_ids = data[0].split()[-max_mails:]
+        print(f"找到 {len(mail_ids)} 封 Google 快訊，解析中...")
+
+        for mid in reversed(mail_ids):
+            _, msg_data = mail.fetch(mid, "(RFC822)")
+            msg = email.message_from_bytes(msg_data[0][1])
+            body_html = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/html":
+                        body_html = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", errors="ignore")
+                        break
+            else:
+                try:
+                    body_html = msg.get_payload(decode=True).decode(msg.get_content_charset() or "utf-8", errors="ignore")
+                except: 
+                    body_html = str(msg.get_payload())
+
+            if not body_html: continue
+
+            links = []
+            if HAS_BS4:
+                soup = BeautifulSoup(body_html, "html.parser")
+                for a in soup.find_all("a", href=True):
+                    title = a.get_text(strip=True)
+                    href = a["href"]
+                    if len(title) < 8 or "google.com/alerts" in href or "取消訂閱" in title or "googlealerts" in href:
+                        continue
+                    links.append((title, href))
+            else:
+                # fallback regex
+                for m in re.finditer(r'<a[^>]+href="([^"]+)"[^>]*>([^<]+)</a>', body_html):
+                    href, title = m.group(1), m.group(2).strip()
+                    if len(title) >= 8:
+                        links.append((title, href))
+
+            for title, href in links:
+                for sid in FOCUS_STOCKS:
+                    sname = FOCUS_PROFILES.get(sid, {}).get("name","")
+                    if sid in title or (sname and sname in title):
+                        level = "高風險" if any(k in title for k in risk_keywords) else "中性"
+                        alerts_by_stock[sid].append({"title": title, "link": href, "level": level})
+        mail.logout()
+    except Exception as e:
+        print(f"⚠️ Google 快訊抓取失敗: {e}")
+        return {}
+
+    for sid in list(alerts_by_stock.keys()):
+        seen=set(); uniq=[]
+        for item in alerts_by_stock[sid]:
+            if item["title"] not in seen:
+                uniq.append(item); seen.add(item["title"])
+        alerts_by_stock[sid]=uniq[:3]
+    print(f"Google 快訊分類完成：{ {k:len(v) for k,v in alerts_by_stock.items()} }")
+    return alerts_by_stock
+
+# ==========================================================
+# 7. 分類與雷達
+# ==========================================================
 def classify_stock(row):
     stock_id=row["stock_id"]
     if stock_id in EXCLUDE_TOOL_STOCKS: return "⚪ 排除：權值／ETF／工具股","高權值或工具型流量，不納入雷達。",-5
@@ -379,7 +495,6 @@ def classify_stock(row):
     trust_5d_net=float(row.get("trust_5d_net",0) or 0); foreign_5d_net=float(row.get("foreign_5d_net",0) or 0); trust_buy_days_5=int(row.get("trust_buy_days_5",0) or 0)
     trust_accumulation=bool(row.get("trust_accumulation",False)); foreign_support=bool(row.get("foreign_support",False)); midterm_inflow=bool(row.get("midterm_inflow_to_verify",False))
     turnover=safe_float(row.get("turnover", np.nan)); liquid=not pd.isna(turnover) and turnover>=MIN_DAILY_TURNOVER
-    # v5.4 放寬高波動
     overheat_limit = 18 if stock_id in HIGH_VOLATILITY_STOCKS else 10
     if not pd.isna(return_5d) and return_5d > overheat_limit: return "🔴 排除：拉高／過熱",f"5日漲幅超過{overheat_limit}%，不符合盤整吸籌。",-3
     if not pd.isna(volume_ratio) and volume_ratio>2.0 and not pd.isna(return_5d) and return_5d>3: return "🔴 排除：拉高／過熱","爆量且股價走強，不符合盤整吸籌。",-3
@@ -415,7 +530,9 @@ def build_radar(quotes, price_features, institutional_features):
     df["sort_order"]=df["signal"].map(signal_order).fillna(99)
     return df.sort_values(["sort_order","score","turnover"], ascending=[True, False, False], na_position="last").drop(columns=["sort_order"])
 
-# 報告與寄信沿用 v5.3
+# ==========================================================
+# 8. 報告與寄信
+# ==========================================================
 def fmt_price(v): return "-" if pd.isna(v) else f"{float(v):.2f}"
 def fmt_pct(v): return "累積中" if pd.isna(v) else f"{float(v):+.1f}%"
 def fmt_ratio(v): return "待驗證" if pd.isna(v) else f"{float(v)*100:.2f}%"
@@ -424,18 +541,41 @@ def fmt_shares(v):
     v=int(v)
     return f"{v/1000:+.1f} 張" if abs(v)>=1000 else f"{v:+,} 股"
 
-def make_focus_report(radar):
-    lines=["="*54,"⭐ 8大核心持股研究健檢","="*54]
-    for sid in FOCUS_STOCKS:
-        profile=FOCUS_PROFILES.get(sid,{}); name=profile.get("name",sid)
-        match=radar[radar["stock_id"]==sid]
+def make_focus_report(radar, alerts_dict=None):
+    if alerts_dict is None: alerts_dict={}
+    lines=["="*54, "⭐ 8大核心持股研究健檢 + Google快訊", "="*54]
+    for stock_id in FOCUS_STOCKS:
+        profile=FOCUS_PROFILES.get(stock_id, {})
+        name=profile.get("name", stock_id)
+        theme=profile.get("theme","未分類")
+        valuation=profile.get("valuation","-")
+        good_catalyst=profile.get("good_catalyst","-")
+        risk_catalyst=profile.get("risk_catalyst","-")
+        rating=profile.get("rating","持續研究")
+        match=radar[radar["stock_id"]==stock_id]
         if match.empty:
-            lines.append(f"• {sid} {name}｜未取得當日行情"); lines.append("-"*54); continue
+            lines.append(f"• {stock_id} {name}｜未取得當日行情")
+            lines.append("-"*54)
+            continue
         row=match.iloc[0]
-        lines.append(f"• {sid} {name}｜產業：{profile.get('theme','未分類')}")
-        lines.append(f" 收盤：{fmt_price(row.get('close',np.nan))}｜月線乖離：{fmt_pct(row.get('distance_ma20_pct',np.nan))}")
-        lines.append(f" 估值備忘：{profile.get('valuation','-')}")
-        lines.append(f" 即時雷達：{row.get('signal','-')}｜投信5日：{fmt_shares(row.get('trust_5d_net',np.nan))}")
+        lines.append(f"• {stock_id} {name}｜產業：{theme}")
+        lines.append(f"  收盤：{fmt_price(row.get('close', np.nan))}｜月線乖離：{fmt_pct(row.get('distance_ma20_pct', np.nan))}")
+        lines.append(f"  估值備忘：{valuation}")
+        lines.append(f"  題材：{good_catalyst}")
+        lines.append(f"  風險：{risk_catalyst}")
+        lines.append(f"  即時雷達：{row.get('signal','-')}｜投信5日：{fmt_shares(row.get('trust_5d_net',np.nan))}")
+        alerts = alerts_dict.get(stock_id, [])
+        if alerts:
+            lines.append(f"  📰 Google快訊 [{len(alerts)}則]：")
+            for al in alerts:
+                icon = "⚠️" if al["level"]=="高風險" else "•"
+                lines.append(f"  {icon} [{al['level']}] {al['title'][:50]}")
+                if al["level"]=="高風險":
+                    lines.append(f"    風控提醒：{al['title'][:40]}... 需確認重訊/資安")
+                lines.append(f"    連結：{al['link'][:80]}")
+        else:
+            lines.append(f"  📰 Google快訊：近2日無新快訊")
+        lines.append(f"  研究標籤：{rating}")
         lines.append("-"*54)
     return "\n".join(lines)
 
@@ -446,53 +586,89 @@ def stock_lines(frame, maximum):
         focus_mark=" ⭐" if bool(row.get("is_focus_stock",False)) else ""
         hedge_text=fmt_ratio(row.get("hedge_volume_ratio",np.nan)) if row.get("hedge_data_status")=="available" else "資料未取得"
         lines.append(f"{row['signal']}{focus_mark}｜{row['stock_id']} {row['stock_name']}｜{row['market']}｜收盤 {fmt_price(row['close'])}｜{row.get('theme','')}")
-        lines.append(f" 投信5日 {fmt_shares(row.get('trust_5d_net',np.nan))}（{int(row.get('trust_buy_days_5',0) or 0)}日買）｜外資5日 {fmt_shares(row.get('foreign_5d_net',np.nan))}")
-        lines.append(f" 5日 {fmt_pct(row.get('return_5d_pct',np.nan))}｜距MA20 {fmt_pct(row.get('distance_ma20_pct',np.nan))}｜避險相對量 {hedge_text}")
-        lines.append(f" 判定：{row['reason']}\n")
+        lines.append(f"  投信5日 {fmt_shares(row.get('trust_5d_net',np.nan))}（{int(row.get('trust_buy_days_5',0) or 0)}日買）｜投信20日 {fmt_shares(row.get('trust_20d_net',np.nan))}｜外資5日 {fmt_shares(row.get('foreign_5d_net',np.nan))}")
+        lines.append(f"  5日 {fmt_pct(row.get('return_5d_pct',np.nan))}｜10日振幅 {fmt_pct(row.get('range_10d_pct',np.nan))}｜距MA20 {fmt_pct(row.get('distance_ma20_pct',np.nan))}｜避險相對量 {hedge_text}")
+        lines.append(f"  判定：{row['reason']}\n")
     return "\n".join(lines).rstrip()
 
-def make_email_body(radar, date_text, execution_time):
-    focus_report=make_focus_report(radar)
-    purple=radar[radar["signal"]=="🟣 中期資金流入待驗證"]; blue=radar[radar["signal"]=="🔵 主動資金疑似布局"]; green=radar[radar["signal"]=="🟢 吸籌延續／初步確認"]
-    yellow=radar[radar["signal"].str.startswith("🟡", na=False)]; red=radar[radar["signal"].str.startswith("🔴", na=False)]; orange=radar[radar["signal"]=="🟠 排除：避險流量主導"]
-    lines=["台股主動資金雷達與風控觀察報告 v5.4",f"日期：{date_text}",f"執行時間：{execution_time}（台灣時間）","",focus_report,"","="*54,f"🟢 吸籌延續｜{len(green)} 檔","="*54,stock_lines(green,10),"","="*54,f"🔵 主動布局｜{len(blue)} 檔","="*54,stock_lines(blue,10),"","="*54,f"🟣 中期流入｜{len(purple)} 檔","="*54,stock_lines(purple,10),"","="*54,f"🟡 轉弱｜{len(yellow)} 檔","="*54,stock_lines(yellow,10),"","="*54,f"🔴 排除｜{len(red)} 檔","="*54,stock_lines(red,15),"","="*54,f"🟠 避險主導｜{len(orange)} 檔","="*54,stock_lines(orange,10),"","提醒：本報告為公開資料研究工具，不構成投資建議。"]
+def make_email_body(radar, date_text, execution_time, alerts_dict=None):
+    focus_report=make_focus_report(radar, alerts_dict)
+    purple=radar[radar["signal"]=="🟣 中期資金流入待驗證"]
+    blue=radar[radar["signal"]=="🔵 主動資金疑似布局"]
+    green=radar[radar["signal"]=="🟢 吸籌延續／初步確認"]
+    yellow=radar[radar["signal"].str.startswith("🟡", na=False)]
+    red=radar[radar["signal"].str.startswith("🔴", na=False)]
+    orange=radar[radar["signal"]=="🟠 排除：避險流量主導"]
+    lines=[
+        "台股主動資金雷達與風控觀察報告 v5.5",
+        f"日期：{date_text}",
+        f"執行時間：{execution_time}（台灣時間）",
+        "",
+        focus_report,
+        "",
+        "="*54, f"🟢 吸籌延續／初步確認｜{len(green)} 檔", "="*54, stock_lines(green, 10),
+        "", "="*54, f"🔵 主動資金疑似布局｜{len(blue)} 檔", "="*54, stock_lines(blue, 10),
+        "", "="*54, f"🟣 中期資金流入待驗證｜{len(purple)} 檔", "="*54, stock_lines(purple, 10),
+        "", "="*54, f"🟡 轉弱／籌碼鬆動｜{len(yellow)} 檔", "="*54, stock_lines(yellow, 10),
+        "", "="*54, f"🔴 排除｜{len(red)} 檔", "="*54, stock_lines(red, 15),
+        "", "="*54, f"🟠 避險主導｜{len(orange)} 檔", "="*54, stock_lines(orange, 10),
+        "", "提醒：本報告為公開資料研究工具 + Google快訊整合，不構成投資建議。",
+    ]
     return "\n".join(lines)
 
 def send_email(subject, body):
     if not all([GMAIL_USER, GMAIL_APP_PASSWORD, RECIPIENT_EMAIL]):
-        print("未設定 Gmail Secrets，略過寄信"); return
-    msg=MIMEMultipart(); msg["From"]=GMAIL_USER; msg["To"]=RECIPIENT_EMAIL; msg["Subject"]=subject
-    msg.attach(MIMEText(body, "plain", "utf-8"))
+        print("未設定 Gmail Secrets，略過寄信；CSV 仍會正常產生。")
+        return
+    message=MIMEMultipart(); message["From"]=GMAIL_USER; message["To"]=RECIPIENT_EMAIL; message["Subject"]=subject
+    message.attach(MIMEText(body, "plain", "utf-8"))
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(GMAIL_USER, GMAIL_APP_PASSWORD); server.send_message(msg)
+        server.login(GMAIL_USER, GMAIL_APP_PASSWORD); server.send_message(message)
     print("Email 寄送完成。")
 
 def main():
     now=now_tw(); date_text=now.strftime("%Y-%m-%d")
-    print("="*60); print(f"開始執行台股主動資金雷達 v5.4：{date_text}"); print("="*60)
-    try: quotes=get_all_quotes(); print(f"成功取得行情：{len(quotes)} 檔。")
+    print("="*60); print(f"開始執行台股主動資金雷達 v5.5：{date_text}"); print("="*60)
+    try:
+        quotes=get_all_quotes(); print(f"成功取得行情：{len(quotes)} 檔。")
     except Exception as error:
         print(f"❌ 無法取得任何市場行情，終止本次執行: {error}"); raise
-    try: institutional_today=get_all_institutional()
+    try:
+        institutional_today=get_all_institutional()
     except Exception as error:
-        print(f"⚠️ 法人資料取得失敗：{error}"); institutional_today=pd.DataFrame()
-    price_history=load_history("layout_price_history_"); inst_history=load_history("layout_institutional_history_")
-    if not institutional_today.empty: inst_history=pd.concat([inst_history, institutional_today], ignore_index=True)
+        print(f"⚠️ 法人資料取得失敗，今天略過法人計算：{error}"); institutional_today=pd.DataFrame()
+
+    # Google 快訊 (v5.5 新增)
+    try:
+        alerts_dict = fetch_google_alerts(days=2, max_mails=5)
+    except Exception as e:
+        print(f"快訊模組異常 {e}"); alerts_dict={}
+
+    price_history=load_history("layout_price_history_")
+    institutional_history=load_history("layout_institutional_history_")
+    if not institutional_today.empty:
+        institutional_history=pd.concat([institutional_history, institutional_today], ignore_index=True)
+
     price_features=make_price_features(quotes, price_history, date_text)
-    institutional_features=make_institutional_features(inst_history, price_features)
+    institutional_features=make_institutional_features(institutional_history, price_features)
     radar=build_radar(quotes, price_features, institutional_features)
+
     save_today_history(quotes, institutional_today, date_text)
     radar_path=os.path.join(OUTPUT_DIR, f"layout_radar_{date_text}.csv")
     radar.to_csv(radar_path, index=False, encoding="utf-8-sig")
     print(f"雷達 CSV 已輸出：{radar_path}")
-    body=make_email_body(radar, date_text, now.strftime("%Y-%m-%d %H:%M"))
-    print("\n"+body+"\n")
-    send_email(f"主動資金雷達 v5.4｜{date_text}", body)
+
+    body=make_email_body(radar, date_text, now.strftime("%Y-%m-%d %H:%M"), alerts_dict)
+    print("\n"+"="*60); print(body); print("="*60+"\n")
+    send_email(f"主動資金雷達 v5.5｜{date_text}", body)
+    print("執行完成。")
 
 if __name__ == "__main__":
-    try: main()
+    try:
+        main()
     except Exception:
-        err=traceback.format_exc(); print(err)
-        try: send_email(f"【錯誤】主動資金雷達 v5.4｜{today_str()}", err)
+        error_text=traceback.format_exc()
+        print("\n程式發生錯誤："); print(error_text)
+        try: send_email(f"【錯誤】主動資金雷達 v5.5｜{today_str()}", error_text)
         except Exception: pass
         raise
