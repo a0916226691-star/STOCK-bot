@@ -13,6 +13,7 @@ import smtplib
 import time
 import random
 import re
+import html
 import traceback
 import imaplib
 import email
@@ -23,7 +24,8 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
-import requests
+import re
+import htmlquests
 
 try:
     from bs4 import BeautifulSoup
@@ -408,135 +410,52 @@ def make_institutional_features(history, price_features):
         rows.append({"stock_id":stock_id,"trust_buy_days_5":trust_buy_5,"trust_5d_net":trust_5d,"foreign_buy_days_5":foreign_buy_5,"foreign_5d_net":foreign_5d,"dealer_hedge_5d_abs":hedge_abs,"trust_volume_ratio":trust_vr,"foreign_volume_ratio":foreign_vr,"hedge_volume_ratio":hedge_vr,"hedge_data_status":hedge_status,"hedge_dominant":hedge_dom,"trust_accumulation":trust_acc,"foreign_support":foreign_sup,"trust_20d_net":trust_20d,"foreign_20d_net":foreign_20d,"trust_buy_days_20":trust_buy_20,"foreign_buy_days_20":foreign_buy_5,"institutional_days_20":inst_days_20,"midterm_inflow_to_verify":midterm})
     return pd.DataFrame(rows, columns=output_columns)
 
-# ==========================================================
-# 6. Google 快訊整合 (v5.5 新增)
-# ==========================================================
-# v5.5.1 修補：只替換 fetch_google_alerts 函式即可
-import imaplib
-import email
-from collections import defaultdict
-import re
 
-def fetch_google_alerts(days=3, max_mails=10):
-    if not all([GMAIL_USER, GMAIL_APP_PASSWORD]):
-        print("未設定 Gmail，跳過 Google 快訊")
+# ==========================================================
+# 6. Google 快訊整合 (v5.6 RSS直連 + 模糊比對)
+# ==========================================================
+def get_rss_urls_from_env():
+    raw = os.getenv("GOOGLE_ALERTS_RSS") or os.getenv("GOOGLE_ALERTS_RSS_URLS") or ""
+    urls = []
+    for part in raw.replace("\n", ",").split(","):
+        u = part.strip()
+        if u.startswith("http"):
+            urls.append(u)
+    return urls
+
+def fetch_google_alerts_rss():
+    urls = get_rss_urls_from_env()
+    if not urls:
         return {}
     alerts_by_stock = defaultdict(list)
-    risk_keywords = ["資安","入侵","重訊","重大","減資","違約","處置","警示","下市","搜索","檢調","火災","裁罰"]
-
-    try:
-        print(f"連線 Gmail IMAP: {GMAIL_USER}")
-        mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
-        mail.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-        mail.select("INBOX")
-
-        # 改用更寬鬆的搜尋：先抓全部，再手動過濾，避免 SINCE 語系問題
-        # 先試精準搜尋，失敗就 fallback 到全部
-        search_queries = [
-            '(FROM "googlealerts-noreply@google.com")',
-            'FROM "googlealerts"',
-            'SUBJECT "Google"',
-            'SUBJECT "快訊"',
-        ]
-        mail_ids = []
-        for q in search_queries:
-            try:
-                status, data = mail.search(None, q)
-                if status == "OK" and data[0]:
-                    mail_ids = data[0].split()
-                    if mail_ids:
-                        print(f"用條件 {q} 找到 {len(mail_ids)} 封")
-                        break
-            except Exception as e:
-                print(f"搜尋 {q} 失敗 {e}")
-                continue
-
-        if not mail_ids:
-            print("完全找不到 Google 快訊郵件，請確認 Gmail 有收到")
-            mail.logout()
-            return {}
-
-        # 只取最近 10 封，避免抓太多
-        mail_ids = mail_ids[-max_mails:]
-        print(f"開始解析最近 {len(mail_ids)} 封...")
-
-        for mid in reversed(mail_ids):
-            _, msg_data = mail.fetch(mid, "(RFC822)")
-            msg = email.message_from_bytes(msg_data[0][1])
-            subject = str(email.header.make_header(email.header.decode_header(msg.get("Subject",""))))
-            print(f"解析郵件: {subject[:60]}")
-
-            body_html = ""
-            body_text = ""
-            if msg.is_multipart():
-                for part in msg.walk():
-                    ctype = part.get_content_type()
-                    try:
-                        payload = part.get_payload(decode=True)
-                        if not payload: continue
-                        charset = part.get_content_charset() or "utf-8"
-                        decoded = payload.decode(charset, errors="ignore")
-                        if ctype == "text/html":
-                            body_html = decoded
-                        elif ctype == "text/plain":
-                            body_text = decoded
-                    except:
-                        continue
-            else:
-                try:
-                    payload = msg.get_payload(decode=True)
-                    if payload:
-                        body_html = payload.decode(msg.get_content_charset() or "utf-8", errors="ignore")
-                except:
-                    body_html = str(msg.get_payload())
-
-            combined = body_html + chr(10) + body_text
-
-            if not combined:
-                continue
-
-            # Debug: 印前 300 字看格式
-            # print(f"內文預覽: {combined[:300]}")
-
-            links = []
-            if HAS_BS4:
-                from bs4 import BeautifulSoup
-                soup = BeautifulSoup(combined, "html.parser")
-                for a in soup.find_all("a", href=True):
-                    title = a.get_text(strip=True)
-                    href = a["href"]
-                    # 放寬過濾：只要不是取消訂閱都留
-                    if len(title) < 6: continue
-                    if "取消訂閱" in title or "Unsubscribe" in title: continue
-                    if "google.com/alerts/feeds" in href: continue
-                    # Google 會包一層 google.com/url?q=實際網址，要解開
-                    if "google.com/url" in href:
-                        m = re.search(r"[?&]q=([^&]+)", href)
-                        if m:
-                            import urllib.parse
-                            href = urllib.parse.unquote(m.group(1))
-                    links.append((title, href))
-            else:
-                for m in re.finditer(r'<a[^>]+href="([^"]+)"[^>]*>([^<]{6,})</a>', combined):
-                    href, title = m.group(1), m.group(2).strip()
-                    links.append((title, href))
-
-            print(f"  -> 抓到 {len(links)} 個連結")
-
-            for title, href in links:
+    risk_keywords = ["資安","入侵","重訊","重大","減資","違約","處置","警示","下市","搜索","檢調","火災","裁罰","重罰"]
+    print(f"RSS 模式：找到 {len(urls)} 個 RSS 連結")
+    for rss_url in urls:
+        try:
+            print(f"抓取 RSS: {rss_url[:80]}")
+            resp = request_get(rss_url, timeout=20)
+            text = resp.text
+            # 用 regex 解析 RSS item，最穩，不依賴 xml 庫
+            items = re.findall(r"<item>(.*?)</item>", text, re.DOTALL | re.IGNORECASE)
+            print(f"  -> RSS 內有 {len(items)} 則")
+            for it in items:
+                title_m = re.search(r"<title><!\[CDATA\[(.*?)\]\]></title>|<title>(.*?)</title>", it, re.DOTALL | re.IGNORECASE)
+                link_m = re.search(r"<link>(.*?)</link>", it, re.DOTALL | re.IGNORECASE)
+                if not title_m: continue
+                title = (title_m.group(1) or title_m.group(2) or "").strip()
+                title = html.unescape(re.sub(r"<[^>]+>", "", title))
+                link = link_m.group(1).strip() if link_m else ""
+                if len(title) < 6: continue
+                # 模糊比對：只要有代號或名稱任一字串出現在標題
                 for sid in FOCUS_STOCKS:
                     sname = FOCUS_PROFILES.get(sid, {}).get("name","")
+                    # 模糊：3293 或 鈊象 任一出現
                     if sid in title or (sname and sname in title):
                         level = "高風險" if any(k in title for k in risk_keywords) else "中性"
-                        alerts_by_stock[sid].append({"title": title, "link": href, "level": level})
-                        print(f"    命中 {sid} {sname}: {title[:40]}")
-
-        mail.logout()
-    except Exception as e:
-        print(f"⚠️ Google 快訊抓取失敗: {e}")
-        traceback.print_exc()
-        return {}
-
+                        alerts_by_stock[sid].append({"title": title, "link": link, "level": level})
+        except Exception as e:
+            print(f"RSS 抓取失敗 {rss_url[:50]}: {e}")
+            continue
     # 去重
     for sid in list(alerts_by_stock.keys()):
         seen=set(); uniq=[]
@@ -544,13 +463,110 @@ def fetch_google_alerts(days=3, max_mails=10):
             if item["title"] not in seen:
                 uniq.append(item); seen.add(item["title"])
         alerts_by_stock[sid]=uniq[:5]
-
-    if not alerts_by_stock:
-        print("⚠️ 解析完成但沒有命中 8 大核心股，可能是快訊關鍵字不是代號+名稱")
-        print("建議：去 google.com/alerts 把關鍵字改成 \"3293 鈊象\" 這種格式")
-    
-    print(f"Google 快訊分類完成：{ {k:len(v) for k,v in alerts_by_stock.items()} }")
+    print(f"RSS 分類完成：{ {k:len(v) for k,v in alerts_by_stock.items()} }")
     return alerts_by_stock
+
+def fetch_google_alerts_imap(days=5, max_mails=10):
+    if not all([GMAIL_USER, GMAIL_APP_PASSWORD]):
+        print("未設定 Gmail，跳過 IMAP")
+        return {}
+    alerts_by_stock = defaultdict(list)
+    risk_keywords = ["資安","入侵","重訊","重大","減資","違約","處置","警示","下市","搜索","檢調","火災","裁罰"]
+    try:
+        print(f"IMAP 模式連線 Gmail: {GMAIL_USER}")
+        mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+        mail.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        mail.select("INBOX")
+        queries = ['(FROM "googlealerts-noreply@google.com")','FROM "googlealerts"','SUBJECT "Google"','SUBJECT "快訊"']
+        mail_ids=[]
+        for q in queries:
+            try:
+                status, data = mail.search(None, q)
+                if status=="OK" and data[0]:
+                    ids = data[0].split()
+                    if ids:
+                        mail_ids = ids
+                        print(f"用條件 {q} 找到 {len(mail_ids)} 封")
+                        break
+            except: continue
+        if not mail_ids:
+            print("IMAP 找不到任何 Google 快訊郵件")
+            mail.logout()
+            return {}
+        mail_ids = mail_ids[-max_mails:]
+        for mid in reversed(mail_ids):
+            _, msg_data = mail.fetch(mid, "(RFC822)")
+            msg = email.message_from_bytes(msg_data[0][1])
+            body_html=""; body_text=""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    try:
+                        payload = part.get_payload(decode=True)
+                        if not payload: continue
+                        charset = part.get_content_charset() or "utf-8"
+                        decoded = payload.decode(charset, errors="ignore")
+                        if part.get_content_type()=="text/html": body_html=decoded
+                        elif part.get_content_type()=="text/plain": body_text=decoded
+                    except: continue
+            else:
+                try:
+                    payload = msg.get_payload(decode=True)
+                    if payload:
+                        body_html = payload.decode(msg.get_content_charset() or "utf-8", errors="ignore")
+                except:
+                    body_html = str(msg.get_payload())
+            combined = body_html + "\n" + body_text
+            # 解包 Google 包裝的連結
+            # 把所有 google.com/url?q=xxx 解開
+            combined = re.sub(r"https://www\.google\.com/url\?q=([^&\"]+)", lambda m: __import__("urllib.parse").parse.unquote(m.group(1)), combined)
+            links=[]
+            if HAS_BS4:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(combined, "html.parser")
+                for a in soup.find_all("a", href=True):
+                    title = a.get_text(strip=True)
+                    href = a["href"]
+                    if len(title)<4: continue
+                    if "取消訂閱" in title or "Unsubscribe" in title: continue
+                    if "google.com/alerts/feeds" in href: continue
+                    links.append((title, href))
+            else:
+                for m in re.finditer(r'<a[^>]+href="([^"]+)"[^>]*>([^<]{4,})</a>', combined):
+                    href, title = m.group(1), m.group(2).strip()
+                    links.append((title, href))
+            # 模糊比對：代號或名稱出現在標題任一處
+            for title, href in links:
+                # 清理標題的 HTML entity
+                title_clean = html.unescape(title)
+                for sid in FOCUS_STOCKS:
+                    sname = FOCUS_PROFILES.get(sid, {}).get("name","")
+                    # 模糊：只要代號或名稱任一出現
+                    if sid in title_clean or (sname and sname in title_clean):
+                        level = "高風險" if any(k in title_clean for k in risk_keywords) else "中性"
+                        alerts_by_stock[sid].append({"title": title_clean, "link": href, "level": level})
+        mail.logout()
+    except Exception as e:
+        print(f"IMAP 抓取失敗: {e}")
+        traceback.print_exc()
+        return {}
+    for sid in list(alerts_by_stock.keys()):
+        seen=set(); uniq=[]
+        for item in alerts_by_stock[sid]:
+            if item["title"] not in seen:
+                uniq.append(item); seen.add(item["title"])
+        alerts_by_stock[sid]=uniq[:5]
+    print(f"IMAP 分類完成：{ {k:len(v) for k,v in alerts_by_stock.items()} }")
+    return alerts_by_stock
+
+def fetch_google_alerts(days=3, max_mails=10):
+    # 優先走 RSS，RSS 沒有才走 IMAP
+    rss = fetch_google_alerts_rss()
+    if rss:
+        print("使用 RSS 結果")
+        return rss
+    print("RSS 無設定或無結果，改走 IMAP")
+    return fetch_google_alerts_imap(days, max_mails)
+
 
 # ==========================================================
 # 7. 分類與雷達
