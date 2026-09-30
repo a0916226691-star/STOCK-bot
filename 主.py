@@ -24,8 +24,7 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
-import re
-import htmlquests
+import requests
 
 try:
     from bs4 import BeautifulSoup
