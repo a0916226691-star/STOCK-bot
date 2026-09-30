@@ -1,21 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-台股主動資金雷達
+台股主動資金雷達 v5.1
+============================================================
+特色：
+1. 上市／上櫃行情掃描。
+2. 以投信連續買超為主，外資僅作輔助。
+3. 排除權值、ETF、工具型流量與自營商避險主導。
+4. 用價格盤整、MA10、MA20、成交量與法人資料做雷達分類。
+5. 保留 8 大核心持股深度健檢，但不對焦點股人工加分。
+6. 每日保存價格與法人資料，逐步建立 5／10／20 日歷史。
+7. Email 與 CSV 輸出。
+8. 本工具僅供公開資料研究，不構成投資建議。
 
-用途：
-1. 掃描上市／上櫃股票。
-2. 尋找投信持續買超、價格仍在盤整的股票。
-3. 外資僅作輔助；只有外資買超不會變成布局訊號。
-4. 排除台積電、金融權值、ETF 等工具型股票。
-5. 自營商避險流量偏高時，不視為方向性買盤。
-6. 每日保存價格與法人歷史 CSV，逐步累積 MA10、MA20 與法人趨勢。
-7. 寄送 Email 報告；未設定 Gmail Secrets 時仍會輸出 CSV。
-
-提醒：
-- 本工具只用公開資料做研究篩選，不構成投資建議。
-- 第 5 個交易日後，投信 5 日趨勢開始有意義。
-- 第 10 個交易日後，10 日振幅開始有意義。
-- 第 20 個交易日後，MA20 與中期法人趨勢才會完整。
+資料累積提醒：
+- 第 5 個交易日後：投信 5 日與均量訊號較有意義。
+- 第 10 個交易日後：10 日振幅與中期流入開始有意義。
+- 第 20 個交易日後：MA20 與完整中期法人趨勢才完整。
 """
 
 import os
@@ -44,40 +44,108 @@ GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (GitHub Actions; stock-radar)"
+    "User-Agent": (
+        "Mozilla/5.0 (GitHub Actions; stock-radar-v5.1)"
+    )
 }
 
+# 最低流動性：當日成交額至少 3,000 萬元。
 MIN_DAILY_TURNOVER = 30_000_000
+
+# 5 日投信買超占平均成交量比例門檻。
 MIN_TRUST_5D_VOLUME_RATIO = 0.01
+
+# 5 日外資買超占平均成交量比例門檻。
 MIN_FOREIGN_5D_VOLUME_RATIO = 0.03
+
+# 避險絕對流量太大時，不視為方向性布局。
 MAX_HEDGE_5D_VOLUME_RATIO = 0.03
+
+# 最多保留並讀取 90 份日資料。
 MAX_HISTORY_FILES = 90
 
 
 # ==========================================================
-# 1. 關注清單、題材、排除股票
+# 1. 核心關注清單、題材與排除清單
 # ==========================================================
 
 FOCUS_STOCKS = [
-    "2383",
-    "2368",
-    "6197",
-    "3293",
-    "4763",
-    "1808",
-    "6919",
-    "1503",
+    "2383",  # 台光電
+    "2368",  # 金像電
+    "6197",  # 佳必琪
+    "3293",  # 鈊象
+    "4763",  # 材料-KY
+    "1808",  # 潤隆
+    "6919",  # 康霈
+    "1503",  # 士電
 ]
 
+# 這裡是你的研究備忘，不是程式即時估值結論。
 FOCUS_PROFILES = {
-    "2383": ("台光電", "AI伺服器／高速CCL"),
-    "2368": ("金像電", "AI伺服器／交換器PCB"),
-    "6197": ("佳必琪", "AI高速傳輸線束"),
-    "3293": ("鈊象", "網路遊戲／授權"),
-    "4763": ("材料-KY", "材料／絲束"),
-    "1808": ("潤隆", "營建／高股息"),
-    "6919": ("康霈", "生技新藥"),
-    "1503": ("士電", "重電／變壓器／綠能"),
+    "2383": {
+        "name": "台光電",
+        "theme": "AI伺服器／高速CCL",
+        "valuation": "合理偏高（高成長支撐）",
+        "good_catalyst": "高速材料需求與產品組合",
+        "risk_catalyst": "銅箔、玻纖布等原料成本波動",
+        "rating": "持續研究",
+    },
+    "2368": {
+        "name": "金像電",
+        "theme": "AI伺服器／交換器PCB",
+        "valuation": "合理區間",
+        "good_catalyst": "高階伺服器與交換器PCB需求",
+        "risk_catalyst": "產能擴充與客戶拉貨節奏",
+        "rating": "持續研究",
+    },
+    "6197": {
+        "name": "佳必琪",
+        "theme": "AI高速傳輸線束",
+        "valuation": "成長型估值",
+        "good_catalyst": "高速線纜與伺服器需求",
+        "risk_catalyst": "伺服器出貨節奏與競爭壓力",
+        "rating": "持續研究",
+    },
+    "3293": {
+        "name": "鈊象",
+        "theme": "網路遊戲／授權",
+        "valuation": "偏高，須持續追蹤",
+        "good_catalyst": "海外授權與產品營運",
+        "risk_catalyst": "海外法規與評價修正",
+        "rating": "持續研究",
+    },
+    "4763": {
+        "name": "材料-KY",
+        "theme": "材料／絲束",
+        "valuation": "需觀察成長持續性",
+        "good_catalyst": "供需與擴產效益",
+        "risk_catalyst": "營收趨勢、供需反轉與評價變化",
+        "rating": "持續研究",
+    },
+    "1808": {
+        "name": "潤隆",
+        "theme": "營建／高股息",
+        "valuation": "資產與現金流導向",
+        "good_catalyst": "完工認列、現金流與股利政策",
+        "risk_catalyst": "工程進度、政策與房市景氣",
+        "rating": "持續研究",
+    },
+    "6919": {
+        "name": "康霈",
+        "theme": "生技新藥",
+        "valuation": "高不確定性題材估值",
+        "good_catalyst": "臨床、授權與研發進展",
+        "risk_catalyst": "臨床結果與資金需求風險",
+        "rating": "高風險研究",
+    },
+    "1503": {
+        "name": "士電",
+        "theme": "重電／變壓器／綠能",
+        "valuation": "成長型估值",
+        "good_catalyst": "電網投資、外銷訂單與產能",
+        "risk_catalyst": "原物料、交期與評價修正",
+        "rating": "持續研究",
+    },
 }
 
 THEMES = {
@@ -128,8 +196,11 @@ THEME_MAP = {}
 
 for theme_name, stock_ids in THEMES.items():
     for stock_id in stock_ids:
-        THEME_MAP.setdefault(stock_id, []).append(theme_name)
+        THEME_MAP.setdefault(stock_id, []).append(
+            theme_name
+        )
 
+# 這些股票／ETF 不納入「提前布局」雷達。
 EXCLUDE_TOOL_STOCKS = {
     "2330",  # 台積電
     "2454",  # 聯發科
@@ -161,7 +232,7 @@ def now_tw():
 
 
 def today_str():
-    """取得 YYYY-MM-DD 日期。"""
+    """取得 YYYY-MM-DD 日期字串。"""
     return now_tw().strftime("%Y-%m-%d")
 
 
@@ -179,7 +250,7 @@ def normalize_stock_id(value):
 
 
 def safe_float(value):
-    """安全把文字轉成 float。"""
+    """安全把來源文字轉成浮點數。"""
     if value is None:
         return np.nan
 
@@ -217,7 +288,7 @@ def safe_float(value):
 
 
 def safe_int(value):
-    """安全把文字轉成 int。"""
+    """安全把來源文字轉成整數。"""
     number = safe_float(value)
 
     if pd.isna(number):
@@ -244,14 +315,14 @@ def request_get(url, params=None, timeout=30):
 
         except Exception as error:
             last_error = error
-            sleep_seconds = 2 * (attempt + 1)
+            wait_seconds = 2 * (attempt + 1)
 
             print(
                 f"連線失敗，第 {attempt + 1} 次重試前等待 "
-                f"{sleep_seconds} 秒：{error}"
+                f"{wait_seconds} 秒：{error}"
             )
 
-            time.sleep(sleep_seconds)
+            time.sleep(wait_seconds)
 
     raise RuntimeError(
         f"連線失敗：{url}｜最後錯誤：{last_error}"
@@ -259,29 +330,39 @@ def request_get(url, params=None, timeout=30):
 
 
 def get_recent_dates(days=20):
-    """取得最近數個日曆日期，用於找最近交易日。"""
+    """取得最近 N 個日期，供法人資料找最近交易日。"""
     return [
-        (now_tw() - timedelta(days=offset)).strftime("%Y%m%d")
+        (now_tw() - timedelta(days=offset)).strftime(
+            "%Y%m%d"
+        )
         for offset in range(days)
     ]
 
 
 # ==========================================================
-# 3. 行情資料
+# 3. 取得行情
 # ==========================================================
 
 def get_twse_quotes():
     """取得 TWSE 上市最新行情。"""
     print("取得 TWSE 上市行情...")
 
-    url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-    data = request_get(url).json()
+    url = (
+        "https://openapi.twse.com.tw/v1/"
+        "exchangeReport/STOCK_DAY_ALL"
+    )
 
+    data = request_get(url).json()
     rows = []
 
     for item in data:
-        stock_id = normalize_stock_id(item.get("Code", ""))
-        close = safe_float(item.get("ClosingPrice"))
+        stock_id = normalize_stock_id(
+            item.get("Code", "")
+        )
+
+        close = safe_float(
+            item.get("ClosingPrice")
+        )
 
         if not stock_id.isdigit():
             continue
@@ -294,12 +375,20 @@ def get_twse_quotes():
 
         rows.append({
             "stock_id": stock_id,
-            "stock_name": str(item.get("Name", "")).strip(),
+            "stock_name": str(
+                item.get("Name", "")
+            ).strip(),
             "market": "TWSE",
             "close": close,
-            "change": safe_float(item.get("Change")),
-            "volume": safe_int(item.get("TradeVolume")),
-            "turnover": safe_float(item.get("TradeValue")),
+            "change": safe_float(
+                item.get("Change")
+            ),
+            "volume": safe_int(
+                item.get("TradeVolume")
+            ),
+            "turnover": safe_float(
+                item.get("TradeValue")
+            ),
         })
 
     df = pd.DataFrame(rows)
@@ -387,8 +476,8 @@ def get_tpex_quotes():
 
 def get_all_quotes():
     """
-    上市行情必抓。
-    上櫃資料若暫時失敗，仍可用上市資料繼續執行。
+    上市資料必抓。
+    上櫃 API 失敗時，仍使用上市資料完成本次執行。
     """
     frames = [get_twse_quotes()]
 
@@ -397,10 +486,11 @@ def get_all_quotes():
 
     except Exception as error:
         print(
-            f"TPEx 上櫃行情暫時不可用，今天只掃描上市：{error}"
+            f"TPEx 行情暫時不可用，今天只掃描上市：{error}"
         )
 
     quotes = pd.concat(frames, ignore_index=True)
+
     quotes["stock_id"] = quotes["stock_id"].map(
         normalize_stock_id
     )
@@ -412,15 +502,16 @@ def get_all_quotes():
 
 
 # ==========================================================
-# 4. TWSE 法人資料
+# 4. 取得 TWSE 法人資料
 # ==========================================================
 
 def get_twse_institutional():
     """
     取得 TWSE T86 法人資料。
 
-    自營商避險欄位找不到時，不會當成 0；
-    而是標示 hedge_data_available=False。
+    保留外資、投信、自營商自行買賣與避險資料。
+    找不到避險欄位時，明確標記為不可用，
+    不會把它錯誤當成 0。
     """
     print("取得 TWSE 法人資料...")
 
@@ -441,7 +532,10 @@ def get_twse_institutional():
                 timeout=20,
             ).json()
 
-            if result.get("stat") == "OK" and result.get("data"):
+            if (
+                result.get("stat") == "OK"
+                and result.get("data")
+            ):
                 data = result
                 used_date = date_code
                 break
@@ -450,7 +544,9 @@ def get_twse_institutional():
             continue
 
     if data is None:
-        raise RuntimeError("找不到可用的 TWSE 法人資料。")
+        raise RuntimeError(
+            "找不到可用的 TWSE 法人資料。"
+        )
 
     fields = data.get("fields", [])
     raw_rows = data.get("data", [])
@@ -511,13 +607,17 @@ def get_twse_institutional():
                 if hedge_column
                 else np.nan
             ),
-            "hedge_data_available": hedge_column is not None,
+            "hedge_data_available": (
+                hedge_column is not None
+            ),
         })
 
     df = pd.DataFrame(rows)
 
     if df.empty:
-        raise RuntimeError("TWSE 法人資料解析後為空。")
+        raise RuntimeError(
+            "TWSE 法人資料解析後為空。"
+        )
 
     df["foreign_net"] = pd.to_numeric(
         df["foreign_net"],
@@ -542,7 +642,7 @@ def get_twse_institutional():
     hedge_text = "可用" if hedge_column else "未提供"
 
     print(
-        f"TWSE 法人資料完成：{len(df)} 檔，"
+        f"TWSE 法人完成：{len(df)} 檔，"
         f"資料日期：{formatted_date}，"
         f"避險欄位：{hedge_text}。"
     )
@@ -551,24 +651,25 @@ def get_twse_institutional():
 
 
 # ==========================================================
-# 5. 歷史資料
+# 5. 歷史資料讀取與保存
 # ==========================================================
 
 def load_history(prefix):
-    """讀取 output 內的歷史 CSV。"""
-    filenames = sorted(
-        [
-            filename
-            for filename in os.listdir(OUTPUT_DIR)
-            if filename.startswith(prefix)
-            and filename.endswith(".csv")
-        ]
-    )[-MAX_HISTORY_FILES:]
+    """讀取 output 下指定前綴的歷史 CSV。"""
+    filenames = sorted([
+        filename
+        for filename in os.listdir(OUTPUT_DIR)
+        if filename.startswith(prefix)
+        and filename.endswith(".csv")
+    ])[-MAX_HISTORY_FILES:]
 
     frames = []
 
     for filename in filenames:
-        path = os.path.join(OUTPUT_DIR, filename)
+        path = os.path.join(
+            OUTPUT_DIR,
+            filename,
+        )
 
         try:
             frame = pd.read_csv(
@@ -577,9 +678,9 @@ def load_history(prefix):
             )
 
             if not frame.empty:
-                frame["stock_id"] = frame["stock_id"].map(
-                    normalize_stock_id
-                )
+                frame["stock_id"] = frame[
+                    "stock_id"
+                ].map(normalize_stock_id)
 
                 frames.append(frame)
 
@@ -595,20 +696,29 @@ def load_history(prefix):
     return pd.concat(frames, ignore_index=True)
 
 
-def save_today_history(quotes, institutional, date_text):
-    """儲存今天價格與法人快照。"""
+def save_today_history(
+    quotes,
+    institutional,
+    date_text,
+):
+    """儲存今天行情與法人資料。"""
     price_path = os.path.join(
         OUTPUT_DIR,
         f"layout_price_history_{date_text}.csv",
     )
 
-    quotes.copy().assign(date=date_text).to_csv(
+    quotes.copy().assign(
+        date=date_text
+    ).to_csv(
         price_path,
         index=False,
         encoding="utf-8-sig",
     )
 
-    if institutional is not None and not institutional.empty:
+    if (
+        institutional is not None
+        and not institutional.empty
+    ):
         institutional_path = os.path.join(
             OUTPUT_DIR,
             f"layout_institutional_history_{date_text}.csv",
@@ -625,15 +735,20 @@ def save_today_history(quotes, institutional, date_text):
 # 6. 價格特徵
 # ==========================================================
 
-def make_price_features(quotes, history, date_text):
+def make_price_features(
+    quotes,
+    history,
+    date_text,
+):
     """
     計算：
-    - MA10、MA20
+    - MA10
+    - MA20
     - 5 日漲跌幅
     - 10 日振幅
-    - 前 5 日平均成交量
-    - 量比
-    - 與 MA10、MA20 的乖離
+    - 前 5 日均量
+    - 今日相對量
+    - MA10／MA20 乖離率
     """
     needed_columns = [
         "stock_id",
@@ -672,7 +787,11 @@ def make_price_features(quotes, history, date_text):
 
     full["date"] = full["date"].astype(str)
 
-    for column in ["close", "volume", "turnover"]:
+    for column in [
+        "close",
+        "volume",
+        "turnover",
+    ]:
         full[column] = pd.to_numeric(
             full[column],
             errors="coerce",
@@ -732,8 +851,10 @@ def make_price_features(quotes, history, date_text):
         full["high_10d"] / full["low_10d"] - 1
     ) * 100
 
-    # 使用前 5 日均量，不把當日量算進自己的平均基準。
-    full["avg_volume_5d"] = grouped["volume"].transform(
+    # 用前五日均量，不把今日成交量混進基準。
+    full["avg_volume_5d"] = grouped[
+        "volume"
+    ].transform(
         lambda values: values.shift(1).rolling(
             5,
             min_periods=5,
@@ -774,17 +895,18 @@ def make_price_features(quotes, history, date_text):
 # 7. 法人特徵
 # ==========================================================
 
-def make_institutional_features(history, price_features):
+def make_institutional_features(
+    history,
+    price_features,
+):
     """
-    計算法人特徵：
-
-    - 投信 5 日／20 日淨買賣。
-    - 外資 5 日／20 日淨買賣。
-    - 投信與外資的買超天數。
-    - 自營商避險流量。
-    - 投信是否符合短期吸籌。
-    - 外資是否只是輔助支持。
-    - 中期投信流入是否值得繼續驗證。
+    計算：
+    - 投信／外資 5 日、20 日淨買賣。
+    - 投信／外資 5 日、20 日買超天數。
+    - 自營商避險絕對流量。
+    - 投信是否形成短期吸籌。
+    - 外資是否形成輔助支持。
+    - 中期投信流入待驗證。
     """
     output_columns = [
         "stock_id",
@@ -809,7 +931,9 @@ def make_institutional_features(history, price_features):
     ]
 
     if history is None or history.empty:
-        return pd.DataFrame(columns=output_columns)
+        return pd.DataFrame(
+            columns=output_columns
+        )
 
     df = history.copy()
 
@@ -843,7 +967,7 @@ def make_institutional_features(history, price_features):
         .astype(bool)
     )
 
-    # 外資、投信無資料才補零；避險資料不可補零。
+    # 外資、投信若空缺可補零；避險資料不可補零。
     df["foreign_net"] = df["foreign_net"].fillna(0)
     df["trust_net"] = df["trust_net"].fillna(0)
 
@@ -858,7 +982,10 @@ def make_institutional_features(history, price_features):
 
     volume_map = {}
 
-    if price_features is not None and not price_features.empty:
+    if (
+        price_features is not None
+        and not price_features.empty
+    ):
         volume_map = (
             price_features
             .set_index("stock_id")["avg_volume_5d"]
@@ -909,15 +1036,19 @@ def make_institutional_features(history, price_features):
 
         hedge_available = bool(
             len(group_5) >= 5
-            and group_5["hedge_data_available"].all()
-            and group_5["dealer_hedge_net"].notna().all()
+            and group_5[
+                "hedge_data_available"
+            ].all()
+            and group_5[
+                "dealer_hedge_net"
+            ].notna().all()
         )
 
         if hedge_available:
             dealer_hedge_5d_abs = float(
-                group_5["dealer_hedge_net"]
-                .abs()
-                .sum()
+                group_5[
+                    "dealer_hedge_net"
+                ].abs().sum()
             )
 
             hedge_data_status = "available"
@@ -997,7 +1128,10 @@ def make_institutional_features(history, price_features):
         midterm_inflow_to_verify = (
             institutional_days_20 >= 10
             and trust_buy_days_20
-            >= max(5, int(institutional_days_20 * 0.4))
+            >= max(
+                5,
+                int(institutional_days_20 * 0.4),
+            )
             and trust_20d_net > 0
         )
 
@@ -1032,21 +1166,21 @@ def make_institutional_features(history, price_features):
 
 
 # ==========================================================
-# 8. 燈號分類
+# 8. 分類規則
 # ==========================================================
 
 def classify_stock(row):
     """
-    核心邏輯：
+    分類順序：
 
-    1. 權值、ETF、工具股直接排除。
-    2. 避險主導直接排除。
-    3. 短線急拉、爆量急拉、法人同步轉賣，列紅燈。
-    4. 跌破 MA20 但法人仍在，列黃燈。
-    5. 中期投信流入，列紫燈待驗證。
-    6. 投信 5 日買超且價格盤整，列藍燈。
-    7. 投信買超且股價溫和站上 MA10，列綠燈。
-    8. 外資單獨流入，僅灰色待驗證。
+    1. 權值／ETF／工具股排除。
+    2. 避險主導排除。
+    3. 過熱與法人同步轉賣列紅燈。
+    4. 跌破 MA20 且仍有法人支持列黃燈。
+    5. 中期投信流入列紫燈待驗證。
+    6. 投信盤整吸籌列藍燈。
+    7. 投信吸籌後站上 MA10 列綠燈。
+    8. 僅外資流入列灰色待驗證。
     """
     stock_id = row["stock_id"]
 
@@ -1103,7 +1237,7 @@ def classify_stock(row):
         and turnover >= MIN_DAILY_TURNOVER
     )
 
-    # 過熱：5日漲幅超過 10%。
+    # 先排除過熱，不追急拉或爆量拉抬。
     if not pd.isna(return_5d) and return_5d > 10:
         return (
             "🔴 排除：拉高／過熱",
@@ -1111,7 +1245,6 @@ def classify_stock(row):
             -3,
         )
 
-    # 過熱：爆量且漲幅偏高。
     if (
         not pd.isna(volume_ratio)
         and volume_ratio > 2.0
@@ -1136,7 +1269,7 @@ def classify_stock(row):
             -3,
         )
 
-    # 跌破 MA20，但仍有投信、外資或中期法人支持。
+    # 跌破 MA20，但籌碼沒有完全轉壞時，列黃燈。
     if (
         not pd.isna(distance_ma20)
         and distance_ma20 < 0
@@ -1148,11 +1281,11 @@ def classify_stock(row):
     ):
         return (
             "🟡 籌碼尚在、價格轉弱",
-            "跌破MA20；等待重新站回，不加碼。",
+            "跌破MA20月線；等待重新站回，不加碼。",
             2,
         )
 
-    # 跌破 MA10、投信近五日轉賣。
+    # 跌破 MA10 且投信偏賣。
     if (
         not pd.isna(distance_ma10)
         and distance_ma10 < 0
@@ -1164,7 +1297,7 @@ def classify_stock(row):
             1,
         )
 
-    # 盤整吸籌條件。
+    # 藍燈：仍處盤整、未爆量、距 MA20 不遠。
     price_ok = (
         (
             pd.isna(return_5d)
@@ -1184,7 +1317,7 @@ def classify_stock(row):
         )
     )
 
-    # 中期資金待驗證條件。
+    # 紫燈：中期趨勢可放入觀察名單。
     midterm_price_ok = (
         (
             pd.isna(return_5d)
@@ -1200,7 +1333,7 @@ def classify_stock(row):
         )
     )
 
-    # 綠燈條件：站上 MA10、漲幅不過熱。
+    # 綠燈：投信持續買、股價已溫和站回 MA10。
     green_price_confirmation = (
         not pd.isna(distance_ma10)
         and 0 <= distance_ma10 <= 8
@@ -1210,31 +1343,7 @@ def classify_stock(row):
         )
     )
 
-    # 中期投信流入。
-    if (
-        liquid
-        and midterm_inflow
-        and midterm_price_ok
-    ):
-        return (
-            "🟣 中期資金流入待驗證",
-            "投信中期買盤具有持續性，仍需研究基本面與消息。",
-            7,
-        )
-
-    # 藍燈：投信持續買超、價格仍在盤整。
-    if (
-        liquid
-        and trust_accumulation
-        and price_ok
-    ):
-        return (
-            "🔵 主動資金疑似布局",
-            "投信5日持續買超、價格仍盤整，未見避險主導。",
-            8,
-        )
-
-    # 綠燈：投信吸籌後，股價溫和轉強。
+    # 綠燈優先於藍燈，避免「已轉強」仍被列為純盤整。
     if (
         liquid
         and trust_accumulation
@@ -1246,7 +1355,28 @@ def classify_stock(row):
             9,
         )
 
-    # 外資只有輔助角色。
+    if (
+        liquid
+        and trust_accumulation
+        and price_ok
+    ):
+        return (
+            "🔵 主動資金疑似布局",
+            "投信5日持續買超、價格仍盤整，未見避險主導。",
+            8,
+        )
+
+    if (
+        liquid
+        and midterm_inflow
+        and midterm_price_ok
+    ):
+        return (
+            "🟣 中期資金流入待驗證",
+            "投信中期買盤具持續性，仍需研究基本面與消息。",
+            7,
+        )
+
     if foreign_support and not trust_accumulation:
         return (
             "⚪ 待驗證：僅外資流入",
@@ -1262,7 +1392,7 @@ def classify_stock(row):
 
 
 # ==========================================================
-# 9. 雷達整合
+# 9. 建構雷達表
 # ==========================================================
 
 def build_radar(
@@ -1277,7 +1407,10 @@ def build_radar(
         price_features,
         institutional_features,
     ]:
-        if feature_df is not None and not feature_df.empty:
+        if (
+            feature_df is not None
+            and not feature_df.empty
+        ):
             df = df.merge(
                 feature_df,
                 on="stock_id",
@@ -1306,6 +1439,9 @@ def build_radar(
         "foreign_support": False,
         "trust_20d_net": 0,
         "foreign_20d_net": 0,
+        "trust_buy_days_20": 0,
+        "foreign_buy_days_20": 0,
+        "institutional_days_20": 0,
         "midterm_inflow_to_verify": False,
     }
 
@@ -1321,7 +1457,9 @@ def build_radar(
             )
 
         else:
-            df[column] = df[column].fillna(default_value)
+            df[column] = df[column].fillna(
+                default_value
+            )
 
     df["theme"] = df["stock_id"].map(
         lambda stock_id: "／".join(
@@ -1346,9 +1484,10 @@ def build_radar(
     ]
 
     df = pd.concat([df, classified], axis=1)
+
     df["score"] = df["base_score"]
 
-    # 只依客觀條件加分，核心持股不額外加分。
+    # 不因核心持股加分，只依客觀法人條件排序。
     df.loc[
         df["trust_buy_days_5"] >= 4,
         "score",
@@ -1360,9 +1499,9 @@ def build_radar(
     ] += 1
 
     signal_order = {
-        "🟣 中期資金流入待驗證": 1,
+        "🟢 吸籌延續／初步確認": 1,
         "🔵 主動資金疑似布局": 2,
-        "🟢 吸籌延續／初步確認": 3,
+        "🟣 中期資金流入待驗證": 3,
         "🟡 籌碼尚在、價格轉弱": 4,
         "🟡 籌碼鬆動、跌破MA10": 5,
         "⚪ 待驗證：僅外資流入": 6,
@@ -1397,11 +1536,11 @@ def build_radar(
 
 
 # ==========================================================
-# 10. Email 格式
+# 10. Email 報告格式
 # ==========================================================
 
 def fmt_price(value):
-    """價格格式。"""
+    """格式化價格。"""
     if pd.isna(value):
         return "-"
 
@@ -1409,7 +1548,7 @@ def fmt_price(value):
 
 
 def fmt_pct(value):
-    """百分比格式。"""
+    """格式化百分比。"""
     if pd.isna(value):
         return "累積中"
 
@@ -1417,7 +1556,7 @@ def fmt_pct(value):
 
 
 def fmt_ratio(value):
-    """比例格式。"""
+    """格式化比例。"""
     if pd.isna(value):
         return "待驗證"
 
@@ -1425,7 +1564,7 @@ def fmt_ratio(value):
 
 
 def fmt_shares(value):
-    """股數格式。"""
+    """格式化股數為張或股。"""
     if pd.isna(value):
         return "-"
 
@@ -1437,8 +1576,85 @@ def fmt_shares(value):
     return f"{value:+,} 股"
 
 
+def make_focus_report(radar):
+    """產生 8 檔核心持股健檢。"""
+    lines = [
+        "=" * 54,
+        "⭐ 8大核心持股研究健檢",
+        "=" * 54,
+    ]
+
+    for stock_id in FOCUS_STOCKS:
+        profile = FOCUS_PROFILES.get(
+            stock_id,
+            {},
+        )
+
+        name = profile.get("name", stock_id)
+        theme = profile.get("theme", "未分類")
+        valuation = profile.get("valuation", "-")
+        good_catalyst = profile.get(
+            "good_catalyst",
+            "-",
+        )
+        risk_catalyst = profile.get(
+            "risk_catalyst",
+            "-",
+        )
+        rating = profile.get("rating", "持續研究")
+
+        match = radar[
+            radar["stock_id"] == stock_id
+        ]
+
+        if match.empty:
+            lines.append(
+                f"• {stock_id} {name}｜未取得當日行情"
+            )
+            lines.append("-" * 54)
+            continue
+
+        row = match.iloc[0]
+
+        lines.append(
+            f"• {stock_id} {name}｜產業：{theme}"
+        )
+
+        lines.append(
+            f"  收盤：{fmt_price(row.get('close', np.nan))}"
+            f"｜月線乖離："
+            f"{fmt_pct(row.get('distance_ma20_pct', np.nan))}"
+        )
+
+        lines.append(
+            f"  估值研究備忘：{valuation}"
+        )
+
+        lines.append(
+            f"  題材：{good_catalyst}"
+        )
+
+        lines.append(
+            f"  風險：{risk_catalyst}"
+        )
+
+        lines.append(
+            f"  即時雷達：{row.get('signal', '-')}"
+            f"｜投信5日："
+            f"{fmt_shares(row.get('trust_5d_net', np.nan))}"
+        )
+
+        lines.append(
+            f"  研究標籤：{rating}"
+        )
+
+        lines.append("-" * 54)
+
+    return "\n".join(lines)
+
+
 def stock_lines(frame, maximum):
-    """輸出某一個燈號分類的股票。"""
+    """格式化某燈號分類的股票清單。"""
     if frame is None or frame.empty:
         return "（今日無股票）"
 
@@ -1493,53 +1709,14 @@ def stock_lines(frame, maximum):
     return "\n".join(lines).rstrip()
 
 
-def make_focus_report(radar):
-    """輸出核心關注股健檢。"""
-    lines = [
-        "=" * 54,
-        "⭐ 核心關注股健檢（不影響客觀排序）",
-        "=" * 54,
-    ]
+def make_email_body(
+    radar,
+    date_text,
+    execution_time,
+):
+    """建立 Email 文字內容。"""
+    focus_report = make_focus_report(radar)
 
-    for stock_id in FOCUS_STOCKS:
-        name, theme = FOCUS_PROFILES.get(
-            stock_id,
-            (stock_id, "未分類"),
-        )
-
-        match = radar[
-            radar["stock_id"] == stock_id
-        ]
-
-        if match.empty:
-            lines.append(
-                f"• {stock_id} {name}｜未取得當日行情"
-            )
-            continue
-
-        row = match.iloc[0]
-
-        lines.append(
-            f"• {stock_id} {name}"
-            f"｜{theme}"
-            f"｜收盤 {fmt_price(row.get('close', np.nan))}"
-            f"｜{row.get('signal', '-')}"
-        )
-
-        lines.append(
-            f"  投信5日 "
-            f"{fmt_shares(row.get('trust_5d_net', np.nan))}"
-            f"｜5日 "
-            f"{fmt_pct(row.get('return_5d_pct', np.nan))}"
-            f"｜距MA20 "
-            f"{fmt_pct(row.get('distance_ma20_pct', np.nan))}"
-        )
-
-    return "\n".join(lines)
-
-
-def make_email_body(radar, date_text, execution_time):
-    """建立完整 Email 內容。"""
     purple = radar[
         radar["signal"] == "🟣 中期資金流入待驗證"
     ]
@@ -1553,11 +1730,17 @@ def make_email_body(radar, date_text, execution_time):
     ]
 
     yellow = radar[
-        radar["signal"].str.startswith("🟡", na=False)
+        radar["signal"].str.startswith(
+            "🟡",
+            na=False,
+        )
     ]
 
     red = radar[
-        radar["signal"].str.startswith("🔴", na=False)
+        radar["signal"].str.startswith(
+            "🔴",
+            na=False,
+        )
     ]
 
     orange = radar[
@@ -1565,7 +1748,7 @@ def make_email_body(radar, date_text, execution_time):
     ]
 
     lines = [
-        "台股主動資金雷達",
+        "台股主動資金雷達與風控觀察報告",
         f"日期：{date_text}",
         f"執行時間：{execution_time}（台灣時間）",
         "",
@@ -1573,14 +1756,14 @@ def make_email_body(radar, date_text, execution_time):
         "- 藍燈與綠燈必須有投信持續買超。",
         "- 外資只作輔助；僅外資流入只列待驗證。",
         "- 自營商避險流量不當作看多。",
-        "- 核心關注股不會獲得額外排序加分。",
+        "- 核心關注股僅用於健檢，不會獲得人工加分。",
         "",
-        make_focus_report(radar),
+        focus_report,
         "",
         "=" * 54,
-        f"🟣 中期資金流入待驗證｜{len(purple)} 檔",
+        f"🟢 吸籌延續／初步確認｜{len(green)} 檔",
         "=" * 54,
-        stock_lines(purple, 10),
+        stock_lines(green, 10),
         "",
         "=" * 54,
         f"🔵 主動資金疑似布局｜{len(blue)} 檔",
@@ -1588,9 +1771,9 @@ def make_email_body(radar, date_text, execution_time):
         stock_lines(blue, 10),
         "",
         "=" * 54,
-        f"🟢 吸籌延續／初步確認｜{len(green)} 檔",
+        f"🟣 中期資金流入待驗證｜{len(purple)} 檔",
         "=" * 54,
-        stock_lines(green, 10),
+        stock_lines(purple, 10),
         "",
         "=" * 54,
         f"🟡 轉弱／籌碼鬆動｜{len(yellow)} 檔",
@@ -1608,8 +1791,9 @@ def make_email_body(radar, date_text, execution_time):
         stock_lines(orange, 10),
         "",
         "提醒：",
-        "- 第5個交易日後，法人5日訊號較有意義。",
-        "- 第20個交易日後，MA20與中期法人趨勢才會完整。",
+        "- 第5個交易日後，投信5日與均量資料才較有參考價值。",
+        "- 第10個交易日後，10日振幅與中期法人趨勢較有意義。",
+        "- 第20個交易日後，MA20與完整中期法人趨勢才完整。",
         "- 本報告為公開資料研究工具，不構成投資建議。",
     ]
 
@@ -1617,11 +1801,11 @@ def make_email_body(radar, date_text, execution_time):
 
 
 # ==========================================================
-# 11. 寄信
+# 11. Email 寄送
 # ==========================================================
 
 def send_email(subject, body):
-    """寄送 Gmail；未設定 Secrets 時略過。"""
+    """寄送 Email；沒有 Secrets 時只略過寄信。"""
     if not all([
         GMAIL_USER,
         GMAIL_APP_PASSWORD,
@@ -1667,15 +1851,20 @@ def main():
     date_text = now.strftime("%Y-%m-%d")
 
     print("=" * 60)
-    print(f"開始執行台股主動資金雷達：{date_text}")
+    print(
+        f"開始執行台股主動資金雷達 v5.1：{date_text}"
+    )
     print("=" * 60)
 
-    # 取得行情。
+    # 1. 行情。
     quotes = get_all_quotes()
-    print(f"成功取得行情：{len(quotes)} 檔。")
 
-    # 取得法人資料。
-    # 即使失敗，仍可保存當日行情並產生雷達 CSV。
+    print(
+        f"成功取得行情：{len(quotes)} 檔。"
+    )
+
+    # 2. 法人資料。
+    # 失敗時仍讓價格歷史與雷達 CSV 繼續產出。
     try:
         institutional_today = get_twse_institutional()
 
@@ -1686,7 +1875,7 @@ def main():
 
         institutional_today = pd.DataFrame()
 
-    # 載入歷史資料。
+    # 3. 讀取既有歷史。
     price_history = load_history(
         "layout_price_history_"
     )
@@ -1695,7 +1884,7 @@ def main():
         "layout_institutional_history_"
     )
 
-    # 將今日法人資料加入記憶體，用於今天的運算。
+    # 4. 把今天法人資料加入記憶體後先計算。
     if not institutional_today.empty:
         institutional_history = pd.concat(
             [
@@ -1705,7 +1894,7 @@ def main():
             ignore_index=True,
         )
 
-    # 計算價格與法人特徵。
+    # 5. 特徵計算。
     price_features = make_price_features(
         quotes,
         price_history,
@@ -1717,14 +1906,14 @@ def main():
         price_features,
     )
 
-    # 建立雷達表。
+    # 6. 建構雷達。
     radar = build_radar(
         quotes,
         price_features,
         institutional_features,
     )
 
-    # 儲存今日資料，供下一個交易日累積。
+    # 7. 儲存每日歷史與結果。
     save_today_history(
         quotes,
         institutional_today,
@@ -1744,7 +1933,7 @@ def main():
 
     print(f"雷達 CSV 已輸出：{radar_path}")
 
-    # 產生並寄送 Email。
+    # 8. Email。
     body = make_email_body(
         radar,
         date_text,
@@ -1756,7 +1945,7 @@ def main():
     print("=" * 60 + "\n")
 
     send_email(
-        f"主動資金雷達｜{date_text}",
+        f"主動資金雷達 v5.1｜{date_text}",
         body,
     )
 
@@ -1775,9 +1964,11 @@ if __name__ == "__main__":
 
         try:
             send_email(
-                f"【錯誤】主動資金雷達｜{today_str()}",
+                f"【錯誤】主動資金雷達 v5.1｜"
+                f"{today_str()}",
                 error_text,
             )
+
         except Exception:
             pass
 
