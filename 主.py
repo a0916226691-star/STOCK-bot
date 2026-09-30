@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-台股主動資金雷達 v5.7 (HTML 彩色視覺化 + 雲端強固版)
-v5.7 更新：
-1. 將 Email 輸出全面升級為 HTML 彩色排版（告別單調黑白純文字）。
-2. 保留 v5.4-v5.6 的 Session 反封鎖、雙源備援、TPEx法人、高波動放寬與 RSS 快訊。
+台股主動資金雷達 v5.8 (智慧過濾垃圾快訊版)
+v5.8 更新：
+1. 新增垃圾快訊過濾機制（自動剔除同學會、爆料同學會、散戶發言、情緒閒聊等無營養雜訊）。
+2. 保留 HTML 彩色視覺化、雙源備援、TPEx上櫃法人與 RSS 快訊。
 """
 
 import os
@@ -13,8 +13,6 @@ import random
 import re
 import html
 import traceback
-import imaplib
-import email
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -127,7 +125,7 @@ def request_get(url, params=None, timeout=30):
             response = SESSION.get(url, params=params, timeout=timeout)
             if response.status_code in (403, 429):
                 wait = 30 + random.uniform(1,5)
-                print(f"⚠️️ 被風控 {response.status_code}，等待 {wait:.1f} 秒後重試...")
+                print(f"⚠️ 被風控 {response.status_code}，等待 {wait:.1f} 秒後重試...")
                 time.sleep(wait)
                 continue
             response.raise_for_status()
@@ -408,7 +406,7 @@ def make_institutional_features(history, price_features):
     return pd.DataFrame(rows, columns=output_columns)
 
 # ==========================================================
-# 6. Google 快訊
+# 6. Google 快訊 (v5.8 智慧過濾垃圾訊息版)
 # ==========================================================
 def get_rss_urls_from_env():
     raw = os.getenv("GOOGLE_ALERTS_RSS") or os.getenv("GOOGLE_ALERTS_RSS_URLS") or ""
@@ -424,7 +422,11 @@ def fetch_google_alerts_rss():
     if not urls:
         return {}
     alerts_by_stock = defaultdict(list)
+    
+    # ❌ 垃圾過濾關鍵字：自動過濾論壇情緒、同學會發言、散戶閒聊、無營養雜訊
+    junk_keywords = ["同學會", "爆料", "散戶", "發言", "聊天", "閒聊", "心情", "權證", "猜測", "看多", "看空", "不ey"]
     risk_keywords = ["資安","入侵","重訊","重大","減資","違約","處置","警示","下市","搜索","檢調","火災","裁罰","重罰"]
+    
     print(f"RSS 模式：找到 {len(urls)} 個 RSS 連結")
     for rss_url in urls:
         try:
@@ -438,29 +440,39 @@ def fetch_google_alerts_rss():
                 title = (title_m.group(1) or title_m.group(2) or "").strip()
                 title = html.unescape(re.sub(r"<[^>]+>", "", title))
                 link = link_m.group(1).strip() if link_m else ""
+                
                 if len(title) < 4: continue
+                
+                # 🚫 檢查是否為垃圾訊息（含同學會、散戶發言等）
+                is_junk = any(jk in title for jk in junk_keywords)
+                if is_junk:
+                    continue  # 直接略過垃圾訊息！
+
                 for sid in FOCUS_STOCKS:
                     sname = FOCUS_PROFILES.get(sid, {}).get("name","")
                     if sname and sname in title:
                         level = "高風險" if any(k in title for k in risk_keywords) else "中性"
                         alerts_by_stock[sid].append({"title": title, "link": link, "level": level})
         except Exception as e:
-            print(f"⚠️ RSS 抓取失敗: {e}")
+            print(f"⚠️️ RSS 抓取失敗: {e}")
             continue
+            
+    # 每檔核心持股「嚴格只保留最新 1 則高品質快訊」，徹底杜絕洗版
     for sid in list(alerts_by_stock.keys()):
         seen=set(); uniq=[]
         for item in alerts_by_stock[sid]:
             if item["title"] not in seen:
                 uniq.append(item); seen.add(item["title"])
-        alerts_by_stock[sid]=uniq[:5]
+        alerts_by_stock[sid] = uniq[:1]  # 限制最多 1 則最新乾淨快訊
+        
     return alerts_by_stock
 
 def fetch_google_alerts():
     rss = fetch_google_alerts_rss()
     if rss:
-        print("✅ 成功透過 RSS 取得快訊資料")
+        print("✅ 成功透過 RSS 取得並過濾快訊資料")
         return rss
-    print("ℹ️ 目前無 RSS 快訊設定或未回傳，略過快訊區塊。")
+    print("ℹ️ 目前無 RSS 快訊設定或無資料，略過快訊區塊。")
     return {}
 
 # ==========================================================
@@ -505,7 +517,7 @@ def build_radar(quotes, price_features, institutional_features):
     df=pd.concat([df, classified], axis=1); df["score"]=df["base_score"]
     df.loc[df["trust_buy_days_5"]>=4, "score"]+=2
     df.loc[df["foreign_support"]==True, "score"]+=1
-    signal_order={"🟢 吸籌延續／初步確認":1,"🔵 主動資金疑似布局":2,"🟣 中期資金流入待驗證":3,"🟡 籌碼尚在、價格轉弱":4,"🟡 籌碼鬆動, 跌破MA10":5,"⚪ 待驗證：僅外資流入":6,"🔴 排除：拉高／過熱":7,"🔴 排除：法人轉賣":8,"🟠 排除：避險流量主導":9,"⚪ 排除：權值／ETF／工具股":10,"⚪ 不列入":99}
+    signal_order={"🟢 吸籌延續／初步確認":1,"🔵 主動資金疑似布局":2,"🟣 中期資金流入待驗證":3,"🟡 籌碼尚在、價格轉轉弱":4,"🟡 籌碼鬆動, 跌破MA10":5,"⚪ 待驗證：僅外資流入":6,"🔴 排除：拉高／過熱":7,"🔴 排除：法人轉賣":8,"🟠 排除：避險流量主導":9,"⚪ 排除：權值／ETF／工具股":10,"⚪ 不列入":99}
     df["sort_order"]=df["signal"].map(signal_order).fillna(99)
     return df.sort_values(["sort_order","score","turnover"], ascending=[True, False, False], na_position="last").drop(columns=["sort_order"])
 
@@ -532,7 +544,7 @@ def make_html_focus_report(radar, alerts_dict=None):
     if alerts_dict is None: alerts_dict={}
     html_content = """
     <div style="margin-bottom: 25px; border: 1px solid #ddd; border-radius: 8px; padding: 15px; background-color: #fafafa;">
-        <h3 style="color: #333; border-bottom: 2px solid #1565c0; padding-bottom: 8px; margin-top: 0;">⭐ 8大核心持股研究健檢 + Google快訊</h3>
+        <h3 style="color: #333; border-bottom: 2px solid #1565c0; padding-bottom: 8px; margin-top: 0;">⭐ 8大核心持股研究健檢 + 精選即時快訊</h3>
     """
     for stock_id in FOCUS_STOCKS:
         profile=FOCUS_PROFILES.get(stock_id, {})
@@ -570,8 +582,8 @@ def make_html_focus_report(radar, alerts_dict=None):
         alerts = alerts_dict.get(stock_id, [])
         if alerts:
             html_content += f"""
-                <div style="margin-top: 8px; background: #fffde7; padding: 8px; border-radius: 4px; border: 1px solid #fff59d;">
-                    <span style="font-weight: bold; color: #f57f17;">📰 Google快訊 ({len(alerts)}則)：</span>
+                <div style="margin-top: 8px; background: #f1f8e9; padding: 8px; border-radius: 4px; border: 1px solid #c8e6c9;">
+                    <span style="font-weight: bold; color: #2e7d32;">📰 精選最新快訊：</span>
                     <ul style="margin: 4px 0 0 20px; padding: 0; font-size: 12px;">
             """
             for al in alerts:
@@ -579,14 +591,14 @@ def make_html_focus_report(radar, alerts_dict=None):
                 html_content += f"""
                     <li style="margin-bottom: 4px;">
                         {icon} <span style="color: {'#d32f2f' if al['level']=='高風險' else '#333'};"><b>[{al['level']}]</b> {al['title']}</span>
-                        <br><a href="{al['link']}" target="_blank" style="color: #1976d2; text-decoration: none; font-size: 11px;">閱讀全文 ↗</a>
+                        <br><a href="{al['link']}" target="_blank" style="color: #1976d2; text-decoration: none; font-size: 11px;">閱讀完整報導 ↗</a>
                     </li>
                 """
             html_content += "</ul></div>"
         else:
             html_content += f"""
                 <div style="margin-top: 6px; color: #888; font-size: 12px;">
-                    📰 Google快訊：目前無新快訊
+                    📰 即時快訊：今日無重大或過濾後無新動態
                 </div>
             """
             
@@ -669,7 +681,7 @@ def make_html_email_body(radar, date_text, execution_time, alerts_dict=None):
     <body style="font-family: Arial, Microsoft JhengHei, sans-serif; color: #333; line-height: 1.5; background-color: #f9f9f9; padding: 20px;">
         <div style="max-width: 800px; margin: auto; background: #ffffff; padding: 25px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1);">
             <h2 style="color: #1565c0; border-bottom: 3px solid #1565c0; padding-bottom: 10px; margin-top: 0;">
-                📈 台股主動資金雷達與風控觀察報告 v5.7
+                📈 台股主動資金雷達與風控觀察報告 v5.8
             </h2>
             <p style="font-size: 14px; color: #666;">
                 <b>日期：</b>{date_text} &nbsp;|&nbsp; <b>執行時間：</b>{execution_time} (台灣時間)
@@ -709,7 +721,7 @@ def make_html_email_body(radar, date_text, execution_time, alerts_dict=None):
 
             <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0;">
             <p style="font-size: 12px; color: #888; text-align: center;">
-                本報告為公開資料研究工具 + Google快訊整合，不構成任何投資建議。
+                本報告為公開資料研究工具 + 智慧過濾快訊整合，不構成任何投資建議。
             </p>
         </div>
     </body>
@@ -725,8 +737,6 @@ def send_email(subject, html_body):
     message["From"] = GMAIL_USER
     message["To"] = RECIPIENT_EMAIL
     message["Subject"] = subject
-    
-    # 夾帶 HTML 內容
     message.attach(MIMEText(html_body, "html", "utf-8"))
     
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
@@ -738,7 +748,7 @@ def main():
     now = now_tw()
     date_text = now.strftime("%Y-%m-%d")
     print("="*60)
-    print(f"開始執行台股主動資金雷達 v5.7：{date_text}")
+    print(f"開始執行台股主動資金雷達 v5.8：{date_text}")
     print("="*60)
     
     try:
@@ -754,7 +764,6 @@ def main():
         print(f"⚠️ 法人資料取得失敗，今天略過法人計算：{error}")
         institutional_today = pd.DataFrame()
 
-    # Google 快訊
     try:
         alerts_dict = fetch_google_alerts()
     except Exception as e:
@@ -776,12 +785,7 @@ def main():
     print(f"雷達 CSV 已輸出：{radar_path}")
 
     html_body = make_html_email_body(radar, date_text, now.strftime("%Y-%m-%d %H:%M"), alerts_dict)
-    
-    print("\n" + "="*60)
-    print("HTML 報表已產生，準備發送彩色郵件...")
-    print("="*60 + "\n")
-    
-    send_email(f"主動資金雷達 v5.7｜{date_text}", html_body)
+    send_email(f"主動資金雷達 v5.8｜{date_text}", html_body)
     print("執行完成。")
 
 if __name__ == "__main__":
@@ -792,7 +796,7 @@ if __name__ == "__main__":
         print("\n程式發生錯誤：")
         print(error_text)
         try:
-            send_email(f"【錯誤】主動資金雷達 v5.7｜{today_str()}", f"<pre>{error_text}</pre>")
+            send_email(f"【錯誤】主動資金雷達 v5.8｜{today_str()}", f"<pre>{error_text}</pre>")
         except Exception:
             pass
         raise
