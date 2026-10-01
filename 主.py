@@ -48,6 +48,14 @@ QUOTE_COLS = ["date", "stock_id", "stock_name", "market", "close", "volume", "tu
 INST_COLS = ["date", "stock_id", "foreign_net", "trust_net", "dealer_prop", "dealer_hedge", "dealer_total", "market"]
 SIGNAL_COLS = ["signal_date", "stock_id", "stock_name", "market", "signal", "reason", "score",
                "close_at_signal", "trust_5d_net", "foreign_5d_net", "ma5", "ma10", "ma20", "tech"]
+_SIG_TYPES = {"score": "INTEGER", "close_at_signal": "REAL", "trust_5d_net": "INTEGER",
+              "foreign_5d_net": "INTEGER", "ma5": "REAL", "ma10": "REAL", "ma20": "REAL"}
+EXPECTED_COLUMNS = {   # 表 → {欄位: 型別}，用來把舊資料庫補齊
+    "prices": {c: ("REAL" if c in ("close", "turnover") else "INTEGER" if c == "volume" else "TEXT")
+               for c in QUOTE_COLS},
+    "institutional": {c: ("TEXT" if c in ("date", "stock_id", "market") else "INTEGER") for c in INST_COLS},
+    "signals": {c: _SIG_TYPES.get(c, "TEXT") for c in SIGNAL_COLS},
+}
 
 # (key, 顯示名稱, 分數)；順序 = 排序優先序
 SIGNAL_TABLE = [
@@ -214,6 +222,13 @@ def init_db():
                      "market TEXT, signal TEXT, reason TEXT, score INTEGER, close_at_signal REAL, "
                      "trust_5d_net INTEGER, foreign_5d_net INTEGER, ma5 REAL, ma10 REAL, ma20 REAL, tech TEXT, "
                      "PRIMARY KEY(signal_date, stock_id))")
+        # 舊版資料庫的表可能缺欄位（CREATE IF NOT EXISTS 不會補），這裡自動補上
+        for table, cols in EXPECTED_COLUMNS.items():
+            have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for name, typ in cols.items():
+                if name not in have:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
+                    print(f"資料庫升級：{table} 補上欄位 {name}")
 
 
 def _py(v):
