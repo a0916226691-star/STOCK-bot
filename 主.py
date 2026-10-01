@@ -40,6 +40,12 @@ OUTPUT_DIR = os.getenv("RADAR_OUTPUT_DIR", "output")
 DB_PATH = os.path.join(OUTPUT_DIR, "tw_radar.db")
 HEADERS = {"User-Agent": "Mozilla/5.0 Chrome/124.0", "Referer": "https://www.twse.com.tw/"}
 
+# 我真正買的股票：放在「股票追蹤」檔（每行「股票代號,買進價」），程式每天幫你檢查該不該賣。
+# 檔名可以是 股票追蹤.csv／股票追蹤.txt／股票追蹤（沒有副檔名）／holdings.csv，放在專案最外層（跟 主.py 同一層）
+HOLDINGS_FILES = [os.getenv("RADAR_HOLDINGS")] if os.getenv("RADAR_HOLDINGS") else [
+    "股票追蹤.csv", "股票追蹤.txt", "股票追蹤", "holdings.csv"]
+HOLDINGS_FILE = HOLDINGS_FILES[0]
+
 # ── 追蹤規則（一檔股票出現後：觀察中 → 買進 → 持有中 → 賣出）──────────────
 TRACK_START = {"PRE_BOTH", "NEAR_BOTH", "FOREIGN_FIRST", "PRE_FOREIGN", "PRE_TRUST", "BOTH_WAIT", "TRUST_WAIT"}
 WATCH_MAX_DAYS = 20        # 觀察超過幾個交易日還沒到買點，就放棄
@@ -1159,6 +1165,57 @@ def build_tracking_text(recs, radar, events, version=None):
                         sec(f"🗑 今天放棄追蹤 {len(events['drop'])} 檔", events["drop"], 15)])
 
 
+# ───────────────────────── 我真正買的股票 ─────────────────────────
+def load_holdings():
+    """讀 holdings.csv。每行：股票代號,買進價（買進價可不填）。空行、# 開頭、標題列都會略過。賣掉了就把那一行刪掉。"""
+    global HOLDINGS_FILE
+    out = {}
+    found = next((p for p in HOLDINGS_FILES if p and os.path.exists(p)), None)
+    if found is None and HOLDINGS_FILE and os.path.exists(HOLDINGS_FILE):
+        found = HOLDINGS_FILE                      # 讓測試或環境變數指定的路徑也能用
+    if found is None:
+        print(f"沒有找到持股檔（{' / '.join(p for p in HOLDINGS_FILES if p)}），略過我的持股")
+        return out
+    HOLDINGS_FILE = found
+    try:
+        with open(HOLDINGS_FILE, encoding="utf-8-sig") as f:
+            for line in f:
+                line = line.strip().replace("，", ",")
+                if not line or line.startswith("#"):
+                    continue
+                parts = [p.strip() for p in line.split(",")]
+                sid = normalize_stock_id(parts[0])
+                if not is_stock_id(sid):
+                    continue                           # 標題列或亂打的字
+                price = safe_float(parts[1]) if len(parts) > 1 else np.nan
+                out[sid] = None if pd.isna(price) or price <= 0 else float(price)
+    except Exception as e:
+        print(f"讀取 {HOLDINGS_FILE} 失敗：{e}")
+    print(f"我的持股：{len(out)} 檔（{HOLDINGS_FILE}）")
+    return out
+
+
+def build_holdings_text(radar, holdings):
+    """每天檢查你真正買的股票：續抱，還是出現賣出訊號。回傳 (文字, 賣出警示數)。"""
+    if not holdings:
+        return "", 0
+    rows = radar.drop_duplicates("stock_id").set_index("stock_id")
+    out, alerts = [], 0
+    for sid, cost in holdings.items():
+        if sid not in rows.index:
+            out.append(f"❔ {sid}｜今天沒有行情資料（休市、下市或代號打錯？）")
+            continue
+        r = rows.loc[sid]
+        why = sell_reason(r, cost)
+        alerts += bool(why)
+        pnl = f"｜買進 {cost:g} → 現價 {r['close']:.1f}（{(r['close'] / cost - 1) * 100:+.1f}%）" if cost else f"｜現價 {r['close']:.1f}（沒填買進價，算不出損益與停損）"
+        stop = f"｜停損價 {cost * (1 - STOP_LOSS_PCT / 100):.1f}" if cost else ""
+        ma = f"｜離MA10 {(r['close'] / r['ma10'] - 1) * 100:+.1f}%" if pd.notna(r["ma10"]) else ""
+        out.append(f"{'🚨 該賣：' + why if why else '✅ 續抱'}｜{sid} {r['stock_name']}{pnl}{stop}{ma}\n"
+                   f"   {_chip(r)}")
+    return "\n".join(out), alerts
+
+
 # ───────────────────────── 輸出：存檔／Email ─────────────────────────
 def save_signals(radar, data_date):
     sig = pd.DataFrame({
@@ -1219,7 +1276,7 @@ v9.2 再加：大盤環境（全市場站上月線的股票<""" + f"{MARKET_MIN_
 損益未扣交易成本（來回約0.6%：手續費買賣各0.1425%＋證交稅0.3%，實際依券商折扣）"""
 
 
-def build_email_body(radar, data_date, track_text=""):
+def build_email_body(radar, data_date, track_text="", hold_text=""):
     k = radar["signal_key"]
     cheap = radar["close"] <= MAX_PRICE                # 只列買得起的（股價上限見 MAX_PRICE）
     best, follow = radar[k.isin(GROUP_BEST) & cheap], radar[k.isin(GROUP_FOLLOW) & cheap]
@@ -1228,7 +1285,9 @@ def build_email_body(radar, data_date, track_text=""):
     b = radar["mkt_breadth"].iloc[0] if "mkt_breadth" in radar.columns and len(radar) else np.nan
     mkt = ("大盤環境：資料不足，暫時無法判斷" if pd.isna(b) else
            f"大盤環境：{b:.0f}% 的股票站上月線｜" + ("偏弱（v9.2 暫停新買進）" if b < MARKET_MIN_BREADTH else "正常"))
+    hold = f"{line}\n💼 我實際持有的股票（賣出檢查，賣掉了請從「股票追蹤」檔刪掉那一行）\n{hold_text}\n\n" if hold_text else ""
     return (f"台股雷達 {VERSION} 搭順風車版｜資料日 {data_date}\n{mkt}\n\n"
+            f"{hold}"
             f"{line}\n🔵🟣 今日候選：吸籌末端·第一根 {len(best)} 檔（股價≤{MAX_PRICE:g}元，列前30）\n{fmt_rows(best, 30)}\n\n"
             f"{line}\n📌 追蹤中（候選股的買賣模擬）\n{track_text}\n\n"
             f"{line}\n🔵🟣 跟著大戶 {len(follow)} 檔（股價≤{MAX_PRICE:g}元，列前20）\n{fmt_rows(follow, 20)}\n\n"
@@ -1294,10 +1353,12 @@ def run(send_mail=True):
     if len(VERSIONS) > 1:
         track_text += ("\n\n【版本對照（成績單會比較哪個版本表現比較好）】\n"
                        + "\n".join(compare_line(v, results[v][1]) for v in VERSIONS))
+    hold_text, alerts = build_holdings_text(radar, load_holdings())
     if send_mail:
         best_n = int((radar["signal_key"].isin(GROUP_BEST) & (radar["close"] <= MAX_PRICE)).sum())
-        subject = f"雷達 {VERSION}｜{data_date}｜第一根候選{best_n} 買進{len(events['buy'])} 賣出{len(events['sell'])}"
-        send_email(subject, build_email_body(radar, data_date, track_text))
+        subject = (f"{'🚨' if alerts else ''}雷達 {VERSION}｜{data_date}｜第一根候選{best_n} 買進{len(events['buy'])} 賣出{len(events['sell'])}"
+                   + (f"｜我的持股該賣{alerts}" if alerts else ""))
+        send_email(subject, build_email_body(radar, data_date, track_text, hold_text))
     print("=== 完成 ===")
 
 
