@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "7 23 * * 0-4"  # 台灣時間每週一至週五早上 07:07 自動執行（資料最完整）
   workflow_dispatch:        # 保留手動觸發按鈕
+    inputs:
+      backfill_days:
+        description: "回補最近幾天的上市歷史資料（第一次建議填 45；平常留 0）"
+        required: false
+        default: "0"
 
 permissions:
   contents: write
@@ -11,6 +16,7 @@ permissions:
 jobs:
   run-stock-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -37,8 +43,30 @@ jobs:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          RADAR_VERSION: "v9.0"          # 每次改選股規則就換一個名字，例如 v9.1，成績單會分開算
+          BACKFILL_DAYS: ${{ github.event.inputs.backfill_days }}
         run: |
-          python 主.py
+          if [ -n "$BACKFILL_DAYS" ] && [ "$BACKFILL_DAYS" != "0" ]; then
+            python 主.py --backfill "$BACKFILL_DAYS"
+          else
+            python 主.py
+          fi
+
+      - name: Run evaluation report
+        # 成績單失敗不應該擋住後面「存檔」的步驟，所以允許失敗
+        continue-on-error: true
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          # 平常只把成績單印在執行紀錄裡；每週五與手動執行時才寄信
+          EXTRA=""
+          if [ "$(TZ=Asia/Taipei date +%u)" = "5" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            EXTRA="--email"
+          fi
+          python 輔.py --detail --csv output/evaluation.csv $EXTRA
 
       - name: Check generated CSV files
         if: always()
@@ -53,9 +81,9 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "4189282+github-actions[bot]@users.noreply.github.com"
-          
+
           git add output/
-          
+
           if git diff --cached --quiet; then
             echo "No CSV changes to save."
           else
