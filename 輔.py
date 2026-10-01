@@ -116,7 +116,8 @@ def trade_report(tr, prices, cost):
                    "盈虧比": pf, "最大虧損%": round(closed["net"].min(), 2),
                    "平均持有天": round(closed["days_held"].astype(float).mean(), 1),
                    "備註": "樣本少" if len(closed) < MIN_N else ""})
-        for reason, gg in closed.groupby("exit_reason"):
+        closed["原因"] = closed["exit_reason"].astype(str).str.split("（").str[0]    # 去掉括號裡的數字，同一種原因歸在一起
+        for reason, gg in closed.groupby("原因"):
             rs.append({"版本": ver, "賣出原因": reason, "筆數": len(gg), "平均損益%": round(gg["net"].mean(), 2),
                        "勝率%": round((gg["net"] > 0).mean() * 100, 1)})
     out = [f"【追蹤交易成績：從買進到賣出的實際損益（已扣來回交易成本 {cost:g}%）】",
