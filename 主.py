@@ -43,6 +43,8 @@ WATCHLIST = ["2383", "2368", "6197", "3293", "4763", "1808", "6919"]  # 只觀�
 EXCLUDE_TOOL_STOCKS = {"2330", "2454", "2308", "3711", "2881", "2882", "2884", "2886",
                        "2891", "2892", "2880", "0050", "0056", "00878", "006208", "00919", "00929"}
 MIN_DAILY_TURNOVER = 30_000_000   # 成交金額下限（元）
+# 版本標記：每次改選股規則就換一個名字（環境變數 RADAR_VERSION），evaluate.py 會依版本分開算成績
+VERSION = os.getenv("RADAR_VERSION", "v9.0")
 
 QUOTE_COLS = ["date", "stock_id", "stock_name", "market", "close", "volume", "turnover"]
 INST_COLS = ["date", "stock_id", "foreign_net", "trust_net", "dealer_prop", "dealer_hedge", "dealer_total", "market"]
@@ -229,6 +231,11 @@ def init_db():
                 if name not in have:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
                     print(f"資料庫升級：{table} 補上欄位 {name}")
+        # 帶版本的訊號紀錄：主鍵含 version，不同版本同一天、同一檔股票不會互相覆蓋
+        conn.execute("CREATE TABLE IF NOT EXISTS signal_log (signal_date TEXT, stock_id TEXT, version TEXT, "
+                     "stock_name TEXT, market TEXT, signal TEXT, reason TEXT, score INTEGER, "
+                     "close_at_signal REAL, trust_5d_net INTEGER, foreign_5d_net INTEGER, "
+                     "ma5 REAL, ma10 REAL, ma20 REAL, tech TEXT, PRIMARY KEY(signal_date, stock_id, version))")
 
 
 def _py(v):
@@ -686,6 +693,11 @@ def save_signals(radar, data_date):
         conn.execute("DELETE FROM signals WHERE signal_date=?", (data_date,))
     n = upsert("signals", sig, SIGNAL_COLS)
     print(f"signals 寫入 {n} 筆")
+    log = sig.assign(version=VERSION)
+    with db() as conn:
+        conn.execute("DELETE FROM signal_log WHERE signal_date=? AND version=?", (data_date, VERSION))
+    upsert("signal_log", log, ["version"] + SIGNAL_COLS)
+    print(f"signal_log 寫入 {len(log)} 筆（版本 {VERSION}）")
 
 
 def _f(x, spec="{:.1f}"):
