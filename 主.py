@@ -21,6 +21,7 @@ v9 修正重點
   7. 成交金額門檻改套用在所有「買進類」訊號
 """
 import argparse
+import io
 import os
 import smtplib
 import sqlite3
@@ -54,8 +55,21 @@ BUY_MAX_RET5 = 12.0        # 買進條件：5日漲幅要小於此 %（還沒噴
 EXCLUDE_TOOL_STOCKS = {"2330", "2454", "2308", "3711", "2881", "2882", "2884", "2886",
                        "2891", "2892", "2880", "0050", "0056", "00878", "006208", "00919", "00929"}
 MIN_DAILY_TURNOVER = 30_000_000   # 成交金額下限（元）
-# 版本標記：每次改選股規則就換一個名字（環境變數 RADAR_VERSION），evaluate.py 會依版本分開算成績
-VERSION = os.getenv("RADAR_VERSION", "v9.0")
+# ── 版本：同一次執行可以同時追蹤好幾個「規則版本」，成績單會並排比較 ──────────────
+# 環境變數 RADAR_VERSIONS（逗號分隔），第一個是主要版本：信件詳細內容與持股檢查都用它；其他版本在信裡只列一行對照。
+VERSIONS = [v.strip() for v in os.getenv("RADAR_VERSIONS", "v9.1,v9.0").split(",") if v.strip()]
+VERSION = VERSIONS[0]
+SIGNAL_VERSION = os.getenv("RADAR_SIGNAL_VERSION", "v9.0")   # 「訊號分類」本身的版本標記（v9.0 與 v9.1 的訊號分類相同）
+# 每個版本開哪些額外條件；沒列在這裡的版本名稱一律當作 v9.0（不開額外條件）
+RULESETS = {
+    "v9.0": {"dealer": False, "big": False},
+    "v9.1": {"dealer": True, "big": True},    # v9.0 ＋ 自營商（三大法人合計）＋ 千張大戶持股變化
+}
+# 千張大戶（集保「股權分散表」每週公布）
+BIG_HOLDER_LEVEL = 15      # 持股分級 15 ＝ 1,000,001 股（1000 張）以上
+BIG_BUY_MIN_DELTA = 0.0    # 買進：千張大戶持股比例本週增減（百分點）要大於此；資料還不夠算增減時不擋
+BIG_SELL_DELTA = -0.5      # 賣出／放棄：千張大戶持股比例本週減少達此百分點（例如 -0.5 ＝ 減少 0.5 個百分點）
+HOLDER_COLS = ["date", "stock_id", "big_ratio", "big_people"]
 
 QUOTE_COLS = ["date", "stock_id", "stock_name", "market", "close", "volume", "turnover"]
 INST_COLS = ["date", "stock_id", "foreign_net", "trust_net", "dealer_prop", "dealer_hedge", "dealer_total", "market"]
@@ -252,6 +266,9 @@ def init_db():
                      "stock_name TEXT, status TEXT, start_signal TEXT, entry_date TEXT, entry_price REAL, "
                      "exit_date TEXT, exit_price REAL, exit_reason TEXT, last_date TEXT, "
                      "days_watched INTEGER, days_held INTEGER, PRIMARY KEY(version, stock_id, first_seen))")
+        # 集保千張大戶持股（每週一筆）
+        conn.execute("CREATE TABLE IF NOT EXISTS holders (date TEXT, stock_id TEXT, big_ratio REAL, "
+                     "big_people INTEGER, PRIMARY KEY(date, stock_id))")
 
 
 def _py(v):
@@ -456,17 +473,83 @@ def fetch_tpex_inst():
     if not f_key or not t_key:
         print("⚠ TPEx 法人欄位對不上，這次略過櫃買法人。API 欄位：", keys)
         return pd.DataFrame(columns=INST_COLS)
+    # 自營商欄位（名稱我沒辦法事先確認，所以用關鍵字偵測；對不上就當 0，不影響其他功能）
+    d_keys = [k for k in diff if "Dealer" in k and "Foreign" not in k]
+    prop_k = next((k for k in d_keys if "Proprietary" in k or "Self" in k), None)
+    hedge_k = next((k for k in d_keys if "Hedg" in k), None)
+    tot_k = next((k for k in d_keys if k not in (prop_k, hedge_k)), None)
     print(f"TPEx 法人欄位對應：外資={f_key}｜投信={t_key}")
+    print(f"TPEx 自營商欄位對應：自行買賣={prop_k}｜避險={hedge_k}｜合計={tot_k}｜（所有含 Dealer 的欄位：{d_keys}）")
+    if not prop_k and not tot_k:
+        print("⚠ TPEx 自營商欄位偵測不到，上櫃自營商先當 0。請把上面「所有含 Dealer 的欄位」貼給我。")
     date = parse_date(pick(data[0], "Date")) or guess_last_close_date()
     rows = []
     for it in data:
         sid = normalize_stock_id(pick(it, "SecuritiesCompanyCode", "Code") or "")
         if not is_stock_id(sid):
             continue
+        hedge = safe_int(it.get(hedge_k)) if hedge_k else 0
+        total = safe_int(it.get(tot_k)) if tot_k else None
+        prop = safe_int(it.get(prop_k)) if prop_k else ((total - hedge) if total is not None else 0)
         rows.append({"date": date, "stock_id": sid, "foreign_net": safe_int(it.get(f_key)),
-                     "trust_net": safe_int(it.get(t_key)), "dealer_prop": 0, "dealer_hedge": 0,
-                     "dealer_total": 0, "market": "TPEx"})
+                     "trust_net": safe_int(it.get(t_key)), "dealer_prop": prop, "dealer_hedge": hedge,
+                     "dealer_total": total if total is not None else prop + hedge, "market": "TPEx"})
     return pd.DataFrame(rows, columns=INST_COLS)
+
+
+# ───────────────────────── 抓資料：千張大戶（集保，每週） ─────────────────────────
+def fetch_tdcc_holders():
+    """集保「股權分散表」開放資料：每檔股票各持股分級的人數、股數、佔比。只取千張以上那一級。"""
+    r = requests.get("https://opendata.tdcc.com.tw/getOD.ashx?id=1-5", headers=HEADERS, timeout=90)
+    r.raise_for_status()
+    try:
+        text = r.content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = r.content.decode("cp950", errors="replace")
+    df = pd.read_csv(io.StringIO(text), dtype=str)
+    df.columns = [str(c).strip() for c in df.columns]
+    find = lambda kw: next((c for c in df.columns if kw in c), None)
+    c_date, c_id, c_lv, c_ratio, c_ppl = find("日期"), find("代號"), find("分級"), find("比例"), find("人數")
+    if not (c_date and c_id and c_lv and c_ratio):
+        print("⚠ 集保資料欄位對不上，這次略過千張大戶。欄位：", list(df.columns))
+        return pd.DataFrame(columns=HOLDER_COLS)
+    big = df[pd.to_numeric(df[c_lv], errors="coerce") == BIG_HOLDER_LEVEL]
+    out = pd.DataFrame({"date": big[c_date].map(parse_date), "stock_id": big[c_id].map(normalize_stock_id),
+                        "big_ratio": pd.to_numeric(big[c_ratio], errors="coerce"),
+                        "big_people": pd.to_numeric(big[c_ppl], errors="coerce") if c_ppl else np.nan})
+    out = out[out["stock_id"].map(is_stock_id) & out["date"].notna() & out["big_ratio"].notna()]
+    if out.empty:
+        print("⚠ 集保資料裡找不到持股分級", BIG_HOLDER_LEVEL, "的資料，這次略過千張大戶。分級值：",
+              sorted(df[c_lv].dropna().unique())[:20])
+        return pd.DataFrame(columns=HOLDER_COLS)
+    return out[HOLDER_COLS].reset_index(drop=True)
+
+
+def collect_holders():
+    try:
+        h = fetch_tdcc_holders()
+    except Exception as e:
+        print(f"集保千張大戶失敗：{e}")
+        return pd.DataFrame(columns=HOLDER_COLS)
+    if not h.empty:
+        print(f"集保千張大戶：{len(h)} 檔（資料日 {h['date'].iloc[0]}，持股分級 {BIG_HOLDER_LEVEL}）"
+              f"｜佔比中位數 {h['big_ratio'].median():.1f}%")
+    return h
+
+
+def make_holder_features(h):
+    """每檔股票：最新一週的千張大戶佔比，以及相較上一週的增減（百分點）。只有一週資料時增減為空。"""
+    cols = ["stock_id", "big_ratio", "big_delta", "big_date"]
+    if h is None or h.empty:
+        return pd.DataFrame(columns=cols)
+    h = h.drop_duplicates(["date", "stock_id"], keep="last").sort_values(["stock_id", "date"]).copy()
+    h["prev"] = h.groupby("stock_id")["big_ratio"].shift(1)
+    last = h.groupby("stock_id").tail(1).copy()
+    last["big_delta"] = last["big_ratio"] - last["prev"]
+    last = last.rename(columns={"date": "big_date"})
+    n_delta = int(last["big_delta"].notna().sum())
+    print(f"千張大戶特徵：{len(last)} 檔｜可算週增減 {n_delta} 檔（資料日 {last['big_date'].max()}）")
+    return last[cols]
 
 
 def collect_inst():
@@ -575,7 +658,7 @@ def make_inst_features(inst, price_feat):
         print("法人資料空")
         return pd.DataFrame()
     df = inst.copy()
-    for c in ("foreign_net", "trust_net", "dealer_hedge"):
+    for c in ("foreign_net", "trust_net", "dealer_hedge", "dealer_prop"):
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
     df = df.drop_duplicates(["date", "stock_id"], keep="last").sort_values(["stock_id", "date"])
     n_days = df["date"].nunique()
@@ -586,7 +669,8 @@ def make_inst_features(inst, price_feat):
     last5["h_abs"] = last5["dealer_hedge"].abs()
     agg = last5.groupby("stock_id").agg(
         n_days=("date", "size"), trust_5d=("trust_net", "sum"), foreign_5d=("foreign_net", "sum"),
-        trust_days=("t_pos", "sum"), foreign_days=("f_pos", "sum"), hedge_abs=("h_abs", "sum")).reset_index()
+        trust_days=("t_pos", "sum"), foreign_days=("f_pos", "sum"), hedge_abs=("h_abs", "sum"),
+        dealer_5d=("dealer_prop", "sum")).reset_index()          # 自營商「自行買賣」5日加總（避險部位不算）
     if price_feat is not None and not price_feat.empty:
         agg = agg.merge(price_feat[["stock_id", "avg_vol_5d"]], on="stock_id", how="left")
     else:
@@ -599,7 +683,7 @@ def make_inst_features(inst, price_feat):
     agg["trust_acc"] = (agg["trust_days"] >= needed) & (agg["trust_5d"] > 0) & ~agg["hedge_dominant"]
     agg["foreign_acc"] = (agg["foreign_days"] >= needed) & (agg["foreign_5d"] > 0) & (agg["foreign_5d"].abs() >= 100_000)
     print(f"法人特徵：{len(agg)} 檔｜資料 {n_days} 天（門檻 {needed} 天）｜避險主導 {int(agg['hedge_dominant'].sum())}")
-    return agg[["stock_id", "trust_5d", "foreign_5d", "trust_days", "foreign_days",
+    return agg[["stock_id", "trust_5d", "foreign_5d", "dealer_5d", "trust_days", "foreign_days",
                 "trust_acc", "foreign_acc", "hedge_dominant"]]
 
 
@@ -665,7 +749,7 @@ def classify(r):
 
 BOOL_COLS = ["trust_acc", "foreign_acc", "hedge_dominant", "is_multi_up", "above_ma10", "above_ma20",
              "is_consolidation", "near_high", "first_break", "pre_breakout", "exploded", "overheat"]
-NUM0_COLS = ["trust_5d", "foreign_5d", "trust_days", "foreign_days"]
+NUM0_COLS = ["trust_5d", "foreign_5d", "dealer_5d", "trust_days", "foreign_days"]
 
 
 def tech_text(r):
@@ -675,13 +759,18 @@ def tech_text(r):
     return f"MA5:{vals[0]:.1f} MA10:{vals[1]:.1f} MA20:{vals[2]:.1f} 前20高:{vals[3]:.1f}"
 
 
-def build_radar(price_feat, inst_feat):
+def build_radar(price_feat, inst_feat, holder_feat=None):
     if price_feat is None or price_feat.empty:
         print("radar 空")
         return pd.DataFrame()
     df = price_feat.copy()
     if inst_feat is not None and not inst_feat.empty:
         df = df.merge(inst_feat, on="stock_id", how="left")
+    if holder_feat is not None and not holder_feat.empty:
+        df = df.merge(holder_feat, on="stock_id", how="left")
+    for c in ("big_ratio", "big_delta"):              # 千張大戶資料可能還沒有（缺值＝不影響判斷）
+        if c not in df.columns:
+            df[c] = np.nan
     for c in BOOL_COLS:
         df[c] = df[c].eq(True) if c in df.columns else False
     for c in NUM0_COLS:
@@ -705,17 +794,36 @@ TRACK_COLS = ["version", "stock_id", "first_seen", "stock_name", "status", "star
               "entry_price", "exit_date", "exit_price", "exit_reason", "last_date", "days_watched", "days_held"]
 
 
-def buy_check(r):
-    """買進條件：收盤突破前 20 日高、還沒爆量、還沒急漲、投信或外資 5 日淨買、成交金額夠。"""
+def rs_of(version):
+    """版本 → 額外條件開關；沒登記的版本名稱當作 v9.0。"""
+    return RULESETS.get(version, {"dealer": False, "big": False})
+
+
+def inst3_5d(r):
+    """三大法人 5 日合計＝投信＋外資＋自營商（自行買賣）。"""
+    return r["trust_5d"] + r["foreign_5d"] + r["dealer_5d"]
+
+
+def buy_check(r, rs=None):
+    """買進條件：收盤突破前 20 日高、還沒爆量、還沒急漲、投信或外資 5 日淨買、成交金額夠。
+    v9.1 再加：三大法人（含自營商）5 日合計淨買；千張大戶持股比例本週有增加（資料不足時不擋）。"""
+    rs = rs or rs_of(VERSION)
     ph, vr, r5 = r["prev_high20"], r["vol_ratio_5d"], r["return_5d"]
     if pd.isna(ph) or pd.isna(vr) or pd.isna(r5):
         return False
-    return bool(r["close"] > ph and vr < BUY_MAX_VOL_RATIO and r5 < BUY_MAX_RET5
-                and (r["trust_5d"] > 0 or r["foreign_5d"] > 0) and r["turnover"] >= MIN_DAILY_TURNOVER)
+    if not (r["close"] > ph and vr < BUY_MAX_VOL_RATIO and r5 < BUY_MAX_RET5
+            and (r["trust_5d"] > 0 or r["foreign_5d"] > 0) and r["turnover"] >= MIN_DAILY_TURNOVER):
+        return False
+    if rs["dealer"] and inst3_5d(r) <= 0:
+        return False
+    if rs["big"] and pd.notna(r["big_delta"]) and r["big_delta"] <= BIG_BUY_MIN_DELTA:
+        return False
+    return True
 
 
-def sell_reason(r, entry_price=None):
+def sell_reason(r, entry_price=None, rs=None):
     """賣出條件（任一成立）；回傳原因，沒有則 None。順序＝優先序。"""
+    rs = rs or rs_of(VERSION)
     c = r["close"]
     if entry_price and c / entry_price - 1 <= -STOP_LOSS_PCT / 100:
         return f"停損 {STOP_LOSS_PCT:g}%"
@@ -723,23 +831,38 @@ def sell_reason(r, entry_price=None):
         return "已爆發·散戶衝進來"
     if r["trust_5d"] < 0 and r["foreign_5d"] < 0:
         return "土洋雙殺"
+    if rs["dealer"] and inst3_5d(r) < 0:
+        return "三大法人合計淨賣"
+    if rs["big"] and pd.notna(r["big_delta"]) and r["big_delta"] <= BIG_SELL_DELTA:
+        return f"千張大戶減持（本週{r['big_delta']:+.2f}個百分點）"
     if pd.notna(r["ma10"]) and c < r["ma10"]:
         return "跌破MA10"
     return None
 
 
-def drop_reason(r, days_watched):
+def drop_reason(r, days_watched, rs=None):
+    rs = rs or rs_of(VERSION)
     if r["exploded"]:
         return "已爆發·沒買到不追"
-    if r["trust_5d"] <= 0 and r["foreign_5d"] <= 0:
-        return "大戶不買了"
+    # 放棄規則 B：大戶「淨賣出」才放棄；只是暫停沒買（合計為 0）的繼續觀察
+    if rs["dealer"]:
+        if inst3_5d(r) < 0:
+            return "三大法人5日合計淨賣"
+    elif r["trust_5d"] < 0 and r["foreign_5d"] < 0:
+        return "土洋5日都在賣"
+    if rs["big"] and pd.notna(r["big_delta"]) and r["big_delta"] <= BIG_SELL_DELTA:
+        return f"千張大戶減持（本週{r['big_delta']:+.2f}個百分點）"
     if days_watched >= WATCH_MAX_DAYS:
         return f"觀察超過{WATCH_MAX_DAYS}天"
     return None
 
 
 def _chip(r):
-    return f"投信{int(round(float(r['trust_5d']) / 1000)):+,d}張 外資{int(round(float(r['foreign_5d']) / 1000)):+,d}張"
+    s = (f"投信{int(round(float(r['trust_5d']) / 1000)):+,d}張 外資{int(round(float(r['foreign_5d']) / 1000)):+,d}張 "
+         f"自營{int(round(float(r['dealer_5d']) / 1000)):+,d}張")
+    if pd.notna(r["big_delta"]):
+        s += f" 千張大戶{r['big_delta']:+.2f}pp"
+    return s
 
 
 def _enter(t, r, data_date, events):
@@ -749,10 +872,12 @@ def _enter(t, r, data_date, events):
         f"量比 {r['vol_ratio_5d']:.1f}，5日{r['return_5d']:+.1f}%｜{_chip(r)}｜停損價 {r['close'] * (1 - STOP_LOSS_PCT / 100):.1f}")
 
 
-def update_tracking(radar, data_date):
-    """每天更新一次所有追蹤中的股票，回傳 (所有紀錄, 今日事件)。同一天重跑不會重複計算。"""
+def update_tracking(radar, data_date, version=None):
+    """每天更新一次某個版本所有追蹤中的股票，回傳 (所有紀錄, 今日事件)。同一天重跑不會重複計算。"""
+    version = version or VERSION
+    rs = rs_of(version)
     with db() as conn:
-        tr = pd.read_sql("SELECT * FROM tracking WHERE version=?", conn, params=(VERSION,), dtype={"stock_id": str})
+        tr = pd.read_sql("SELECT * FROM tracking WHERE version=?", conn, params=(version,), dtype={"stock_id": str})
     tr = tr.astype(object).where(tr.notna(), None) if not tr.empty else tr
     recs = tr.to_dict("records") if not tr.empty else []
     rows = radar.drop_duplicates("stock_id").set_index("stock_id")
@@ -770,16 +895,16 @@ def update_tracking(radar, data_date):
         c = float(r["close"])
         if t["status"] == "WATCH":
             t["days_watched"] = int(t["days_watched"] or 0) + 1
-            if buy_check(r):
+            if buy_check(r, rs):
                 _enter(t, r, data_date, events)
             else:
-                why = drop_reason(r, t["days_watched"])
+                why = drop_reason(r, t["days_watched"], rs)
                 if why:
                     t.update(status="DROPPED", exit_date=data_date, exit_price=c, exit_reason=why)
                     events["drop"].append(f"{sid} {t['stock_name']}｜{why}")
         else:
             t["days_held"] = int(t["days_held"] or 0) + 1
-            why = sell_reason(r, t["entry_price"])
+            why = sell_reason(r, t["entry_price"], rs)
             if why:
                 t.update(status="CLOSED", exit_date=data_date, exit_price=c, exit_reason=why)
                 events["sell"].append(
@@ -793,11 +918,13 @@ def update_tracking(radar, data_date):
     for sid, r in rows.iterrows():
         if r["signal_key"] not in TRACK_START or sid in open_ids or sid in cooling:
             continue
-        t = {"version": VERSION, "stock_id": sid, "first_seen": data_date, "stock_name": r["stock_name"],
+        if drop_reason(r, 0, rs):                      # 一出現就會被放棄的（例如千張大戶正在減持），直接不加入，免得紀錄裡一堆雜訊
+            continue
+        t = {"version": version, "stock_id": sid, "first_seen": data_date, "stock_name": r["stock_name"],
              "status": "WATCH", "start_signal": r["signal"], "entry_date": None, "entry_price": None,
              "exit_date": None, "exit_price": None, "exit_reason": None, "last_date": data_date,
              "days_watched": 0, "days_held": 0}
-        if buy_check(r):                               # 一出現就已經是「剛突破第一根」→ 當天就買
+        if buy_check(r, rs):                           # 一出現就已經是「剛突破第一根」→ 當天就買
             _enter(t, r, data_date, events)
         recs.append(t)
         events["new"].append(sid)
@@ -805,12 +932,30 @@ def update_tracking(radar, data_date):
     if recs:
         upsert("tracking", pd.DataFrame(recs, columns=TRACK_COLS), TRACK_COLS)
     n = {s: sum(1 for t in recs if t["status"] == s) for s in ("WATCH", "HOLD", "CLOSED", "DROPPED")}
-    print(f"追蹤：觀察中 {n['WATCH']}｜持有中 {n['HOLD']}｜已賣出 {n['CLOSED']}｜已放棄 {n['DROPPED']}"
+    events["counts"] = n
+    print(f"追蹤[{version}]：觀察中 {n['WATCH']}｜持有中 {n['HOLD']}｜已賣出 {n['CLOSED']}｜已放棄 {n['DROPPED']}"
           f"｜今天 新增 {len(events['new'])} 買 {len(events['buy'])} 賣 {len(events['sell'])} 放棄 {len(events['drop'])}")
     return recs, events
 
 
-def build_tracking_text(recs, radar, events):
+def rules_text(version):
+    rs = rs_of(version)
+    extra = []
+    if rs["dealer"]:
+        extra.append("三大法人（含自營商）5日合計要淨買／淨賣才買／賣")
+    if rs["big"]:
+        extra.append(f"千張大戶持股比例本週增加才買、減少{abs(BIG_SELL_DELTA):g}個百分點以上就賣")
+    return "基本規則" + ("＋" + "＋".join(extra) if extra else "（沒有額外條件）")
+
+
+def compare_line(version, events):
+    n = events.get("counts", {})
+    return (f"{version}（{rules_text(version)}）：今天買進 {len(events['buy'])}、賣出 {len(events['sell'])}｜"
+            f"持有中 {n.get('HOLD', 0)}、觀察中 {n.get('WATCH', 0)}")
+
+
+def build_tracking_text(recs, radar, events, version=None):
+    version = version or VERSION
     rows = radar.drop_duplicates("stock_id").set_index("stock_id")
 
     def sec(title, lines, limit=None):
@@ -845,7 +990,8 @@ def build_tracking_text(recs, radar, events):
     hold = [x[1] for x in sorted(hold, key=lambda x: x[0], reverse=True)]     # 賺最多的排最前面
     watch = [x[1] for x in sorted(watch, key=lambda x: x[0])]                 # 離買點最近的排最前面
 
-    head = (f"今天新加入 {len(events['new'])} 檔、放棄 {len(events['drop'])} 檔｜"
+    head = (f"追蹤版本 {version}：{rules_text(version)}\n"
+            f"今天新加入 {len(events['new'])} 檔、放棄 {len(events['drop'])} 檔｜"
             f"觀察中共 {len(watch)} 檔、持有中 {len(hold)} 檔（模擬記錄，價格以收盤價計）")
     return "\n\n".join([head,
                         sec(f"🟢 今天觸發買進 {len(events['buy'])} 檔", events["buy"]),
@@ -884,11 +1030,11 @@ def save_signals(radar, data_date):
         conn.execute("DELETE FROM signals WHERE signal_date=?", (data_date,))
     n = upsert("signals", sig, SIGNAL_COLS)
     print(f"signals 寫入 {n} 筆")
-    log = sig.assign(version=VERSION)
+    log = sig.assign(version=SIGNAL_VERSION)
     with db() as conn:
-        conn.execute("DELETE FROM signal_log WHERE signal_date=? AND version=?", (data_date, VERSION))
+        conn.execute("DELETE FROM signal_log WHERE signal_date=? AND version=?", (data_date, SIGNAL_VERSION))
     upsert("signal_log", log, ["version"] + SIGNAL_COLS)
-    print(f"signal_log 寫入 {len(log)} 筆（版本 {VERSION}）")
+    print(f"signal_log 寫入 {len(log)} 筆（版本 {SIGNAL_VERSION}）")
 
 
 def _f(x, spec="{:.1f}"):
@@ -924,7 +1070,10 @@ LEGEND = """【搭順風車邏輯 - 買在還沒爆發前】
 開始追蹤：出現「吸籌末端／快突破／先洋後土／吸籌中等站回」類訊號
 買進：收盤突破前20日高 + 量比<""" + f"{BUY_MAX_VOL_RATIO:g}" + """ + 5日漲幅<""" + f"{BUY_MAX_RET5:g}" + """% + 投信或外資5日淨買
 賣出（任一）：停損""" + f"{STOP_LOSS_PCT:g}" + """%／已爆發（量比≥2.5且5日漲≥12%）／土洋雙殺／跌破MA10
-放棄：觀察超過""" + f"{WATCH_MAX_DAYS}" + """天／大戶5日都不買／已爆發沒買到
+放棄：觀察超過""" + f"{WATCH_MAX_DAYS}" + """天／投信與外資5日合計都淨賣（只是沒買不算）／已爆發沒買到
+v9.1 另外加：買進要三大法人（投信＋外資＋自營商自行買賣）5日合計淨買、千張大戶持股比例本週增加；
+　　　　　　賣出多了「三大法人5日合計淨賣」「千張大戶本週減持""" + f"{abs(BIG_SELL_DELTA):g}" + """個百分點以上」
+千張大戶＝持股1000張以上的人合計佔比（集保每週公布一次，所以這項資料最多落後約一週；資料還不夠算週增減時，不會因此擋買進）
 損益未扣交易成本（來回約0.6%：手續費買賣各0.1425%＋證交稅0.3%，實際依券商折扣）"""
 
 
@@ -963,7 +1112,7 @@ def send_email(subject, body):
 # ───────────────────────── 主流程 ─────────────────────────
 def run(send_mail=True):
     init_db()
-    print(f"=== 台股雷達 v9.0 開始 {now_tw():%Y-%m-%d %H:%M} ===")
+    print(f"=== 台股雷達 開始 {now_tw():%Y-%m-%d %H:%M}｜追蹤版本 {VERSIONS}（主要：{VERSION}）===")
     hist_price = load_table("prices", 120)
     quotes = collect_quotes(hist_price)
     if quotes.empty:
@@ -972,10 +1121,14 @@ def run(send_mail=True):
         upsert("prices", quotes, QUOTE_COLS)
     for frame in collect_inst():
         upsert("institutional", frame, INST_COLS)
+    holders = collect_holders()
+    if not holders.empty:
+        upsert("holders", holders, HOLDER_COLS)
 
     pf = make_price_features(load_table("prices", 120))
     inf = make_inst_features(load_table("institutional", 30), pf)
-    radar = build_radar(pf, inf)
+    hf = make_holder_features(load_table("holders", 60))
+    radar = build_radar(pf, inf, hf)
     if radar.empty:
         print("沒有可用資料，結束")
         raise SystemExit(1)
@@ -986,8 +1139,12 @@ def run(send_mail=True):
         radar.to_csv(os.path.join(OUTPUT_DIR, f"radar_{data_date}.csv"), index=False, encoding="utf-8-sig")
     except OSError as e:
         print(f"寫 CSV 失敗：{e}")
-    recs, events = update_tracking(radar, data_date)
-    track_text = build_tracking_text(recs, radar, events)
+    results = {v: update_tracking(radar, data_date, v) for v in VERSIONS}
+    recs, events = results[VERSION]
+    track_text = build_tracking_text(recs, radar, events, VERSION)
+    if len(VERSIONS) > 1:
+        track_text += ("\n\n【版本對照（成績單會比較哪個版本表現比較好）】\n"
+                       + "\n".join(compare_line(v, results[v][1]) for v in VERSIONS))
     hold_text, alerts = build_holdings_text(radar)
     if send_mail:
         subject = (f"{'🚨' if alerts else ''}雷達 {VERSION}｜{data_date}｜買進{len(events['buy'])} 賣出{len(events['sell'])}"
