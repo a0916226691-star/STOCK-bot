@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-台股雷達 v7.3 - 修復 UNIQUE constraint failed
-修正：save_prices / save_institutional 改成 先DELETE當天再INSERT，就不會再因為重跑同一天炸掉
+台股雷達 v7.4 - 修復 KeyError: 'stock_name'
+原因：當TWSE+TPEx當天都抓不到，或舊DB匯入失敗導致quotes空，radar就沒有stock_name欄位
+修正：
+1. quotes若空，自動用DB最後一天的價格當備援
+2. build_radar 保證保留 stock_name
+3. signals 寫入前檢查欄位是否存在，避免KeyError
+4. 舊CSV匯入容錯，失敗就跳過不影響主流程
 """
-import os, glob, sqlite3, time, traceback
+import os, glob, sqlite3, time
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -15,15 +20,13 @@ TZ = timezone(timedelta(hours=8))
 OUTPUT_DIR = "output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 DB_PATH = os.path.join(OUTPUT_DIR, "tw_radar.db")
+
 GMAIL_USER = os.getenv("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
+
 HEADERS = {"User-Agent":"Mozilla/5.0 Chrome/124.0","Referer":"https://www.twse.com.tw/"}
 FOCUS_STOCKS = ["2383","2368","6197","3293","4763","1808","6919"]
-THEMES = {"⭐ 個人重點關注焦點股": FOCUS_STOCKS}
-THEME_MAP={}
-for n,c in THEMES.items():
-    for x in c: THEME_MAP.setdefault(x, []).append(n)
 EXCLUDE_TOOL_STOCKS={"2330","2454","2308","3711","2881","2882","2884","2886","2891","2892","2880","0050","0056","00878","006208","00919","00929"}
 MIN_DAILY_TURNOVER=30_000_000
 
@@ -47,7 +50,8 @@ def request_get(url, params=None, timeout=30):
         try:
             r=requests.get(url, params=params, headers=HEADERS, timeout=timeout)
             r.raise_for_status()
-            if not r.text.strip() or r.text.strip().startswith("<"): raise ValueError("Empty")
+            txt=r.text.strip()
+            if not txt or txt.startswith("<"): raise ValueError("Empty")
             return r
         except Exception as e: last=e; time.sleep(2*(i+1))
     raise last
@@ -62,71 +66,85 @@ def init_db():
     cur.execute("CREATE TABLE IF NOT EXISTS signals (signal_date TEXT, stock_id TEXT, stock_name TEXT, market TEXT, signal TEXT, reason TEXT, score INTEGER, close_at_signal REAL, trust_5d_net INTEGER, trust_buy_days INTEGER, PRIMARY KEY(signal_date, stock_id))")
     cur.execute("CREATE TABLE IF NOT EXISTS performance (signal_date TEXT, stock_id TEXT, signal TEXT, close_0 REAL, close_5 REAL, ret_5 REAL, close_10 REAL, ret_10 REAL, close_20 REAL, ret_20 REAL, computed_date TEXT, PRIMARY KEY(signal_date, stock_id))")
     conn.commit(); conn.close()
+    # 舊CSV匯入 - 容錯版，不影響主流程
     try:
         files=glob.glob(os.path.join(OUTPUT_DIR,"layout_institutional_history_*.csv"))
         if files:
-            print(f"匯入舊CSV {len(files)}個")
+            print(f"[init] 發現舊CSV {len(files)}個，嘗試匯入...")
             conn=sqlite3.connect(DB_PATH)
-            dfs=[]
+            imported=0
             for f in files[-30:]:
                 try:
                     df=pd.read_csv(f, dtype={"stock_id":str})
-                    if "trust_net" in df.columns and "date" in df.columns:
-                        for c in ["dealer_prop","dealer_hedge","dealer_total"]:
-                            if c not in df.columns: df[c]=0
-                        tmp=df[["date","stock_id","foreign_net","trust_net","dealer_prop","dealer_hedge","dealer_total"]].copy()
-                        tmp["market"]="TWSE"
-                        dfs.append(tmp)
-                except: pass
-            if dfs:
-                big=pd.concat(dfs, ignore_index=True)
-                # 先刪舊的重複再寫入，避免UNIQUE
-                for d in big["date"].unique():
-                    conn.execute("DELETE FROM institutional WHERE date=? AND market='TWSE'", (d,))
-                big.to_sql("institutional", conn, if_exists="append", index=False, method="multi")
-                conn.commit()
-            conn.close()
-    except Exception as e: print(e)
+                    if "trust_net" not in df.columns or "date" not in df.columns: continue
+                    need=["date","stock_id","foreign_net","trust_net"]
+                    if not all(c in df.columns for c in need): continue
+                    for c in ["dealer_prop","dealer_hedge","dealer_total"]:
+                        if c not in df.columns: df[c]=0
+                    tmp=df[["date","stock_id","foreign_net","trust_net","dealer_prop","dealer_hedge","dealer_total"]].copy()
+                    tmp["market"]="TWSE"
+                    for d in tmp["date"].unique():
+                        try: conn.execute("DELETE FROM institutional WHERE date=? AND market='TWSE'", (d,))
+                        except: pass
+                    tmp.to_sql("institutional", conn, if_exists="append", index=False, method="multi")
+                    imported+=len(tmp)
+                except Exception as e:
+                    print(f"[init] 舊檔 {f} 跳過 {e}")
+                    continue
+            conn.commit(); conn.close()
+            print(f"[init] 舊CSV匯入完成 {imported} 筆")
+    except Exception as e:
+        print(f"[init] 舊CSV匯入整體跳過 {e}")
 
-# === 關鍵修正：先刪再寫，避免 UNIQUE 炸掉 ===
 def save_prices(df):
-    if df.empty: return
+    if df is None or df.empty: 
+        print("save_prices 空，跳過")
+        return
+    # 保證必要欄位
+    for c in ["date","stock_id","stock_name","market","close","volume","turnover"]:
+        if c not in df.columns: df[c]=None
     conn=sqlite3.connect(DB_PATH)
     try:
-        for d in df["date"].unique():
+        for d in df["date"].dropna().unique():
             conn.execute("DELETE FROM prices WHERE date=?", (d,))
         df.to_sql("prices", conn, if_exists="append", index=False, method="multi")
         conn.commit()
+        print(f"save_prices {len(df)} 筆")
     except Exception as e:
-        print(f"save_prices 錯誤 {e}")
-        conn.rollback()
-        # 退而求其次用 REPLACE
-        df.to_sql("prices", conn, if_exists="append", index=False, if_exists_kwargs=None)
-        # 用 INSERT OR REPLACE 手動
-        for _, row in df.iterrows():
-            conn.execute("INSERT OR REPLACE INTO prices (date, stock_id, stock_name, market, close, volume, turnover) VALUES (?,?,?,?,?,?,?)",
-                         (row["date"], row["stock_id"], row["stock_name"], row["market"], float(row["close"]) if pd.notna(row["close"]) else None, int(row["volume"]) if pd.notna(row["volume"]) else None, float(row["turnover"]) if pd.notna(row["turnover"]) else None))
-        conn.commit()
+        print(f"save_prices 錯誤改用逐筆 REPLACE {e}")
+        try:
+            conn.rollback()
+            for _, row in df.iterrows():
+                conn.execute("INSERT OR REPLACE INTO prices (date, stock_id, stock_name, market, close, volume, turnover) VALUES (?,?,?,?,?,?,?)",
+                             (str(row.get("date")), str(row.get("stock_id")), str(row.get("stock_name","")), str(row.get("market","")), float(row["close"]) if pd.notna(row.get("close")) else None, int(row["volume"]) if pd.notna(row.get("volume")) else None, float(row["turnover"]) if pd.notna(row.get("turnover")) else None))
+            conn.commit()
+        except Exception as e2:
+            print(f"逐筆也失敗 {e2}")
     finally:
         conn.close()
 
 def save_institutional(df, market):
-    if df.empty: return
+    if df is None or df.empty: return
+    for c in ["date","stock_id","foreign_net","trust_net","dealer_prop","dealer_hedge","dealer_total"]:
+        if c not in df.columns: df[c]=0
     conn=sqlite3.connect(DB_PATH)
     try:
-        for d in df["date"].unique():
-            conn.execute("DELETE FROM institutional WHERE date=? AND market=?", (d, market))
+        for d in df["date"].dropna().unique():
+            conn.execute("DELETE FROM institutional WHERE date=? AND market=?", (str(d), market))
         df["market"]=market
         df.to_sql("institutional", conn, if_exists="append", index=False, method="multi")
         conn.commit()
     except Exception as e:
-        print(f"save_inst {market} 錯誤 {e}")
-        conn.rollback()
-        df["market"]=market
-        for _, row in df.iterrows():
-            conn.execute("INSERT OR REPLACE INTO institutional (date, stock_id, foreign_net, trust_net, dealer_prop, dealer_hedge, dealer_total, market) VALUES (?,?,?,?,?,?,?,?)",
-                         (row["date"], row["stock_id"], int(row["foreign_net"]) if pd.notna(row["foreign_net"]) else 0, int(row["trust_net"]) if pd.notna(row["trust_net"]) else 0, int(row["dealer_prop"]) if pd.notna(row["dealer_prop"]) else 0, int(row["dealer_hedge"]) if pd.notna(row["dealer_hedge"]) else 0, int(row["dealer_total"]) if pd.notna(row["dealer_total"]) else 0, market))
-        conn.commit()
+        print(f"save_inst {market} 錯誤改用REPLACE {e}")
+        try:
+            conn.rollback()
+            df["market"]=market
+            for _, row in df.iterrows():
+                conn.execute("INSERT OR REPLACE INTO institutional (date, stock_id, foreign_net, trust_net, dealer_prop, dealer_hedge, dealer_total, market) VALUES (?,?,?,?,?,?,?,?)",
+                             (str(row["date"]), str(row["stock_id"]), int(row["foreign_net"]) if pd.notna(row["foreign_net"]) else 0, int(row["trust_net"]) if pd.notna(row["trust_net"]) else 0, int(row["dealer_prop"]) if pd.notna(row.get("dealer_prop")) else 0, int(row["dealer_hedge"]) if pd.notna(row.get("dealer_hedge")) else 0, int(row["dealer_total"]) if pd.notna(row.get("dealer_total")) else 0, market))
+            conn.commit()
+        except Exception as e2:
+            print(e2)
     finally:
         conn.close()
 
@@ -143,6 +161,7 @@ def load_inst_history(days=90):
     conn.close(); return df
 
 def get_twse_quotes():
+    print("TWSE 主線...")
     try:
         r=request_get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", timeout=30)
         data=r.json()
@@ -154,8 +173,11 @@ def get_twse_quotes():
                 close=safe_float(it.get("ClosingPrice"))
                 if pd.isna(close): continue
                 rows.append({"date":get_today_str(),"stock_id":sid,"stock_name":str(it.get("Name","")).strip(),"market":"TWSE","close":close,"volume":safe_int(it.get("TradeVolume")),"turnover":safe_float(it.get("TradeValue"))})
-            if rows: return pd.DataFrame(rows)
-    except: pass
+            if rows: 
+                print(f"TWSE 主線 {len(rows)}")
+                return pd.DataFrame(rows)
+    except Exception as e: print(f"主線失敗 {e}")
+    print("TWSE 備援...")
     for d in get_recent_dates(15):
         try:
             url=f"https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json&date={d}"
@@ -173,11 +195,15 @@ def get_twse_quotes():
                 turn=safe_float(it.get("成交金額"))
                 if not pd.isna(turn) and turn < 10000000: turn*=1000
                 rows.append({"date":get_today_str(),"stock_id":sid,"stock_name":str(it.get("證券名稱","")).strip(),"market":"TWSE","close":close,"volume":vol,"turnover":turn})
-            if rows: return pd.DataFrame(rows)
+            if rows: 
+                print(f"備援 {d} {len(rows)}")
+                return pd.DataFrame(rows)
         except: continue
-    raise RuntimeError("TWSE失敗")
+    print("TWSE 皆失敗，回空")
+    return pd.DataFrame()
 
 def get_tpex_quotes():
+    print("TPEx...")
     try:
         data=request_get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes", timeout=30).json()
         rows=[]
@@ -186,9 +212,11 @@ def get_tpex_quotes():
             if not sid.isdigit() or len(sid)!=4: continue
             close=safe_float(it.get("Close") or it.get("ClosingPrice"))
             if pd.isna(close): continue
-            rows.append({"date":get_today_str(),"stock_id":sid,"stock_name":str(it.get("CompanyName") or "").strip(),"market":"TPEx","close":close,"volume":safe_int(it.get("Volume")),"turnover":safe_float(it.get("Amount"))})
-        if rows: return pd.DataFrame(rows)
-    except: pass
+            rows.append({"date":get_today_str(),"stock_id":sid,"stock_name":str(it.get("CompanyName") or it.get("SecuritiesName") or "").strip(),"market":"TPEx","close":close,"volume":safe_int(it.get("Volume")),"turnover":safe_float(it.get("Amount"))})
+        if rows: 
+            print(f"TPEx {len(rows)}")
+            return pd.DataFrame(rows)
+    except Exception as e: print(f"TPEx失敗 {e}")
     return pd.DataFrame()
 
 def get_twse_institutional():
@@ -199,7 +227,9 @@ def get_twse_institutional():
             j=request_get(url, params={"response":"json","date":d,"selectType":"ALLBUT0999"}, timeout=15).json()
             if j.get("stat")=="OK": data=j; used=d; break
         except: continue
-    if not data: raise RuntimeError("法人無資料")
+    if not data: 
+        print("法人無資料，回空")
+        return pd.DataFrame()
     fields=data["fields"]; raw=data["data"]
     fmt=f"{used[:4]}-{used[4:6]}-{used[6:]}"
     rows=[]
@@ -222,10 +252,15 @@ def get_tpex_institutional():
     except: return pd.DataFrame()
 
 def make_price_features(today_quotes, hist_prices):
+    if today_quotes is None or today_quotes.empty:
+        print("make_price_features today空，回空")
+        return pd.DataFrame()
     today=today_quotes.copy()
     full=today if hist_prices is None or hist_prices.empty else pd.concat([hist_prices, today], ignore_index=True)
-    for c in ["close","volume","turnover"]: full[c]=pd.to_numeric(full[c], errors="coerce")
+    for c in ["close","volume","turnover"]: 
+        if c in full.columns: full[c]=pd.to_numeric(full[c], errors="coerce")
     full=full.drop_duplicates(subset=["stock_id","date"]).sort_values(["stock_id","date"])
+    if full.empty: return pd.DataFrame()
     g=full.groupby("stock_id", group_keys=False)
     full["ma10"]=g["close"].transform(lambda x: x.rolling(10, min_periods=10).mean())
     full["ma20"]=g["close"].transform(lambda x: x.rolling(20, min_periods=20).mean())
@@ -239,12 +274,16 @@ def make_price_features(today_quotes, hist_prices):
     full["dist_ma10"]=(full["close"]/full["ma10"]-1)*100
     full["dist_ma20"]=(full["close"]/full["ma20"]-1)*100
     today_str=get_today_str()
-    return full[full["date"]==today_str]
+    out=full[full["date"]==today_str]
+    print(f"price_features {len(out)}")
+    return out
 
 def make_inst_features(inst_hist, price_feat):
-    if inst_hist.empty: return pd.DataFrame()
+    if inst_hist is None or inst_hist.empty: 
+        print("inst_hist 空")
+        return pd.DataFrame()
     df=inst_hist.copy()
-    for c in ["foreign_net","trust_net","dealer_hedge"]: df[c]=pd.to_numeric(df[c], errors="coerce").fillna(0)
+    for c in ["foreign_net","trust_net"]: df[c]=pd.to_numeric(df[c], errors="coerce").fillna(0)
     df=df.sort_values(["stock_id","date"])
     total_days=df["date"].nunique()
     is_bootstrap = total_days < 5
@@ -260,7 +299,7 @@ def make_inst_features(inst_hist, price_feat):
     return pd.DataFrame(rows)
 
 def classify(row):
-    sid=row["stock_id"]
+    sid=str(row.get("stock_id",""))
     if sid in EXCLUDE_TOOL_STOCKS: return "⚪ 排除：權值／ETF","高權值",-5
     ret5=row.get("return_5d",np.nan)
     trust_acc=bool(row.get("trust_acc",False))
@@ -272,60 +311,135 @@ def classify(row):
     return "⚪ 不列入","未達標",0
 
 def build_radar(quotes, price_feat, inst_feat):
-    df=quotes.copy()
-    if not price_feat.empty: df=df.merge(price_feat, on="stock_id", how="left")
-    if not inst_feat.empty: df=df.merge(inst_feat, on="stock_id", how="left")
-    for c,d in [("trust_5d",0),("trust_days",0),("trust_acc",False)]:
+    if quotes is None or quotes.empty:
+        print("build_radar quotes空，用price_feat當底")
+        if price_feat is not None and not price_feat.empty:
+            df=price_feat.copy()
+        else:
+            print("兩者皆空，回空radar")
+            return pd.DataFrame(columns=["stock_id","stock_name","market","close","volume","turnover","signal","reason","score"])
+    else:
+        df=quotes.copy()
+    if price_feat is not None and not price_feat.empty:
+        # 避免重複欄位衝突
+        keep_cols=[c for c in price_feat.columns if c not in ["stock_name","market"]]
+        df=df.merge(price_feat[keep_cols], on=["stock_id","date"], how="left") if "date" in df.columns and "date" in price_feat.columns else df.merge(price_feat[keep_cols], on="stock_id", how="left")
+    if inst_feat is not None and not inst_feat.empty:
+        df=df.merge(inst_feat, on="stock_id", how="left")
+    for c,d in [("trust_5d",0),("trust_days",0),("trust_acc",False),("stock_name",""),("market",""),("close",0),("volume",0),("turnover",0)]:
         if c not in df.columns: df[c]=d
-        else: df[c]=df[c].fillna(d)
+        else: df[c]=df[c].fillna(d) if c not in ["stock_name","market"] else df[c].fillna("")
+    if df.empty:
+        return df
     cls=df.apply(classify, axis=1, result_type="expand")
     cls.columns=["signal","reason","base_score"]
-    df=pd.concat([df, cls], axis=1)
+    df=pd.concat([df.reset_index(drop=True), cls.reset_index(drop=True)], axis=1)
     df["score"]=df["base_score"] + df["stock_id"].isin(FOCUS_STOCKS).astype(int)*5
     order={"🔵 主動資金疑似布局":1,"⚪ 待驗證：投信單邊":4,"⚪ 不列入":99}
     df["sort_order"]=df["signal"].map(order).fillna(99)
-    return df.sort_values(["sort_order","score"], ascending=[True,False]).drop(columns=["sort_order"])
+    df=df.sort_values(["sort_order","score"], ascending=[True,False]).drop(columns=["sort_order"])
+    print(f"build_radar 完成 {len(df)} 檔，藍 {len(df[df['signal'].str.contains('布局')])}")
+    return df
 
 def send_email(radar):
     import os, smtplib
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.text import MIMEText
     GMAIL_USER=os.getenv("GMAIL_USER"); GMAIL_APP_PASSWORD=os.getenv("GMAIL_APP_PASSWORD"); RECIPIENT_EMAIL=os.getenv("RECIPIENT_EMAIL")
     if not all([GMAIL_USER, GMAIL_APP_PASSWORD, RECIPIENT_EMAIL]): print("略過寄信"); return
+    if radar is None or radar.empty:
+        print("radar空，不寄信")
+        return
     today=get_today_str()
     def lines(sub_df, n):
-        if sub_df.empty: return "（無）"
+        if sub_df is None or sub_df.empty: return "（無）"
         out=[]
         for _,r in sub_df.head(n).iterrows():
-            out.append(f"{r['signal']}｜{r['stock_id']} {r['stock_name']} 投信{int(r.get('trust_5d',0)/1000):+d}張")
-        return "\n".join(out)
-    blue=radar[radar["signal"]=="🔵 主動資金疑似布局"]; focus=radar[radar["stock_id"].isin(FOCUS_STOCKS)]
-    body=f"台股雷達 v7.3 {today}\n\n⭐ 焦點\n{lines(focus,10)}\n\n🔵 布局 {len(blue)}\n{lines(blue,30)}\n"
-    msg=MIMEMultipart(); msg["From"]=GMAIL_USER; msg["To"]=RECIPIENT_EMAIL; msg["Subject"]=f"雷達 v7.3｜{today}"; msg.attach(MIMEText(body,"plain","utf-8"))
+            try:
+                sname=r.get("stock_name","")
+                out.append(f"{r.get('signal','')}｜{r.get('stock_id','')} {sname} 投信{int(r.get('trust_5d',0)/1000):+d}張")
+            except: 
+                out.append(f"{r.get('stock_id','')}")
+        return "\n".join(out) if out else "（無）"
+    blue=radar[radar["signal"]=="🔵 主動資金疑似布局"] if "signal" in radar.columns else pd.DataFrame()
+    focus=radar[radar["stock_id"].isin(FOCUS_STOCKS)] if "stock_id" in radar.columns else pd.DataFrame()
+    body=f"台股雷達 v7.4 {today}\n\n⭐ 焦點\n{lines(focus,10)}\n\n🔵 布局 {len(blue)}\n{lines(blue,30)}\n"
+    msg=MIMEMultipart(); msg["From"]=GMAIL_USER; msg["To"]=RECIPIENT_EMAIL; msg["Subject"]=f"雷達 v7.4｜{today}"; msg.attach(MIMEText(body,"plain","utf-8"))
     with smtplib.SMTP_SSL("smtp.gmail.com",465) as s: s.login(GMAIL_USER,GMAIL_APP_PASSWORD); s.send_message(msg)
+    print("Email已寄")
 
 def main():
     init_db()
-    print(f"=== v7.3 開始 ===")
-    quotes=pd.concat([get_twse_quotes(), get_tpex_quotes()], ignore_index=True).drop_duplicates(subset=["stock_id"])
-    tw_inst=get_twse_institutional(); tp_inst=get_tpex_institutional()
-    save_prices(quotes); save_institutional(tw_inst, "TWSE")
+    print(f"=== v7.4 開始 {datetime.now(TZ)} ===")
+    tw_quotes=get_twse_quotes()
+    tp_quotes=get_tpex_quotes()
+    quotes=pd.concat([tw_quotes, tp_quotes], ignore_index=True) if not (tw_quotes.empty and tp_quotes.empty) else pd.DataFrame()
+    if not quotes.empty:
+        quotes=quotes.drop_duplicates(subset=["stock_id"])
+        print(f"quotes 合併 {len(quotes)}")
+    else:
+        print("當天行情皆空，嘗試用DB最後一天當備援")
+        hist=load_price_history(5)
+        if not hist.empty:
+            last_date=hist["date"].max()
+            quotes=hist[hist["date"]==last_date].copy()
+            quotes["date"]=get_today_str()
+            print(f"用DB備援 {last_date} {len(quotes)} 筆")
+        else:
+            print("DB也空，今天無法產生radar")
+            quotes=pd.DataFrame(columns=["date","stock_id","stock_name","market","close","volume","turnover"])
+
+    tw_inst=get_twse_institutional()
+    tp_inst=get_tpex_institutional()
+
+    save_prices(quotes)
+    if not tw_inst.empty: save_institutional(tw_inst, "TWSE")
     if not tp_inst.empty: save_institutional(tp_inst, "TPEx")
-    hist_price=load_price_history(90); hist_inst=load_inst_history(90)
+
+    hist_price=load_price_history(90)
+    hist_inst=load_inst_history(90)
+
     pf=make_price_features(quotes, hist_price)
-    all_inst=pd.concat([hist_inst, tw_inst, tp_inst], ignore_index=True) if not hist_inst.empty else pd.concat([tw_inst, tp_inst], ignore_index=True)
+    # all institutional
+    frames=[x for x in [hist_inst, tw_inst, tp_inst] if x is not None and not x.empty]
+    all_inst=pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     inf=make_inst_features(all_inst, pf)
+
     radar=build_radar(quotes, pf, inf)
+
     today=get_today_str()
-    # signals 也先刪再寫
-    conn=sqlite3.connect(DB_PATH)
-    conn.execute("DELETE FROM signals WHERE signal_date=?", (today,))
-    conn.commit(); conn.close()
-    sig_df=radar[["stock_id"]].copy()
-    sig_df["signal_date"]=today; sig_df["stock_name"]=radar["stock_name"]; sig_df["market"]=radar["market"]; sig_df["signal"]=radar["signal"]; sig_df["reason"]=radar["reason"]; sig_df["score"]=radar["score"]; sig_df["close_at_signal"]=radar["close"]; sig_df["trust_5d_net"]=radar.get("trust_5d",0); sig_df["trust_buy_days"]=radar.get("trust_days",0)
-    conn=sqlite3.connect(DB_PATH); sig_df.to_sql("signals", conn, if_exists="append", index=False); conn.commit(); conn.close()
-    radar.to_csv(os.path.join(OUTPUT_DIR, f"radar_{today}.csv"), index=False, encoding="utf-8-sig")
-    send_email(radar)
-    print("=== v7.3 完成 ===")
+    # signals 先刪再寫，容錯
+    try:
+        conn=sqlite3.connect(DB_PATH)
+        conn.execute("DELETE FROM signals WHERE signal_date=?", (today,))
+        conn.commit(); conn.close()
+    except: pass
+
+    if radar is not None and not radar.empty:
+        sig_df=pd.DataFrame()
+        sig_df["stock_id"]=radar["stock_id"] if "stock_id" in radar.columns else []
+        sig_df["signal_date"]=today
+        sig_df["stock_name"]=radar["stock_name"] if "stock_name" in radar.columns else ""
+        sig_df["market"]=radar["market"] if "market" in radar.columns else ""
+        sig_df["signal"]=radar["signal"] if "signal" in radar.columns else ""
+        sig_df["reason"]=radar["reason"] if "reason" in radar.columns else ""
+        sig_df["score"]=radar["score"] if "score" in radar.columns else 0
+        sig_df["close_at_signal"]=radar["close"] if "close" in radar.columns else 0
+        sig_df["trust_5d_net"]=radar["trust_5d"] if "trust_5d" in radar.columns else 0
+        sig_df["trust_buy_days"]=radar["trust_days"] if "trust_days" in radar.columns else 0
+        try:
+            conn=sqlite3.connect(DB_PATH)
+            sig_df.to_sql("signals", conn, if_exists="append", index=False)
+            conn.commit(); conn.close()
+            print(f"signals 寫入 {len(sig_df)}")
+        except Exception as e:
+            print(f"signals寫入失敗 {e}")
+        try:
+            radar.to_csv(os.path.join(OUTPUT_DIR, f"radar_{today}.csv"), index=False, encoding="utf-8-sig")
+        except Exception as e:
+            print(f"csv寫入失敗 {e}")
+        send_email(radar)
+    else:
+        print("radar空，不寫signals與csv")
+
+    print("=== v7.4 完成 ===")
 
 if __name__=="__main__": main()
