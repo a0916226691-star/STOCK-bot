@@ -34,6 +34,7 @@ import pandas as pd
 HORIZONS = (5, 10, 20)
 MIN_N = 30            # 樣本少於此數就標註「樣本少」
 DEDUP_GAP = 5         # 同一檔同一訊號，間隔超過幾個交易日才算「新的一次」
+COST_PCT = 0.585      # 來回交易成本 %：手續費 0.1425% × 2 ＋ 證交稅 0.3%（未計券商折扣）
 DEFAULT_DB = os.path.join(os.getenv("RADAR_OUTPUT_DIR", "output"), "tw_radar.db")
 BUY, SELL, WATCH = "買進", "賣出/避開", "觀察/等待"
 
@@ -74,6 +75,57 @@ def read_db(path):
         conn.close()
     sig = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["signal_date", "stock_id", "version", "signal"])
     return sig, prices
+
+
+def read_tracking(path):
+    """讀主程式的追蹤紀錄（tracking 表）；舊資料庫沒有這張表就回傳空表。"""
+    conn = sqlite3.connect(path)
+    try:
+        has = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tracking'").fetchone()
+        if not has:
+            return pd.DataFrame()
+        return pd.read_sql("SELECT * FROM tracking", conn, dtype={"stock_id": str})
+    finally:
+        conn.close()
+
+
+# ───────────────────────── 追蹤交易成績 ─────────────────────────
+def trade_report(tr, prices, cost):
+    """tracking 表 → 每筆「買進→賣出」的實際損益統計（扣掉來回交易成本 cost %）。"""
+    if tr is None or tr.empty:
+        return ""
+    last = prices.sort_values("date").groupby("stock_id")["close"].last() if not prices.empty else pd.Series(dtype=float)
+    ov, st, rs = [], [], []
+    for ver, g in tr.groupby("version"):
+        bought = g[g["entry_price"].notna()]
+        closed = bought[bought["status"] == "CLOSED"].copy()
+        hold = bought[bought["status"] == "HOLD"].copy()
+        unreal = (hold["stock_id"].map(last) / hold["entry_price"] - 1) * 100 if len(hold) else pd.Series(dtype=float)
+        ov.append({"版本": ver, "追蹤過": len(g), "買進": len(bought), "買進率%": round(len(bought) / len(g) * 100, 1),
+                   "觀察中": int((g["status"] == "WATCH").sum()), "放棄": int((g["status"] == "DROPPED").sum()),
+                   "持有中": len(hold), "持有中平均未實現%": round(unreal.mean(), 2) if len(unreal.dropna()) else "-",
+                   "已賣出": len(closed)})
+        if closed.empty:
+            continue
+        closed["net"] = (closed["exit_price"] / closed["entry_price"] - 1) * 100 - cost
+        w, l = closed.loc[closed["net"] > 0, "net"], closed.loc[closed["net"] <= 0, "net"]
+        pf = round(w.mean() / abs(l.mean()), 2) if len(w) and len(l) and l.mean() != 0 else "-"
+        st.append({"版本": ver, "已賣出": len(closed), "勝率%": round(len(w) / len(closed) * 100, 1),
+                   "平均損益%": round(closed["net"].mean(), 2), "中位%": round(closed["net"].median(), 2),
+                   "平均獲利%": round(w.mean(), 2) if len(w) else "-", "平均虧損%": round(l.mean(), 2) if len(l) else "-",
+                   "盈虧比": pf, "最大虧損%": round(closed["net"].min(), 2),
+                   "平均持有天": round(closed["days_held"].astype(float).mean(), 1),
+                   "備註": "樣本少" if len(closed) < MIN_N else ""})
+        for reason, gg in closed.groupby("exit_reason"):
+            rs.append({"版本": ver, "賣出原因": reason, "筆數": len(gg), "平均損益%": round(gg["net"].mean(), 2),
+                       "勝率%": round((gg["net"] > 0).mean() * 100, 1)})
+    out = [f"【追蹤交易成績：從買進到賣出的實際損益（已扣來回交易成本 {cost:g}%）】",
+           pd.DataFrame(ov).to_string(index=False), ""]
+    if st:
+        out += [pd.DataFrame(st).to_string(index=False), "", "賣出原因分布：", pd.DataFrame(rs).to_string(index=False), ""]
+    else:
+        out += ["還沒有任何一筆走完「買進→賣出」，請之後再看。", ""]
+    return "\n".join(out)
 
 
 # ───────────────────────── 算報酬 ─────────────────────────
@@ -133,13 +185,15 @@ def summarize(ev, by):
     return pd.DataFrame(rows)
 
 
-def build_report(ev, args, multi_db):
+def build_report(ev, args, multi_db, track_text=""):
     lines = ["═══ 台股雷達成績單 ═══",
              f"買進價：{'訊號隔天收盤' if args.entry == 'next' else '訊號當天收盤'}｜"
              f"{'連續出現全部計入' if args.all else '同一檔同一訊號連續出現只算第一次'}",
              "命中率：買進/觀察類＝後來上漲的比例；賣出類＝後來下跌的比例",
              "超額%：扣掉同期全市場平均報酬後的結果（賣出類已轉成「跌得比大盤多」為正）；"
              "正數才代表比隨便買有優勢", ""]
+    if track_text:
+        lines += [track_text]
     if ev.empty:
         lines.append("目前沒有可以計算的訊號。可能原因：還沒有訊號紀錄，或訊號日期在價格資料之外。")
         return "\n".join(lines)
@@ -192,21 +246,28 @@ def main(argv=None):
     ap.add_argument("--detail", action="store_true", help="另外列出每一種訊號的明細")
     ap.add_argument("--csv", metavar="檔名", help="把明細存成 CSV")
     ap.add_argument("--email", action="store_true", help="把成績單寄到信箱")
+    ap.add_argument("--cost", type=float, default=COST_PCT,
+                    help=f"來回交易成本 %%（預設 {COST_PCT}：手續費買賣各0.1425%%＋證交稅0.3%%，有券商折扣可調低）")
     args = ap.parse_args(argv)
     args._csv_df = None
 
     specs = args.db or [DEFAULT_DB]
-    frames = []
+    frames, track_texts = [], []
     for spec in specs:
         name, path = spec.split("=", 1) if "=" in spec else ("", spec)
+        prefix = (name or os.path.basename(os.path.dirname(os.path.abspath(path))) or "db") + ":"
         sig, prices = read_db(path)
         ev = build_events(sig, prices, 1 if args.entry == "next" else 0, dedup=not args.all)
+        tr = read_tracking(path)
         if len(specs) > 1:
-            ev["version"] = (name or os.path.basename(os.path.dirname(os.path.abspath(path))) or "db") + ":" + ev["version"].astype(str)
+            ev["version"] = prefix + ev["version"].astype(str)
+            if not tr.empty:
+                tr["version"] = prefix + tr["version"].astype(str)
         frames.append(ev)
+        track_texts.append(trade_report(tr, prices, args.cost))
     ev = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
-    report = build_report(ev, args, len(specs) > 1)
+    report = build_report(ev, args, len(specs) > 1, "\n".join(t for t in track_texts if t))
     print(report)
     if args.csv and args._csv_df is not None:
         args._csv_df.to_csv(args.csv, index=False, encoding="utf-8-sig")
