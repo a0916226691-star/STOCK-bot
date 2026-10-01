@@ -39,7 +39,18 @@ OUTPUT_DIR = os.getenv("RADAR_OUTPUT_DIR", "output")
 DB_PATH = os.path.join(OUTPUT_DIR, "tw_radar.db")
 HEADERS = {"User-Agent": "Mozilla/5.0 Chrome/124.0", "Referer": "https://www.twse.com.tw/"}
 
-WATCHLIST = ["2383", "2368", "6197", "3293", "4763", "1808", "6919"]  # 只觀察，不加分
+# 我的持股（每天在信裡檢查「該不該賣」）。買進價填數字就會算損益與停損；填 None 就只檢查其他賣出條件。
+MY_HOLDINGS = {"2383": None, "2368": None, "6197": None, "3293": None,
+               "4763": None, "1808": None, "6919": None}
+
+# ── 追蹤規則（一檔股票出現後：觀察中 → 買進 → 持有中 → 賣出）──────────────
+TRACK_START = {"PRE_BOTH", "NEAR_BOTH", "FOREIGN_FIRST", "PRE_FOREIGN", "PRE_TRUST", "BOTH_WAIT", "TRUST_WAIT"}
+WATCH_MAX_DAYS = 20        # 觀察超過幾個交易日還沒到買點，就放棄
+COOLDOWN_DAYS = 14         # 賣出或放棄之後，幾個日曆天內不重複加入追蹤（約 10 個交易日）
+STOP_LOSS_PCT = 7.0        # 停損：虧損達此 % 就賣
+BUY_MAX_VOL_RATIO = 2.5    # 買進條件：量比要小於此（還沒爆量）
+BUY_MAX_RET5 = 12.0        # 買進條件：5日漲幅要小於此 %（還沒噴）
+# 賣出條件「已爆發」的標準（量比 >= 2.5 且 5日漲 >= 12%）定義在 make_price_features 的 exploded
 EXCLUDE_TOOL_STOCKS = {"2330", "2454", "2308", "3711", "2881", "2882", "2884", "2886",
                        "2891", "2892", "2880", "0050", "0056", "00878", "006208", "00919", "00929"}
 MIN_DAILY_TURNOVER = 30_000_000   # 成交金額下限（元）
@@ -236,6 +247,11 @@ def init_db():
                      "stock_name TEXT, market TEXT, signal TEXT, reason TEXT, score INTEGER, "
                      "close_at_signal REAL, trust_5d_net INTEGER, foreign_5d_net INTEGER, "
                      "ma5 REAL, ma10 REAL, ma20 REAL, tech TEXT, PRIMARY KEY(signal_date, stock_id, version))")
+        # 追蹤紀錄：每一次「出現 → 買進 → 賣出」是一筆
+        conn.execute("CREATE TABLE IF NOT EXISTS tracking (version TEXT, stock_id TEXT, first_seen TEXT, "
+                     "stock_name TEXT, status TEXT, start_signal TEXT, entry_date TEXT, entry_price REAL, "
+                     "exit_date TEXT, exit_price REAL, exit_reason TEXT, last_date TEXT, "
+                     "days_watched INTEGER, days_held INTEGER, PRIMARY KEY(version, stock_id, first_seen))")
 
 
 def _py(v):
@@ -681,6 +697,181 @@ def build_radar(price_feat, inst_feat):
     return df
 
 
+# ───────────────────────── 追蹤：候選 → 買進 → 賣出 ─────────────────────────
+# 觀察中(WATCH) → 達到買進條件 → 持有中(HOLD) → 達到賣出條件 → 已賣出(CLOSED)
+# 觀察太久／大戶不買了／已爆發沒買到 → 放棄追蹤(DROPPED)
+# 這是「模擬記錄」，不會真的下單；買賣價格以觸發當天收盤價計。
+TRACK_COLS = ["version", "stock_id", "first_seen", "stock_name", "status", "start_signal", "entry_date",
+              "entry_price", "exit_date", "exit_price", "exit_reason", "last_date", "days_watched", "days_held"]
+
+
+def buy_check(r):
+    """買進條件：收盤突破前 20 日高、還沒爆量、還沒急漲、投信或外資 5 日淨買、成交金額夠。"""
+    ph, vr, r5 = r["prev_high20"], r["vol_ratio_5d"], r["return_5d"]
+    if pd.isna(ph) or pd.isna(vr) or pd.isna(r5):
+        return False
+    return bool(r["close"] > ph and vr < BUY_MAX_VOL_RATIO and r5 < BUY_MAX_RET5
+                and (r["trust_5d"] > 0 or r["foreign_5d"] > 0) and r["turnover"] >= MIN_DAILY_TURNOVER)
+
+
+def sell_reason(r, entry_price=None):
+    """賣出條件（任一成立）；回傳原因，沒有則 None。順序＝優先序。"""
+    c = r["close"]
+    if entry_price and c / entry_price - 1 <= -STOP_LOSS_PCT / 100:
+        return f"停損 {STOP_LOSS_PCT:g}%"
+    if r["exploded"]:
+        return "已爆發·散戶衝進來"
+    if r["trust_5d"] < 0 and r["foreign_5d"] < 0:
+        return "土洋雙殺"
+    if pd.notna(r["ma10"]) and c < r["ma10"]:
+        return "跌破MA10"
+    return None
+
+
+def drop_reason(r, days_watched):
+    if r["exploded"]:
+        return "已爆發·沒買到不追"
+    if r["trust_5d"] <= 0 and r["foreign_5d"] <= 0:
+        return "大戶不買了"
+    if days_watched >= WATCH_MAX_DAYS:
+        return f"觀察超過{WATCH_MAX_DAYS}天"
+    return None
+
+
+def _chip(r):
+    return f"投信{int(round(float(r['trust_5d']) / 1000)):+,d}張 外資{int(round(float(r['foreign_5d']) / 1000)):+,d}張"
+
+
+def _enter(t, r, data_date, events):
+    t.update(status="HOLD", entry_date=data_date, entry_price=float(r["close"]), days_held=0)
+    events["buy"].append(
+        f"{t['stock_id']} {t['stock_name']}｜買進價 {r['close']:.1f}｜突破前20日高 {r['prev_high20']:.1f}，"
+        f"量比 {r['vol_ratio_5d']:.1f}，5日{r['return_5d']:+.1f}%｜{_chip(r)}｜停損價 {r['close'] * (1 - STOP_LOSS_PCT / 100):.1f}")
+
+
+def update_tracking(radar, data_date):
+    """每天更新一次所有追蹤中的股票，回傳 (所有紀錄, 今日事件)。同一天重跑不會重複計算。"""
+    with db() as conn:
+        tr = pd.read_sql("SELECT * FROM tracking WHERE version=?", conn, params=(VERSION,), dtype={"stock_id": str})
+    tr = tr.astype(object).where(tr.notna(), None) if not tr.empty else tr
+    recs = tr.to_dict("records") if not tr.empty else []
+    rows = radar.drop_duplicates("stock_id").set_index("stock_id")
+    events = {"buy": [], "sell": [], "drop": [], "new": []}
+
+    open_ids = set()
+    for t in recs:
+        if t["status"] not in ("WATCH", "HOLD"):
+            continue
+        sid = t["stock_id"]
+        open_ids.add(sid)
+        if str(t.get("last_date") or "") >= data_date or sid not in rows.index:
+            continue                                   # 今天已處理過（重跑），或今天沒有這檔的資料
+        r = rows.loc[sid]
+        c = float(r["close"])
+        if t["status"] == "WATCH":
+            t["days_watched"] = int(t["days_watched"] or 0) + 1
+            if buy_check(r):
+                _enter(t, r, data_date, events)
+            else:
+                why = drop_reason(r, t["days_watched"])
+                if why:
+                    t.update(status="DROPPED", exit_date=data_date, exit_price=c, exit_reason=why)
+                    events["drop"].append(f"{sid} {t['stock_name']}｜{why}")
+        else:
+            t["days_held"] = int(t["days_held"] or 0) + 1
+            why = sell_reason(r, t["entry_price"])
+            if why:
+                t.update(status="CLOSED", exit_date=data_date, exit_price=c, exit_reason=why)
+                events["sell"].append(
+                    f"{sid} {t['stock_name']}｜買 {t['entry_price']:.1f} → 賣 {c:.1f}｜"
+                    f"損益 {(c / t['entry_price'] - 1) * 100:+.1f}%（未扣成本）｜持有 {t['days_held']} 天｜原因：{why}")
+        t["last_date"] = data_date
+
+    today = datetime.strptime(data_date, "%Y-%m-%d")
+    cooling = {t["stock_id"] for t in recs                 # 剛賣出／剛放棄的，一陣子內不重複加入（也避免同一天重跑重複加入）
+               if t.get("exit_date") and (today - datetime.strptime(str(t["exit_date"]), "%Y-%m-%d")).days < COOLDOWN_DAYS}
+    for sid, r in rows.iterrows():
+        if r["signal_key"] not in TRACK_START or sid in open_ids or sid in cooling:
+            continue
+        t = {"version": VERSION, "stock_id": sid, "first_seen": data_date, "stock_name": r["stock_name"],
+             "status": "WATCH", "start_signal": r["signal"], "entry_date": None, "entry_price": None,
+             "exit_date": None, "exit_price": None, "exit_reason": None, "last_date": data_date,
+             "days_watched": 0, "days_held": 0}
+        if buy_check(r):                               # 一出現就已經是「剛突破第一根」→ 當天就買
+            _enter(t, r, data_date, events)
+        recs.append(t)
+        events["new"].append(sid)
+
+    if recs:
+        upsert("tracking", pd.DataFrame(recs, columns=TRACK_COLS), TRACK_COLS)
+    n = {s: sum(1 for t in recs if t["status"] == s) for s in ("WATCH", "HOLD", "CLOSED", "DROPPED")}
+    print(f"追蹤：觀察中 {n['WATCH']}｜持有中 {n['HOLD']}｜已賣出 {n['CLOSED']}｜已放棄 {n['DROPPED']}"
+          f"｜今天 新增 {len(events['new'])} 買 {len(events['buy'])} 賣 {len(events['sell'])} 放棄 {len(events['drop'])}")
+    return recs, events
+
+
+def build_tracking_text(recs, radar, events):
+    rows = radar.drop_duplicates("stock_id").set_index("stock_id")
+
+    def sec(title, lines, limit=None):
+        shown = lines if limit is None else lines[:limit]
+        more = f"\n   …還有 {len(lines) - len(shown)} 檔" if len(shown) < len(lines) else ""
+        return f"{title}\n" + ("\n".join(shown) + more if lines else "（無）")
+
+    hold, watch = [], []
+    for t in recs:
+        sid = t["stock_id"]
+        r = rows.loc[sid] if sid in rows.index else None
+        if t["status"] == "HOLD":
+            if r is None:
+                hold.append((-9, f"{sid} {t['stock_name']}｜買進價 {t['entry_price']:.1f}｜今天沒有行情資料"))
+                continue
+            c, e = float(r["close"]), t["entry_price"]
+            ma = f"｜離MA10 {(c / r['ma10'] - 1) * 100:+.1f}%" if pd.notna(r["ma10"]) else ""
+            hold.append((c / e - 1,
+                         f"{sid} {t['stock_name']}｜買進價 {e:.1f}｜現價 {c:.1f}｜損益 {(c / e - 1) * 100:+.1f}%｜"
+                         f"持有 {t['days_held']} 天{ma}｜停損價 {e * (1 - STOP_LOSS_PCT / 100):.1f}"))
+        elif t["status"] == "WATCH":
+            if r is None:
+                continue
+            ph, c = r["prev_high20"], float(r["close"])
+            if pd.isna(ph):
+                gap, txt = 1e9, "尚無前高資料（上櫃歷史累積中）"
+            elif c > ph:
+                gap, txt = -1, f"已站上前高 {ph:.1f}，但量比／漲幅／法人未達標"
+            else:
+                gap, txt = (ph / c - 1) * 100, f"還差 {(ph / c - 1) * 100:.1f}% 到買點（前高 {ph:.1f}）"
+            watch.append((gap, f"{sid} {t['stock_name']}｜已觀察 {t['days_watched']} 天｜{txt}｜{t['start_signal']}"))
+    hold = [x[1] for x in sorted(hold, key=lambda x: x[0], reverse=True)]     # 賺最多的排最前面
+    watch = [x[1] for x in sorted(watch, key=lambda x: x[0])]                 # 離買點最近的排最前面
+
+    head = (f"今天新加入 {len(events['new'])} 檔、放棄 {len(events['drop'])} 檔｜"
+            f"觀察中共 {len(watch)} 檔、持有中 {len(hold)} 檔（模擬記錄，價格以收盤價計）")
+    return "\n\n".join([head,
+                        sec(f"🟢 今天觸發買進 {len(events['buy'])} 檔", events["buy"]),
+                        sec(f"🔴 今天觸發賣出 {len(events['sell'])} 檔", events["sell"]),
+                        sec(f"📈 持有中 {len(hold)} 檔", hold),
+                        sec(f"👀 觀察中 {len(watch)} 檔（依離買點的距離排序，列前 20）", watch, 20),
+                        sec(f"🗑 今天放棄追蹤 {len(events['drop'])} 檔", events["drop"], 15)])
+
+
+def build_holdings_text(radar):
+    rows = radar.drop_duplicates("stock_id").set_index("stock_id")
+    out, alerts = [], 0
+    for sid, cost in MY_HOLDINGS.items():
+        if sid not in rows.index:
+            out.append(f"❔ {sid}｜今天沒有行情資料")
+            continue
+        r = rows.loc[sid]
+        why = sell_reason(r, cost)
+        alerts += bool(why)
+        pnl = f"｜損益 {(r['close'] / cost - 1) * 100:+.1f}%" if cost else ""
+        ma = f"｜離MA10 {(r['close'] / r['ma10'] - 1) * 100:+.1f}%" if pd.notna(r["ma10"]) else ""
+        out.append(f"{'🚨 ' + why if why else '✅ 續抱'}｜{sid} {r['stock_name']}｜收盤 {r['close']:.1f}{pnl}{ma}\n"
+                   f"   {_chip(r)}｜{r['signal']}")
+    return "\n".join(out) if out else "（尚未設定）", alerts
+
+
 # ───────────────────────── 輸出：存檔／Email ─────────────────────────
 def save_signals(radar, data_date):
     sig = pd.DataFrame({
@@ -726,22 +917,29 @@ LEGEND = """【搭順風車邏輯 - 買在還沒爆發前】
 ⚪ 洋買土賣·觀察 / 🟡 洋賣土買·小心接刀：大戶意見分歧
 🔴 已爆發·勿追／過熱·勿追：量爆2.5倍+5日>12%，散戶衝進來的地方，不是買點
 🔴 雙殺·快下車：洋賣土賣，大戶下車了
-WATCHLIST（只觀察、不加分）：""" + " ".join(WATCHLIST) + """
 技術：MA5=週線 MA10=10日 MA20=月線 多頭排列=5>10>20 盤整=前20日高低差<18%
-成交金額低於3000萬的標的不列入買進類訊號"""
+成交金額低於3000萬的標的不列入買進類訊號
+
+【追蹤規則（模擬記錄，不會真的下單）】
+開始追蹤：出現「吸籌末端／快突破／先洋後土／吸籌中等站回」類訊號
+買進：收盤突破前20日高 + 量比<""" + f"{BUY_MAX_VOL_RATIO:g}" + """ + 5日漲幅<""" + f"{BUY_MAX_RET5:g}" + """% + 投信或外資5日淨買
+賣出（任一）：停損""" + f"{STOP_LOSS_PCT:g}" + """%／已爆發（量比≥2.5且5日漲≥12%）／土洋雙殺／跌破MA10
+放棄：觀察超過""" + f"{WATCH_MAX_DAYS}" + """天／大戶5日都不買／已爆發沒買到
+損益未扣交易成本（來回約0.6%：手續費買賣各0.1425%＋證交稅0.3%，實際依券商折扣）"""
 
 
-def build_email_body(radar, data_date):
+def build_email_body(radar, data_date, track_text="", hold_text=""):
     k = radar["signal_key"]
     best, follow = radar[k.isin(GROUP_BEST)], radar[k.isin(GROUP_FOLLOW)]
     danger = radar[k.isin(GROUP_DANGER)]
-    watch = radar[radar["stock_id"].isin(WATCHLIST)]
     line = "━━━━━━━━━━━━"
-    return (f"台股雷達 v9.0 搭順風車版｜資料日 {data_date}\n{LEGEND}\n\n"
-            f"{line}\n🔵🟣 吸籌末端·第一根 {len(best)} 檔\n{fmt_rows(best, 30)}\n\n"
-            f"{line}\n🔵🟣 跟著大戶 {len(follow)} 檔\n{fmt_rows(follow, 20)}\n\n"
+    return (f"台股雷達 {VERSION} 搭順風車版｜資料日 {data_date}\n\n"
+            f"{line}\n💼 我的持股（賣出條件檢查）\n{hold_text}\n\n"
+            f"{line}\n📌 追蹤中\n{track_text}\n\n"
+            f"{line}\n🔵🟣 今日候選：吸籌末端·第一根 {len(best)} 檔（列前30）\n{fmt_rows(best, 30)}\n\n"
+            f"{line}\n🔵🟣 跟著大戶 {len(follow)} 檔（列前20）\n{fmt_rows(follow, 20)}\n\n"
             f"{line}\n🔴 已爆發／過熱／雙殺 {len(danger)} 檔（只列前15）\n{fmt_rows(danger, 15)}\n\n"
-            f"{line}\n👀 WATCHLIST 觀察名單（不加分）\n{fmt_rows(watch, 10)}\n")
+            f"{line}\n{LEGEND}\n")
 
 
 def send_email(subject, body):
@@ -788,8 +986,13 @@ def run(send_mail=True):
         radar.to_csv(os.path.join(OUTPUT_DIR, f"radar_{data_date}.csv"), index=False, encoding="utf-8-sig")
     except OSError as e:
         print(f"寫 CSV 失敗：{e}")
+    recs, events = update_tracking(radar, data_date)
+    track_text = build_tracking_text(recs, radar, events)
+    hold_text, alerts = build_holdings_text(radar)
     if send_mail:
-        send_email(f"雷達 v9.0搭順風車·第一根｜{data_date}", build_email_body(radar, data_date))
+        subject = (f"{'🚨' if alerts else ''}雷達 {VERSION}｜{data_date}｜買進{len(events['buy'])} 賣出{len(events['sell'])}"
+                   + (f"｜持股警示{alerts}" if alerts else ""))
+        send_email(subject, build_email_body(radar, data_date, track_text, hold_text))
     print("=== 完成 ===")
 
 
