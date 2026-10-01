@@ -40,10 +40,6 @@ OUTPUT_DIR = os.getenv("RADAR_OUTPUT_DIR", "output")
 DB_PATH = os.path.join(OUTPUT_DIR, "tw_radar.db")
 HEADERS = {"User-Agent": "Mozilla/5.0 Chrome/124.0", "Referer": "https://www.twse.com.tw/"}
 
-# 我的持股（每天在信裡檢查「該不該賣」）。買進價填數字就會算損益與停損；填 None 就只檢查其他賣出條件。
-MY_HOLDINGS = {"2383": None, "2368": None, "6197": None, "3293": None,
-               "4763": None, "1808": None, "6919": None}
-
 # ── 追蹤規則（一檔股票出現後：觀察中 → 買進 → 持有中 → 賣出）──────────────
 TRACK_START = {"PRE_BOTH", "NEAR_BOTH", "FOREIGN_FIRST", "PRE_FOREIGN", "PRE_TRUST", "BOTH_WAIT", "TRUST_WAIT"}
 WATCH_MAX_DAYS = 20        # 觀察超過幾個交易日還沒到買點，就放棄
@@ -1001,23 +997,6 @@ def build_tracking_text(recs, radar, events, version=None):
                         sec(f"🗑 今天放棄追蹤 {len(events['drop'])} 檔", events["drop"], 15)])
 
 
-def build_holdings_text(radar):
-    rows = radar.drop_duplicates("stock_id").set_index("stock_id")
-    out, alerts = [], 0
-    for sid, cost in MY_HOLDINGS.items():
-        if sid not in rows.index:
-            out.append(f"❔ {sid}｜今天沒有行情資料")
-            continue
-        r = rows.loc[sid]
-        why = sell_reason(r, cost)
-        alerts += bool(why)
-        pnl = f"｜損益 {(r['close'] / cost - 1) * 100:+.1f}%" if cost else ""
-        ma = f"｜離MA10 {(r['close'] / r['ma10'] - 1) * 100:+.1f}%" if pd.notna(r["ma10"]) else ""
-        out.append(f"{'🚨 ' + why if why else '✅ 續抱'}｜{sid} {r['stock_name']}｜收盤 {r['close']:.1f}{pnl}{ma}\n"
-                   f"   {_chip(r)}｜{r['signal']}")
-    return "\n".join(out) if out else "（尚未設定）", alerts
-
-
 # ───────────────────────── 輸出：存檔／Email ─────────────────────────
 def save_signals(radar, data_date):
     sig = pd.DataFrame({
@@ -1077,15 +1056,14 @@ v9.1 另外加：買進要三大法人（投信＋外資＋自營商自行買賣
 損益未扣交易成本（來回約0.6%：手續費買賣各0.1425%＋證交稅0.3%，實際依券商折扣）"""
 
 
-def build_email_body(radar, data_date, track_text="", hold_text=""):
+def build_email_body(radar, data_date, track_text=""):
     k = radar["signal_key"]
     best, follow = radar[k.isin(GROUP_BEST)], radar[k.isin(GROUP_FOLLOW)]
     danger = radar[k.isin(GROUP_DANGER)]
     line = "━━━━━━━━━━━━"
     return (f"台股雷達 {VERSION} 搭順風車版｜資料日 {data_date}\n\n"
-            f"{line}\n💼 我的持股（賣出條件檢查）\n{hold_text}\n\n"
-            f"{line}\n📌 追蹤中\n{track_text}\n\n"
             f"{line}\n🔵🟣 今日候選：吸籌末端·第一根 {len(best)} 檔（列前30）\n{fmt_rows(best, 30)}\n\n"
+            f"{line}\n📌 追蹤中（候選股的買賣模擬）\n{track_text}\n\n"
             f"{line}\n🔵🟣 跟著大戶 {len(follow)} 檔（列前20）\n{fmt_rows(follow, 20)}\n\n"
             f"{line}\n🔴 已爆發／過熱／雙殺 {len(danger)} 檔（只列前15）\n{fmt_rows(danger, 15)}\n\n"
             f"{line}\n{LEGEND}\n")
@@ -1145,11 +1123,10 @@ def run(send_mail=True):
     if len(VERSIONS) > 1:
         track_text += ("\n\n【版本對照（成績單會比較哪個版本表現比較好）】\n"
                        + "\n".join(compare_line(v, results[v][1]) for v in VERSIONS))
-    hold_text, alerts = build_holdings_text(radar)
     if send_mail:
-        subject = (f"{'🚨' if alerts else ''}雷達 {VERSION}｜{data_date}｜買進{len(events['buy'])} 賣出{len(events['sell'])}"
-                   + (f"｜持股警示{alerts}" if alerts else ""))
-        send_email(subject, build_email_body(radar, data_date, track_text, hold_text))
+        best_n = int(radar["signal_key"].isin(GROUP_BEST).sum())
+        subject = f"雷達 {VERSION}｜{data_date}｜第一根候選{best_n} 買進{len(events['buy'])} 賣出{len(events['sell'])}"
+        send_email(subject, build_email_body(radar, data_date, track_text))
     print("=== 完成 ===")
 
 
