@@ -50,17 +50,27 @@ BUY_MAX_RET5 = 12.0        # 買進條件：5日漲幅要小於此 %（還沒噴
 # 賣出條件「已爆發」的標準（量比 >= 2.5 且 5日漲 >= 12%）定義在 make_price_features 的 exploded
 EXCLUDE_TOOL_STOCKS = {"2330", "2454", "2308", "3711", "2881", "2882", "2884", "2886",
                        "2891", "2892", "2880", "0050", "0056", "00878", "006208", "00919", "00929"}
+MAX_PRICE = float(os.getenv("RADAR_MAX_PRICE", "150"))   # 股價上限（元）：一張最多約 15 萬。超過的不列入候選、不開始追蹤
 MIN_DAILY_TURNOVER = 30_000_000   # 成交金額下限（元）
 # ── 版本：同一次執行可以同時追蹤好幾個「規則版本」，成績單會並排比較 ──────────────
 # 環境變數 RADAR_VERSIONS（逗號分隔），第一個是主要版本：信件詳細內容與持股檢查都用它；其他版本在信裡只列一行對照。
-VERSIONS = [v.strip() for v in os.getenv("RADAR_VERSIONS", "v9.1,v9.0").split(",") if v.strip()]
+VERSIONS = [v.strip() for v in os.getenv("RADAR_VERSIONS", "v9.2,v9.1,v9.0").split(",") if v.strip()]
 VERSION = VERSIONS[0]
-SIGNAL_VERSION = os.getenv("RADAR_SIGNAL_VERSION", "v9.0")   # 「訊號分類」本身的版本標記（v9.0 與 v9.1 的訊號分類相同）
+SIGNAL_VERSION = os.getenv("RADAR_SIGNAL_VERSION", "v9.0")   # 「訊號分類」本身的版本標記（v9.0／v9.1／v9.2 的訊號分類相同）
 # 每個版本開哪些額外條件；沒列在這裡的版本名稱一律當作 v9.0（不開額外條件）
 RULESETS = {
     "v9.0": {"dealer": False, "big": False},
     "v9.1": {"dealer": True, "big": True},    # v9.0 ＋ 自營商（三大法人合計）＋ 千張大戶持股變化
+    "v9.2": {"dealer": True, "big": True, "market": True, "margin": True},   # v9.1 ＋ 大盤環境過濾 ＋ 融資（散戶）過熱
 }
+RULE_DEFAULTS = {"dealer": False, "big": False, "market": False, "margin": False}
+# 大盤環境：全市場「收盤站上月線的股票」占幾 %。低於門檻＝大盤偏弱，v9.2 暫停新的買進
+MARKET_MIN_BREADTH = 40.0
+# 融資（散戶借錢買股）：5 個交易日增加太多＝散戶衝進來
+MARGIN_BUY_MAX_CHG = 10.0    # 買進：融資餘額 5 日增加不能超過此 %（資料不足時不擋）
+MARGIN_SELL_CHG = 20.0       # 賣出：融資餘額 5 日增加達此 % 就賣
+MARGIN_MIN_BAL = 1000        # 融資餘額太小（張）的股票，百分比會失真，不判斷
+MARGIN_COLS = ["date", "stock_id", "margin_bal", "short_bal", "market"]
 # 千張大戶（集保「股權分散表」每週公布）
 BIG_HOLDER_LEVEL = 15      # 持股分級 15 ＝ 1,000,001 股（1000 張）以上
 BIG_BUY_MIN_DELTA = 0.0    # 買進：千張大戶持股比例本週增減（百分點）要大於此；資料還不夠算增減時不擋
@@ -262,6 +272,9 @@ def init_db():
                      "stock_name TEXT, status TEXT, start_signal TEXT, entry_date TEXT, entry_price REAL, "
                      "exit_date TEXT, exit_price REAL, exit_reason TEXT, last_date TEXT, "
                      "days_watched INTEGER, days_held INTEGER, PRIMARY KEY(version, stock_id, first_seen))")
+        # 融資融券餘額（每日；單位：張）
+        conn.execute("CREATE TABLE IF NOT EXISTS margin (date TEXT, stock_id TEXT, margin_bal REAL, "
+                     "short_bal REAL, market TEXT, PRIMARY KEY(date, stock_id, market))")
         # 集保千張大戶持股（每週一筆）
         conn.execute("CREATE TABLE IF NOT EXISTS holders (date TEXT, stock_id TEXT, big_ratio REAL, "
                      "big_people INTEGER, PRIMARY KEY(date, stock_id))")
@@ -493,6 +506,122 @@ def fetch_tpex_inst():
     return pd.DataFrame(rows, columns=INST_COLS)
 
 
+# ───────────────────────── 抓資料：融資融券（散戶借錢買股的程度） ─────────────────────────
+def fetch_twse_margin(d):
+    """上市融資融券餘額（張）。TWSE 這張表的『今日餘額』欄位名稱重複，所以用位置判斷：第一個＝融資、第二個＝融券。"""
+    empty = pd.DataFrame(columns=MARGIN_COLS)
+    j = get_json("https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN",
+                 {"response": "json", "date": d, "selectType": "STOCK"}, timeout=20)
+    if j.get("stat") != "OK":
+        return empty
+    fields, raw = find_table(j, ["股票代號"])
+    id_name = "股票代號"
+    if not fields:
+        fields, raw = find_table(j, ["證券代號"])
+        id_name = "證券代號"
+    if not fields:
+        print("MI_MARGN 找不到資料表，API 格式可能改了；回應欄位：", [k for k in j.keys()])
+        return empty
+    bal = [i for i, f in enumerate(fields) if str(f).endswith("今日餘額")]
+    if len(bal) < 2:
+        print("MI_MARGN 找不到融資／融券今日餘額欄位；欄位：", fields)
+        return empty
+    i_id, i_m, i_s = fields.index(id_name), bal[0], bal[1]
+    date, rows = fmt_date(d), []
+    for r in raw:
+        sid = normalize_stock_id(str(r[i_id]))
+        if is_stock_id(sid):
+            rows.append({"date": date, "stock_id": sid, "margin_bal": safe_int(r[i_m]),
+                         "short_bal": safe_int(r[i_s]), "market": "TWSE"})
+    return pd.DataFrame(rows, columns=MARGIN_COLS)
+
+
+def fetch_tpex_margin():
+    """上櫃融資融券。我沒辦法事先確認 API 名稱與欄位，所以逐一嘗試、用關鍵字偵測；失敗就略過（上櫃股不套用融資條件）。"""
+    empty = pd.DataFrame(columns=MARGIN_COLS)
+    tried, data, used = [], None, None
+    for name in ("tpex_mainboard_margin_balance", "tpex_margin_balance", "tpex_mainboard_margin_trading"):
+        tried.append(name)
+        try:
+            data = get_json(f"https://www.tpex.org.tw/openapi/v1/{name}", retries=1)
+        except Exception:
+            continue
+        if isinstance(data, list) and data:
+            used = name
+            break
+    if not used:
+        print(f"⚠ TPEx 融資融券：試過 {tried} 都抓不到，上櫃股先不套用融資條件（上市不受影響）")
+        return empty
+    keys = list(data[0].keys())
+    low = {k: k.lower() for k in keys}
+    bal = [k for k in keys if ("balance" in low[k] or "餘額" in k) and not any(w in low[k] for w in ("prev", "前日"))]
+    m_k = next((k for k in bal if "margin" in low[k] or "融資" in k), None)
+    s_k = next((k for k in bal if "short" in low[k] or "融券" in k), None)
+    print(f"TPEx 融資融券欄位對應（{used}）：融資餘額={m_k}｜融券餘額={s_k}")
+    if not m_k:
+        print("⚠ TPEx 融資餘額欄位對不上，略過。API 欄位：", keys)
+        return empty
+    date = parse_date(pick(data[0], "Date")) or guess_last_close_date()
+    rows = []
+    for it in data:
+        sid = normalize_stock_id(pick(it, "SecuritiesCompanyCode", "Code") or "")
+        if is_stock_id(sid):
+            rows.append({"date": date, "stock_id": sid, "margin_bal": safe_int(it.get(m_k)),
+                         "short_bal": safe_int(it.get(s_k)) if s_k else 0, "market": "TPEx"})
+    return pd.DataFrame(rows, columns=MARGIN_COLS)
+
+
+def collect_margin():
+    """抓最近還沒存過的幾天上市融資餘額（最多 6 天，讓 5 日增減馬上算得出來），再加上上櫃最新一天。"""
+    frames = []
+    try:
+        with db() as conn:
+            have = {r[0] for r in conn.execute("SELECT DISTINCT date FROM margin WHERE market='TWSE'")}
+        got = 0
+        for d in recent_trading_days(10):
+            if got >= 6:
+                break
+            if fmt_date(d) in have:
+                continue
+            m = fetch_twse_margin(d)
+            if not m.empty:
+                frames.append(m)
+                got += 1
+            time.sleep(1.5)
+        print(f"TWSE 融資融券：新增 {got} 天")
+    except Exception as e:
+        print(f"TWSE 融資融券失敗：{e}")
+    try:
+        tp = fetch_tpex_margin()
+        if not tp.empty:
+            print(f"TPEx 融資融券 {tp['date'].iloc[0]}：{len(tp)} 檔")
+            frames.append(tp)
+    except Exception as e:
+        print(f"TPEx 融資融券失敗：{e}")
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=MARGIN_COLS)
+
+
+def make_margin_features(m):
+    """每檔股票：最新融資餘額，以及 5 個交易日的增減 %（資料不到 4 天或餘額太小就是空值，不影響判斷）。"""
+    cols = ["stock_id", "margin_bal", "margin_chg5"]
+    if m is None or m.empty:
+        return pd.DataFrame(columns=cols)
+    m = m.drop_duplicates(["date", "stock_id", "market"], keep="last").sort_values(["stock_id", "date"]).copy()
+    m["margin_bal"] = pd.to_numeric(m["margin_bal"], errors="coerce")
+
+    def chg(s):
+        v = s.dropna().values
+        k = min(5, len(v) - 1)
+        if k < 3 or v[-1 - k] <= 0 or v[-1] < MARGIN_MIN_BAL:
+            return np.nan
+        return (v[-1] / v[-1 - k] - 1) * 100
+
+    g = m.groupby("stock_id")["margin_bal"]
+    out = pd.DataFrame({"margin_bal": g.last(), "margin_chg5": g.apply(chg)}).reset_index()
+    print(f"融資特徵：{len(out)} 檔｜可算5日增減 {int(out['margin_chg5'].notna().sum())} 檔")
+    return out[cols]
+
+
 # ───────────────────────── 抓資料：千張大戶（集保，每週） ─────────────────────────
 def fetch_tdcc_holders():
     """集保「股權分散表」開放資料：每檔股票各持股分級的人數、股數、佔比。只取千張以上那一級。"""
@@ -576,6 +705,7 @@ def backfill(days):
     with db() as conn:
         have_p = {r[0] for r in conn.execute("SELECT DISTINCT date FROM prices WHERE market='TWSE'")}
         have_i = {r[0] for r in conn.execute("SELECT DISTINCT date FROM institutional WHERE market='TWSE'")}
+        have_m = {r[0] for r in conn.execute("SELECT DISTINCT date FROM margin WHERE market='TWSE'")}
     for d in weekdays_back(days):
         iso = fmt_date(d)
         if iso not in have_p:
@@ -584,6 +714,13 @@ def backfill(days):
                 print(f"回補行情 {iso}：{n} 檔" if n else f"{iso} 無行情（休市？）")
             except Exception as e:
                 print(f"回補行情 {iso} 失敗：{e}")
+            time.sleep(2)
+        if iso not in have_m:
+            try:
+                n = upsert("margin", fetch_twse_margin(d), MARGIN_COLS)
+                print(f"回補融資 {iso}：{n} 檔" if n else f"{iso} 無融資資料")
+            except Exception as e:
+                print(f"回補融資 {iso} 失敗：{e}")
             time.sleep(2)
         if iso not in have_i:
             try:
@@ -642,6 +779,11 @@ def make_price_features(full):
 
     latest = df["date"].max()
     out = df[df["date"] == latest].copy()
+    ok = out["ma20"].notna()
+    breadth = float((out.loc[ok, "close"] > out.loc[ok, "ma20"]).mean() * 100) if ok.sum() >= 200 else np.nan
+    out["mkt_breadth"] = breadth            # 大盤環境：站上月線的股票占幾 %（有 MA20 的股票不到 200 檔時算不準，記為空值）
+    print("大盤環境：" + ("資料不足，無法判斷" if np.isnan(breadth) else
+          f"{breadth:.0f}% 的股票站上月線（低於 {MARKET_MIN_BREADTH:g}% 算偏弱，v9.2 會暫停新買進）"))
     print(f"價格特徵：資料日 {latest}，{len(out)} 檔｜MA20 有值 {int(out['ma20'].notna().sum())} 檔｜"
           f"吸籌末端 {int(out['pre_breakout'].sum())}｜已爆發 {int(out['exploded'].sum())}")
     if out["ma20"].notna().sum() == 0:
@@ -755,7 +897,7 @@ def tech_text(r):
     return f"MA5:{vals[0]:.1f} MA10:{vals[1]:.1f} MA20:{vals[2]:.1f} 前20高:{vals[3]:.1f}"
 
 
-def build_radar(price_feat, inst_feat, holder_feat=None):
+def build_radar(price_feat, inst_feat, holder_feat=None, margin_feat=None):
     if price_feat is None or price_feat.empty:
         print("radar 空")
         return pd.DataFrame()
@@ -764,6 +906,11 @@ def build_radar(price_feat, inst_feat, holder_feat=None):
         df = df.merge(inst_feat, on="stock_id", how="left")
     if holder_feat is not None and not holder_feat.empty:
         df = df.merge(holder_feat, on="stock_id", how="left")
+    if margin_feat is not None and not margin_feat.empty:
+        df = df.merge(margin_feat, on="stock_id", how="left")
+    for c in ("margin_bal", "margin_chg5", "mkt_breadth"):   # 融資／大盤資料可能還沒有（缺值＝不影響判斷）
+        if c not in df.columns:
+            df[c] = np.nan
     for c in ("big_ratio", "big_delta"):              # 千張大戶資料可能還沒有（缺值＝不影響判斷）
         if c not in df.columns:
             df[c] = np.nan
@@ -792,7 +939,7 @@ TRACK_COLS = ["version", "stock_id", "first_seen", "stock_name", "status", "star
 
 def rs_of(version):
     """版本 → 額外條件開關；沒登記的版本名稱當作 v9.0。"""
-    return RULESETS.get(version, {"dealer": False, "big": False})
+    return {**RULE_DEFAULTS, **RULESETS.get(version, {})}
 
 
 def inst3_5d(r):
@@ -802,7 +949,8 @@ def inst3_5d(r):
 
 def buy_check(r, rs=None):
     """買進條件：收盤突破前 20 日高、還沒爆量、還沒急漲、投信或外資 5 日淨買、成交金額夠。
-    v9.1 再加：三大法人（含自營商）5 日合計淨買；千張大戶持股比例本週有增加（資料不足時不擋）。"""
+    v9.1 再加：三大法人（含自營商）5 日合計淨買；千張大戶持股比例本週有增加（資料不足時不擋）。
+    v9.2 再加：大盤環境不能偏弱；融資 5 日增加不能太多。"""
     rs = rs or rs_of(VERSION)
     ph, vr, r5 = r["prev_high20"], r["vol_ratio_5d"], r["return_5d"]
     if pd.isna(ph) or pd.isna(vr) or pd.isna(r5):
@@ -814,6 +962,10 @@ def buy_check(r, rs=None):
         return False
     if rs["big"] and pd.notna(r["big_delta"]) and r["big_delta"] <= BIG_BUY_MIN_DELTA:
         return False
+    if rs["market"] and pd.notna(r.get("mkt_breadth", np.nan)) and r["mkt_breadth"] < MARKET_MIN_BREADTH:
+        return False                                   # 大盤偏弱：暫停新買進
+    if rs["margin"] and pd.notna(r.get("margin_chg5", np.nan)) and r["margin_chg5"] > MARGIN_BUY_MAX_CHG:
+        return False                                   # 融資已經大增：散戶先進來了
     return True
 
 
@@ -831,6 +983,8 @@ def sell_reason(r, entry_price=None, rs=None):
         return "三大法人合計淨賣"
     if rs["big"] and pd.notna(r["big_delta"]) and r["big_delta"] <= BIG_SELL_DELTA:
         return f"千張大戶減持（本週{r['big_delta']:+.2f}個百分點）"
+    if rs["margin"] and pd.notna(r.get("margin_chg5", np.nan)) and r["margin_chg5"] >= MARGIN_SELL_CHG:
+        return f"融資暴增（5日{r['margin_chg5']:+.0f}%）·散戶進場"
     if pd.notna(r["ma10"]) and c < r["ma10"]:
         return "跌破MA10"
     return None
@@ -858,6 +1012,8 @@ def _chip(r):
          f"自營{int(round(float(r['dealer_5d']) / 1000)):+,d}張")
     if pd.notna(r["big_delta"]):
         s += f" 千張大戶{r['big_delta']:+.2f}pp"
+    if pd.notna(r.get("margin_chg5", np.nan)):
+        s += f" 融資5日{r['margin_chg5']:+.0f}%"
     return s
 
 
@@ -914,6 +1070,8 @@ def update_tracking(radar, data_date, version=None):
     for sid, r in rows.iterrows():
         if r["signal_key"] not in TRACK_START or sid in open_ids or sid in cooling:
             continue
+        if r["close"] > MAX_PRICE:                     # 一張買不起的不追蹤
+            continue
         if drop_reason(r, 0, rs):                      # 一出現就會被放棄的（例如千張大戶正在減持），直接不加入，免得紀錄裡一堆雜訊
             continue
         t = {"version": version, "stock_id": sid, "first_seen": data_date, "stock_name": r["stock_name"],
@@ -941,6 +1099,10 @@ def rules_text(version):
         extra.append("三大法人（含自營商）5日合計要淨買／淨賣才買／賣")
     if rs["big"]:
         extra.append(f"千張大戶持股比例本週增加才買、減少{abs(BIG_SELL_DELTA):g}個百分點以上就賣")
+    if rs["market"]:
+        extra.append(f"大盤偏弱（站上月線的股票<{MARKET_MIN_BREADTH:g}%）不買")
+    if rs["margin"]:
+        extra.append(f"融資5日增加>{MARGIN_BUY_MAX_CHG:g}%不買、>={MARGIN_SELL_CHG:g}%就賣")
     return "基本規則" + ("＋" + "＋".join(extra) if extra else "（沒有額外條件）")
 
 
@@ -1052,19 +1214,24 @@ LEGEND = """【搭順風車邏輯 - 買在還沒爆發前】
 放棄：觀察超過""" + f"{WATCH_MAX_DAYS}" + """天／投信與外資5日合計都淨賣（只是沒買不算）／已爆發沒買到
 v9.1 另外加：買進要三大法人（投信＋外資＋自營商自行買賣）5日合計淨買、千張大戶持股比例本週增加；
 　　　　　　賣出多了「三大法人5日合計淨賣」「千張大戶本週減持""" + f"{abs(BIG_SELL_DELTA):g}" + """個百分點以上」
+v9.2 再加：大盤環境（全市場站上月線的股票<""" + f"{MARKET_MIN_BREADTH:g}" + """%＝偏弱）時不買；融資（散戶借錢買股）5日增加超過""" + f"{MARGIN_BUY_MAX_CHG:g}" + """%不買、達""" + f"{MARGIN_SELL_CHG:g}" + """%就賣
 千張大戶＝持股1000張以上的人合計佔比（集保每週公布一次，所以這項資料最多落後約一週；資料還不夠算週增減時，不會因此擋買進）
 損益未扣交易成本（來回約0.6%：手續費買賣各0.1425%＋證交稅0.3%，實際依券商折扣）"""
 
 
 def build_email_body(radar, data_date, track_text=""):
     k = radar["signal_key"]
-    best, follow = radar[k.isin(GROUP_BEST)], radar[k.isin(GROUP_FOLLOW)]
+    cheap = radar["close"] <= MAX_PRICE                # 只列買得起的（股價上限見 MAX_PRICE）
+    best, follow = radar[k.isin(GROUP_BEST) & cheap], radar[k.isin(GROUP_FOLLOW) & cheap]
     danger = radar[k.isin(GROUP_DANGER)]
     line = "━━━━━━━━━━━━"
-    return (f"台股雷達 {VERSION} 搭順風車版｜資料日 {data_date}\n\n"
-            f"{line}\n🔵🟣 今日候選：吸籌末端·第一根 {len(best)} 檔（列前30）\n{fmt_rows(best, 30)}\n\n"
+    b = radar["mkt_breadth"].iloc[0] if "mkt_breadth" in radar.columns and len(radar) else np.nan
+    mkt = ("大盤環境：資料不足，暫時無法判斷" if pd.isna(b) else
+           f"大盤環境：{b:.0f}% 的股票站上月線｜" + ("偏弱（v9.2 暫停新買進）" if b < MARKET_MIN_BREADTH else "正常"))
+    return (f"台股雷達 {VERSION} 搭順風車版｜資料日 {data_date}\n{mkt}\n\n"
+            f"{line}\n🔵🟣 今日候選：吸籌末端·第一根 {len(best)} 檔（股價≤{MAX_PRICE:g}元，列前30）\n{fmt_rows(best, 30)}\n\n"
             f"{line}\n📌 追蹤中（候選股的買賣模擬）\n{track_text}\n\n"
-            f"{line}\n🔵🟣 跟著大戶 {len(follow)} 檔（列前20）\n{fmt_rows(follow, 20)}\n\n"
+            f"{line}\n🔵🟣 跟著大戶 {len(follow)} 檔（股價≤{MAX_PRICE:g}元，列前20）\n{fmt_rows(follow, 20)}\n\n"
             f"{line}\n🔴 已爆發／過熱／雙殺 {len(danger)} 檔（只列前15）\n{fmt_rows(danger, 15)}\n\n"
             f"{line}\n{LEGEND}\n")
 
@@ -1102,11 +1269,15 @@ def run(send_mail=True):
     holders = collect_holders()
     if not holders.empty:
         upsert("holders", holders, HOLDER_COLS)
+    margin = collect_margin()
+    if not margin.empty:
+        upsert("margin", margin, MARGIN_COLS)
 
     pf = make_price_features(load_table("prices", 120))
     inf = make_inst_features(load_table("institutional", 30), pf)
     hf = make_holder_features(load_table("holders", 60))
-    radar = build_radar(pf, inf, hf)
+    mf = make_margin_features(load_table("margin", 30))
+    radar = build_radar(pf, inf, hf, mf)
     if radar.empty:
         print("沒有可用資料，結束")
         raise SystemExit(1)
@@ -1124,14 +1295,14 @@ def run(send_mail=True):
         track_text += ("\n\n【版本對照（成績單會比較哪個版本表現比較好）】\n"
                        + "\n".join(compare_line(v, results[v][1]) for v in VERSIONS))
     if send_mail:
-        best_n = int(radar["signal_key"].isin(GROUP_BEST).sum())
+        best_n = int((radar["signal_key"].isin(GROUP_BEST) & (radar["close"] <= MAX_PRICE)).sum())
         subject = f"雷達 {VERSION}｜{data_date}｜第一根候選{best_n} 買進{len(events['buy'])} 賣出{len(events['sell'])}"
         send_email(subject, build_email_body(radar, data_date, track_text))
     print("=== 完成 ===")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="台股雷達 v9.0")
+    ap = argparse.ArgumentParser(description="台股雷達 v9.2")
     ap.add_argument("--backfill", type=int, default=0, metavar="N", help="先回補最近 N 個日曆天的上市行情與法人")
     ap.add_argument("--no-email", action="store_true", help="不寄信")
     args = ap.parse_args()
