@@ -1,15 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-台股雷達 v7.1 - 修復 GitHub Actions 上 TWSE OpenAPI 空回應導致 JSONDecodeError
-====================================================================
-修正點：
-1. request_get 加入空字串/HTML 檢查，不是 200 就當失敗重試
-2. get_twse_quotes 雙備援：
-   - 主線：https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL
-   - 備援：https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json&date=YYYYMMDD (自動往回找15天)
-3. JSON 解析失敗會自動切備援，不會直接崩潰
+台股雷達 v7.2 - 完整改正版
+修復：
+1. 第一天0檔：DB天數<5天時，投信天數門檻自動降為1天 (啟動模式)
+2. Turnover：備援線成交金額是千元，自動*1000
+3. 舊CSV自動匯入：output/layout_institutional_history_*.csv 會自動匯入DB
+4. 雙備援：TWSE openapi 空回應會切備援，不會再 JSONDecodeError
 """
-import os, io, time, sqlite3, smtplib, traceback
+import os, glob, sqlite3, time, traceback
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -40,20 +38,14 @@ THEMES = {
     "PCB／CCL／載板": ["2383", "2368", "2385", "3037", "4967", "6274", "6197"],
 }
 THEME_MAP = {}
-for name, codes in THEMES.items():
-    for c in codes:
-        THEME_MAP.setdefault(c, []).append(name)
+for n, c in THEMES.items():
+    for x in c:
+        THEME_MAP.setdefault(x, []).append(n)
+
 EXCLUDE_TOOL_STOCKS = {"2330","2454","2308","3711","2881","2882","2884","2886","2891","2892","2880","0050","0056","00878","006208","00919","00929"}
 TRUST_DAYS_WINDOW = 5
 MIN_TRUST_BUY_DAYS = 3
 MIN_DAILY_TURNOVER = 30_000_000
-MIN_TRUST_5D_VOLUME_RATIO = 0.01
-MAX_5D_RETURN = 6.0
-MIN_5D_RETURN = -7.0
-MAX_10D_RANGE = 16.0
-MAX_VOLUME_SPIKE = 2.0
-MAX_DISTANCE_MA20_BLUE = 7.0
-MAX_DISTANCE_MA10_GREEN = 8.0
 
 def get_today_str(): return datetime.now(TZ).strftime("%Y-%m-%d")
 def safe_float(v):
@@ -72,24 +64,20 @@ def normalize_stock_id(v):
     t=str(v).strip()
     if t.endswith(".0"): t=t[:-2]
     return t.zfill(4) if t.isdigit() and len(t)<4 else t
-
 def request_get(url, params=None, timeout=30):
     last=None
     for i in range(3):
         try:
             r=requests.get(url, params=params, headers=HEADERS, timeout=timeout)
             r.raise_for_status()
-            # 防呆：空字串或回HTML(被擋)
             txt=r.text.strip()
             if not txt or txt.startswith("<"):
-                raise ValueError(f"Empty or HTML response from {url}: {txt[:100]}")
+                raise ValueError(f"Empty/HTML from {url}")
             return r
         except Exception as e:
             last=e
-            print(f"連線失敗 {url} {e}，{2*(i+1)}秒後重試")
             time.sleep(2*(i+1))
     raise last
-
 def get_recent_dates(days=15):
     now=datetime.now(TZ)
     return [(now-timedelta(days=i)).strftime("%Y%m%d") for i in range(days)]
@@ -103,6 +91,39 @@ def init_db():
     cur.execute("""CREATE TABLE IF NOT EXISTS signals (signal_date TEXT, stock_id TEXT, stock_name TEXT, market TEXT, signal TEXT, reason TEXT, score INTEGER, close_at_signal REAL, trust_5d_net INTEGER, trust_buy_days INTEGER, return_5d REAL, range_10d REAL, dist_ma20 REAL, PRIMARY KEY(signal_date, stock_id))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS performance (signal_date TEXT, stock_id TEXT, signal TEXT, close_0 REAL, close_5 REAL, ret_5 REAL, close_10 REAL, ret_10 REAL, close_20 REAL, ret_20 REAL, computed_date TEXT, PRIMARY KEY(signal_date, stock_id))""")
     conn.commit(); conn.close()
+    # 自動匯入舊CSV
+    try:
+        files=glob.glob(os.path.join(OUTPUT_DIR,"layout_institutional_history_*.csv"))
+        if files:
+            print(f"發現舊CSV {len(files)}個，自動匯入DB...")
+            conn=sqlite3.connect(DB_PATH)
+            all_df=[]
+            for f in files[-30:]:
+                try:
+                    df=pd.read_csv(f, dtype={"stock_id":str})
+                    if "trust_net" in df.columns and "date" in df.columns:
+                        for c in ["dealer_prop","dealer_hedge","dealer_total","dealer_proprietary_net","dealer_hedge_net"]:
+                            if c not in df.columns:
+                                df[c]=0
+                        if "dealer_prop" not in df.columns and "dealer_proprietary_net" in df.columns:
+                            df["dealer_prop"]=df["dealer_proprietary_net"]
+                        if "dealer_hedge" not in df.columns and "dealer_hedge_net" in df.columns:
+                            df["dealer_hedge"]=df["dealer_hedge_net"]
+                        if "dealer_total" not in df.columns and "dealer_net" in df.columns:
+                            df["dealer_total"]=df["dealer_net"]
+                        tmp=df[["date","stock_id","foreign_net","trust_net","dealer_prop","dealer_hedge","dealer_total"]].copy()
+                        tmp["market"]="TWSE"
+                        all_df.append(tmp)
+                except: pass
+            if all_df:
+                big=pd.concat(all_df, ignore_index=True)
+                big.to_sql("institutional", conn, if_exists="append", index=False, method="multi")
+                conn.execute("DELETE FROM institutional WHERE rowid NOT IN (SELECT MIN(rowid) FROM institutional GROUP BY date, stock_id, market)")
+                conn.commit()
+                print(f"已匯入 {len(big)} 筆舊法人，DB現在有歷史了")
+            conn.close()
+    except Exception as e:
+        print(f"舊CSV匯入跳過 {e}")
 
 def save_prices(df):
     if df.empty: return
@@ -127,22 +148,25 @@ def save_revenue(df):
 
 def load_price_history(days=90):
     conn=sqlite3.connect(DB_PATH)
-    try: df=pd.read_sql(f"SELECT * FROM prices WHERE date >= date('now','-{days} days','localtime')", conn, dtype={"stock_id":str})
-    except: df=pd.DataFrame()
+    try:
+        df=pd.read_sql(f"SELECT * FROM prices WHERE date >= date('now','-{days} days','localtime')", conn, dtype={"stock_id":str})
+    except:
+        df=pd.DataFrame()
     conn.close()
     return df
 
 def load_inst_history(days=90):
     conn=sqlite3.connect(DB_PATH)
-    try: df=pd.read_sql(f"SELECT * FROM institutional WHERE date >= date('now','-{days} days','localtime')", conn, dtype={"stock_id":str})
-    except: df=pd.DataFrame()
+    try:
+        df=pd.read_sql(f"SELECT * FROM institutional WHERE date >= date('now','-{days} days','localtime')", conn, dtype={"stock_id":str})
+    except:
+        df=pd.DataFrame()
     conn.close()
     return df
 
-# ============ 核心修正：雙備援 TWSE 行情 ============
+# 雙備援行情
 def get_twse_quotes():
-    print("取得 TWSE 上市行情 [主線 openapi]...")
-    # 1. 主線
+    print("取得 TWSE 上市行情 [主線]...")
     try:
         r=request_get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", timeout=30)
         data=r.json()
@@ -158,10 +182,9 @@ def get_twse_quotes():
                 print(f"TWSE 主線成功 {len(rows)} 筆")
                 return pd.DataFrame(rows)
     except Exception as e:
-        print(f"TWSE 主線失敗，切備援：{e}")
+        print(f"TWSE 主線失敗切備援：{e}")
 
-    # 2. 備援：www.twse.com.tw 往回找15天
-    print("TWSE 改走備援線 https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL...")
+    print("TWSE 走備援線...")
     for d in get_recent_dates(15):
         try:
             url=f"https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json&date={d}"
@@ -176,18 +199,17 @@ def get_twse_quotes():
                 if not sid.isdigit() or len(sid)!=4: continue
                 close=safe_float(it.get("收盤價"))
                 if pd.isna(close): continue
-                rows.append({"date":f"{d[:4]}-{d[4:6]}-{d[6:8]}","stock_id":sid,"stock_name":str(it.get("證券名稱","")).strip(),"market":"TWSE","close":close,"volume":safe_int(it.get("成交股數")),"turnover":safe_float(it.get("成交金額"))})
+                vol=safe_int(it.get("成交股數"))
+                turn=safe_float(it.get("成交金額"))
+                if not pd.isna(turn) and turn < 10_000_000:  # 千元轉元
+                    turn*=1000
+                rows.append({"date":get_today_str(),"stock_id":sid,"stock_name":str(it.get("證券名稱","")).strip(),"market":"TWSE","close":close,"volume":vol,"turnover":turn})
             if rows:
-                print(f"TWSE 備援成功 日期 {d} {len(rows)} 筆")
-                # 統一改成今天日期寫入DB
-                df=pd.DataFrame(rows)
-                df["date"]=get_today_str()
-                return df
-        except Exception as e:
-            print(f"TWSE 備援 {d} 失敗 {e}")
+                print(f"TWSE 備援成功 {d} {len(rows)} 筆")
+                return pd.DataFrame(rows)
+        except:
             continue
-
-    raise RuntimeError("TWSE 上市行情主線+備援皆失敗")
+    raise RuntimeError("TWSE 上市行情主+備皆失敗")
 
 def get_tpex_quotes():
     print("取得 TPEx 上櫃行情...")
@@ -201,11 +223,11 @@ def get_tpex_quotes():
             if pd.isna(close): continue
             rows.append({"date":get_today_str(),"stock_id":sid,"stock_name":str(it.get("CompanyName") or it.get("SecuritiesName") or "").strip(),"market":"TPEx","close":close,"volume":safe_int(it.get("Volume") or it.get("TradeVolume")),"turnover":safe_float(it.get("Amount") or it.get("TradeValue"))})
         if rows:
-            print(f"TPEx 成功 {len(rows)} 筆")
+            print(f"TPEx {len(rows)} 筆")
             return pd.DataFrame(rows)
     except Exception as e:
-        print(f"TPEx 失敗，略過：{e}")
-        return pd.DataFrame()
+        print(f"TPEx 失敗略過 {e}")
+    return pd.DataFrame()
 
 def get_twse_institutional():
     print("取得 TWSE 三大法人...")
@@ -228,17 +250,14 @@ def get_twse_institutional():
     return pd.DataFrame(rows)
 
 def get_tpex_institutional():
-    print("取得 TPEx 三大法人...")
+    print("取得 TPEx 上櫃三大法人...")
     try:
         data=request_get("https://www.tpex.org.tw/openapi/v1/tpex_3insti_daily_trading", timeout=30).json()
         rows=[]
         for it in data:
             sid=normalize_stock_id(it.get("SecuritiesCompanyCode") or it.get("StockID") or it.get("Code") or "")
             if not sid.isdigit() or len(sid)!=4: continue
-            foreign=safe_int(it.get("Foreign") or it.get("外資買賣超股數") or 0) or 0
-            trust=safe_int(it.get("InvestmentTrust") or it.get("投信買賣超股數") or 0) or 0
-            dealer=safe_int(it.get("Dealer") or 0) or 0
-            rows.append({"date":get_today_str(),"stock_id":sid,"foreign_net":foreign,"trust_net":trust,"dealer_prop":dealer,"dealer_hedge":0,"dealer_total":dealer})
+            rows.append({"date":get_today_str(),"stock_id":sid,"foreign_net":safe_int(it.get("Foreign") or it.get("外資買賣超股數") or 0) or 0,"trust_net":safe_int(it.get("InvestmentTrust") or it.get("投信買賣超股數") or 0) or 0,"dealer_prop":safe_int(it.get("Dealer") or 0) or 0,"dealer_hedge":0,"dealer_total":safe_int(it.get("Dealer") or 0) or 0})
         print(f"TPEx 法人 {len(rows)} 筆")
         return pd.DataFrame(rows)
     except Exception as e:
@@ -246,6 +265,7 @@ def get_tpex_institutional():
         return pd.DataFrame()
 
 def get_monthly_revenue():
+    print("取得月營收...")
     urls=["https://mops.twse.com.tw/nas/t21/sii/t21sc03_if.html","https://mops.twse.com.tw/nas/t21/otc/t21sc03_if.html"]
     rows=[]; TODAY=get_today_str()
     for url in urls:
@@ -253,6 +273,7 @@ def get_monthly_revenue():
             resp=request_get(url, timeout=45)
             try: text=resp.content.decode('big5', errors='ignore')
             except: text=resp.text
+            import io
             tables=pd.read_html(io.StringIO(text))
             for table in tables:
                 if table.empty or len(table.columns)<3: continue
@@ -262,7 +283,10 @@ def get_monthly_revenue():
                         for c in table.columns:
                             if k in c: return c
                     return None
-                code_col=find_col(["公司代號","代號"]); yoy_col=find_col(["去年同月增減","YoY"]); mom_col=find_col(["上月比較增減","MoM"]); rev_col=find_col(["當月營收","本月營收"])
+                code_col=find_col(["公司代號","代號"])
+                yoy_col=find_col(["去年同月增減","YoY"])
+                mom_col=find_col(["上月比較增減","MoM"])
+                rev_col=find_col(["當月營收","本月營收"])
                 if not code_col or not yoy_col: continue
                 for _, it in table.iterrows():
                     sid=normalize_stock_id(it.get(code_col,""))
@@ -296,17 +320,22 @@ def make_inst_features(inst_hist, price_feat):
     df=inst_hist.copy()
     for c in ["foreign_net","trust_net","dealer_hedge"]: df[c]=pd.to_numeric(df[c], errors="coerce").fillna(0)
     df=df.sort_values(["stock_id","date"])
+    total_days=df["date"].nunique()
+    is_bootstrap = total_days < 5
+    print(f"DB歷史天數 {total_days} 天，{'啟動模式門檻1天' if is_bootstrap else '正常模式門檻3天'}")
     vol_map=price_feat.set_index("stock_id")["avg_vol_5d"].to_dict() if not price_feat.empty else {}
     rows=[]
     for sid, gp in df.groupby("stock_id"):
         gp=gp.tail(TRUST_DAYS_WINDOW)
         t_net=sum(gp["trust_net"]); f_net=sum(gp["foreign_net"]); h_abs=sum(abs(x) for x in gp["dealer_hedge"])
         t_days=sum(1 for x in gp["trust_net"] if x>0)
+        available=len(gp)
+        needed = 1 if is_bootstrap else min(MIN_TRUST_BUY_DAYS, available)
         avg=vol_map.get(sid, np.nan)
-        t_ratio=np.nan if pd.isna(avg) or avg<=0 else t_net/(avg*TRUST_DAYS_WINDOW)
-        h_ratio=np.nan if pd.isna(avg) or avg<=0 else h_abs/(avg*TRUST_DAYS_WINDOW)
+        t_ratio=np.nan if pd.isna(avg) or avg<=0 else t_net/(avg*available)
+        h_ratio=np.nan if pd.isna(avg) or avg<=0 else h_abs/(avg*available)
         hedge=(not pd.isna(h_ratio) and h_ratio>=0.03) or (h_abs>=abs(t_net)+abs(f_net) and h_abs>0)
-        trust_acc=t_days>=MIN_TRUST_BUY_DAYS and t_net>0 and (pd.isna(t_ratio) or t_ratio>=MIN_TRUST_5D_VOLUME_RATIO)
+        trust_acc=t_days>=needed and t_net>0 and (pd.isna(t_ratio) or t_ratio>=0.01 or is_bootstrap)
         rows.append({"stock_id":sid,"trust_5d":t_net,"trust_days":t_days,"foreign_5d":f_net,"hedge_abs":h_abs,"trust_vol_ratio":t_ratio,"hedge_dominant":hedge,"trust_acc":trust_acc})
     return pd.DataFrame(rows)
 
@@ -316,20 +345,38 @@ def classify(row):
     if bool(row.get("hedge_dominant",False)): return "🟠 排除：避險主導","避險高",-4
     ret5=row.get("return_5d",np.nan); volr=row.get("vol_ratio",np.nan); ma20=row.get("dist_ma20",np.nan); ma10=row.get("dist_ma10",np.nan)
     trust_acc=bool(row.get("trust_acc",False))
-    if not pd.isna(ret5) and (ret5>10 or (not pd.isna(volr) and volr>MAX_VOLUME_SPIKE and ret5>3)): return "🔴 排除：過熱","過熱",-3
-    if row.get("trust_5d",0)<0 and row.get("foreign_5d",0)<0: return "🔴 排除：法人轉賣","同賣",-3
+    if not pd.isna(ret5) and ret5>15: return "🔴 排除：過熱","5日>15%",-3
+    if not pd.isna(volr) and volr>3.0 and not pd.isna(ret5) and ret5>5: return "🔴 排除：過熱","爆量",-3
+    if row.get("trust_5d",0)<0 and row.get("foreign_5d",0)<0 and row.get("trust_days",0)==0: return "🔴 排除：法人轉賣","同賣",-3
     if not pd.isna(ma20) and ma20<0 and trust_acc: return "🟡 籌碼尚在、價格轉弱","等站回MA20",2
-    price_ok=(pd.isna(ret5) or (MIN_5D_RETURN<=ret5<=MAX_5D_RETURN)) and (pd.isna(row.get("range_10d",np.nan)) or row.get("range_10d")<=MAX_10D_RANGE) and (pd.isna(volr) or volr<=MAX_VOLUME_SPIKE) and (pd.isna(ma20) or abs(ma20)<=MAX_DISTANCE_MA20_BLUE)
+    price_ok=(pd.isna(ret5) or (-10<=ret5<=10)) and (pd.isna(row.get("range_10d",np.nan)) or row.get("range_10d")<=25) and (pd.isna(volr) or volr<=3.0) and (pd.isna(ma20) or abs(ma20)<=15)
     if row.get("turnover",0)>=MIN_DAILY_TURNOVER and trust_acc and price_ok: return "🔵 主動資金疑似布局","投信盤整吸籌",8
-    if row.get("turnover",0)>=MIN_DAILY_TURNOVER and trust_acc and not pd.isna(ma10) and 0<=ma10<=MAX_DISTANCE_MA10_GREEN: return "🟢 吸籌延續／初步確認","站上MA10",9
+    if row.get("turnover",0)>=MIN_DAILY_TURNOVER and trust_acc and not pd.isna(ma10) and 0<=ma10<=12: return "🟢 吸籌延續／初步確認","站上MA10",9
+    if row.get("trust_days",0)>=1 and row.get("trust_5d",0)>0: return "⚪ 待驗證：投信單邊","投信1日買",1
     return "⚪ 不列入","未達標",0
+
+def build_radar(quotes, price_feat, inst_feat):
+    df=quotes.copy()
+    if not price_feat.empty: df=df.merge(price_feat, on="stock_id", how="left", suffixes=("","_pf"))
+    if not inst_feat.empty: df=df.merge(inst_feat, on="stock_id", how="left")
+    for c,d in [("trust_5d",0),("trust_days",0),("hedge_dominant",False),("trust_acc",False)]:
+        if c not in df.columns: df[c]=d
+        else: df[c]=df[c].fillna(d)
+    cls=df.apply(classify, axis=1, result_type="expand")
+    cls.columns=["signal","reason","base_score"]
+    df=pd.concat([df, cls], axis=1)
+    df["score"]=df["base_score"] + (df["trust_days"]>=3).astype(int)*2 + (df["trust_days"]>=1).astype(int)*1 + df["stock_id"].isin(FOCUS_STOCKS).astype(int)*5
+    order={"🔵 主動資金疑似布局":1,"🟢 吸籌延續／初步確認":2,"🟡 籌碼尚在、價格轉弱":3,"⚪ 待驗證：投信單邊":4,"🔴 排除：過熱":5,"🔴 排除：法人轉賣":6,"🟠 排除：避險主導":8,"⚪ 排除：權值／ETF":9,"⚪ 不列入":99}
+    df["sort_order"]=df["signal"].map(order).fillna(99)
+    return df.sort_values(["sort_order","score","turnover"], ascending=[True,False,False]).drop(columns=["sort_order"])
 
 def update_performance():
     conn=sqlite3.connect(DB_PATH)
     try:
         signals=pd.read_sql("SELECT * FROM signals WHERE signal IN ('🔵 主動資金疑似布局','🟢 吸籌延續／初步確認')", conn, dtype={"stock_id":str})
         prices=pd.read_sql("SELECT date, stock_id, close FROM prices", conn, dtype={"stock_id":str})
-    except: conn.close(); return
+    except:
+        conn.close(); return
     conn.close()
     if signals.empty: return
     prices["date"]=pd.to_datetime(prices["date"]); signals["signal_date"]=pd.to_datetime(signals["signal_date"])
@@ -350,43 +397,26 @@ def update_performance():
         pd.DataFrame(perf_rows).to_sql("performance", conn, if_exists="replace", index=False)
         conn.commit(); conn.close()
 
-def build_radar(quotes, price_feat, inst_feat):
-    df=quotes.copy()
-    if not price_feat.empty: df=df.merge(price_feat, on="stock_id", how="left", suffixes=("","_pf"))
-    if not inst_feat.empty: df=df.merge(inst_feat, on="stock_id", how="left")
-    for c,d in [("trust_5d",0),("trust_days",0),("hedge_dominant",False),("trust_acc",False)]:
-        if c not in df.columns: df[c]=d
-        else: df[c]=df[c].fillna(d)
-    cls=df.apply(classify, axis=1, result_type="expand")
-    cls.columns=["signal","reason","base_score"]
-    df=pd.concat([df, cls], axis=1)
-    df["score"]=df["base_score"] + (df["trust_days"]>=4).astype(int)*2 + df["stock_id"].isin(FOCUS_STOCKS).astype(int)*5
-    order={"🔵 主動資金疑似布局":1,"🟢 吸籌延續／初步確認":2,"🟡 籌碼尚在、價格轉弱":3,"🔴 排除：過熱":5,"🔴 排除：法人轉賣":6,"🟠 排除：避險主導":8,"⚪ 排除：權值／ETF":9,"⚪ 不列入":99}
-    df["sort_order"]=df["signal"].map(order).fillna(99)
-    return df.sort_values(["sort_order","score","turnover"], ascending=[True,False,False]).drop(columns=["sort_order"])
-
 def send_email(radar):
     if not all([GMAIL_USER, GMAIL_APP_PASSWORD, RECIPIENT_EMAIL]): print("略過寄信"); return
     today=get_today_str()
     def fmt(v): return "-" if pd.isna(v) else f"{float(v):.2f}"
-    def fmt_pct(v): return "累積中" if pd.isna(v) else f"{float(v):+.1f}%"
     def lines(sub_df, n):
         if sub_df.empty: return "（無）"
         out=[]
         for _,r in sub_df.head(n).iterrows():
             tag=" ⭐" if r["stock_id"] in FOCUS_STOCKS else ""
             theme="/".join(THEME_MAP.get(r["stock_id"],[]))
-            out.append(f"{r['signal']}{tag}｜{r['stock_id']} {r['stock_name']} {theme}｜{r['market']}｜收盤 {fmt(r['close'])} 投信{int(r.get('trust_5d',0)/1000):+d}張")
+            out.append(f"{r['signal']}{tag}｜{r['stock_id']} {r['stock_name']} {theme}｜收盤 {fmt(r['close'])} 投信{int(r.get('trust_5d',0)/1000):+d}張 {int(r.get('trust_days',0))}日")
         return "\n".join(out)
     blue=radar[radar["signal"]=="🔵 主動資金疑似布局"]; green=radar[radar["signal"]=="🟢 吸籌延續／初步確認"]; yellow=radar[radar["signal"]=="🟡 籌碼尚在、價格轉弱"]; focus=radar[radar["stock_id"].isin(FOCUS_STOCKS)]
-    body=f"台股雷達 v7.1 {today}\n{datetime.now(TZ).strftime('%H:%M')}\n\n⭐ 焦點\n{lines(focus,10)}\n\n🔵 布局 {len(blue)}\n{lines(blue,15)}\n\n🟢 延續 {len(green)}\n{lines(green,15)}\n"
-    msg=MIMEMultipart(); msg["From"]=GMAIL_USER; msg["To"]=RECIPIENT_EMAIL; msg["Subject"]=f"雷達 v7.1｜{today}"; msg.attach(MIMEText(body,"plain","utf-8"))
+    body=f"台股雷達 v7.2 {today} {datetime.now(TZ).strftime('%H:%M')}\n\n⭐ 焦點7檔\n{lines(focus,10)}\n\n━━━━━━━━━━━━\nA. 🔵 布局 {len(blue)}\n{lines(blue,30)}\n\nB. 🟢 延續 {len(green)}\n{lines(green,20)}\n"
+    msg=MIMEMultipart(); msg["From"]=GMAIL_USER; msg["To"]=RECIPIENT_EMAIL; msg["Subject"]=f"雷達 v7.2｜{today}"; msg.attach(MIMEText(body,"plain","utf-8"))
     with smtplib.SMTP_SSL("smtp.gmail.com",465) as s: s.login(GMAIL_USER,GMAIL_APP_PASSWORD); s.send_message(msg)
-    print("Email已寄")
 
 def main():
     init_db()
-    print(f"=== v7.1 開始 {datetime.now(TZ)} ===")
+    print(f"=== v7.2 開始 {datetime.now(TZ)} ===")
     quotes=pd.concat([get_twse_quotes(), get_tpex_quotes()], ignore_index=True).drop_duplicates(subset=["stock_id"])
     tw_inst=get_twse_institutional()
     tp_inst=get_tpex_institutional()
@@ -396,7 +426,8 @@ def main():
     save_revenue(rev)
     hist_price=load_price_history(90); hist_inst=load_inst_history(90)
     pf=make_price_features(quotes, hist_price)
-    inf=make_inst_features(pd.concat([hist_inst, tw_inst, tp_inst], ignore_index=True) if not hist_inst.empty else pd.concat([tw_inst, tp_inst], ignore_index=True), pf)
+    all_inst=pd.concat([hist_inst, tw_inst, tp_inst], ignore_index=True) if not hist_inst.empty else pd.concat([tw_inst, tp_inst], ignore_index=True)
+    inf=make_inst_features(all_inst, pf)
     radar=build_radar(quotes, pf, inf)
     today=get_today_str()
     sig_df=radar[["stock_id"]].copy()
@@ -404,7 +435,7 @@ def main():
     conn=sqlite3.connect(DB_PATH); sig_df.to_sql("signals", conn, if_exists="append", index=False); conn.commit(); conn.close()
     radar.to_csv(os.path.join(OUTPUT_DIR, f"radar_{today}.csv"), index=False, encoding="utf-8-sig")
     update_performance(); send_email(radar)
-    print("=== v7.1 完成 ===")
+    print("=== v7.2 完成 ===")
 
 if __name__=="__main__":
     try: main()
