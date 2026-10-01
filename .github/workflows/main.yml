@@ -43,7 +43,9 @@ jobs:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
-          RADAR_VERSION: "v9.0"          # 每次改選股規則就換一個名字，例如 v9.1，成績單會分開算
+          # 同時追蹤哪些規則版本（逗號分隔，第一個是信件詳細內容用的主要版本）。
+          # v9.0＝基本規則；v9.1＝v9.0＋自營商＋千張大戶持股變化。成績單會把它們並排比較。
+          RADAR_VERSIONS: "v9.1,v9.0"
           BACKFILL_DAYS: ${{ github.event.inputs.backfill_days }}
         run: |
           if [ -n "$BACKFILL_DAYS" ] && [ "$BACKFILL_DAYS" != "0" ]; then
