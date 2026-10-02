@@ -1527,8 +1527,8 @@ def build_email_body(radar, data_date, track_text="", hold_text=""):
 # ───────────────────────── 精簡信件（v10.1）：只寫 可買／觀察／賣出 ─────────────────────────
 BUY_MAX_N = 5              # 可買最多列幾檔
 WATCH_MAX_N = 8            # 觀察最多列幾檔
-TARGET_MIN_PCT = 5.0       # 目標價至少 +5%
-TARGET_MAX_PCT = 15.0      # 目標價最多 +15%
+TARGET_MIN_PCT = 8.0       # 目標價至少 +8%
+TARGET_MAX_PCT = 10.0      # 目標價最多 +10%
 INST_COST_MAX_GAP = 5.0    # 現價離法人成本超過此 % → 不列可買，改列觀察「等拉回法人成本」
 INST_COST_STOP_PCT = 3.0   # 停損：跌破法人成本此 %
 
