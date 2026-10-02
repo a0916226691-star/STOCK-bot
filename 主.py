@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 台股雷達 v9.0 搭順風車版（重構＋修正版）
+v10 新增：型態分類（🚀突破型／🎯低接型／📦整理股）分區列在信件最前面，附參考進場價與停損價（見 classify_setup）
 
 用法
     python tw_radar.py                 # 每日執行：抓行情＋法人 → 算訊號 → 寄信
@@ -58,6 +59,17 @@ EXCLUDE_TOOL_STOCKS = {"2330", "2454", "2308", "3711", "2881", "2882", "2884", "
                        "2891", "2892", "2880", "0050", "0056", "00878", "006208", "00919", "00929"}
 MAX_PRICE = float(os.getenv("RADAR_MAX_PRICE", "150"))   # 股價上限（元）：一張最多約 15 萬。超過的不列入候選、不開始追蹤
 MIN_DAILY_TURNOVER = 30_000_000   # 成交金額下限（元）
+# ── 型態分類（v10）：突破型／低接型／整理股，報告分開列 ──────────────
+MA20_SLOPE_MIN = 1.5       # 強勢：月線 5 天內至少上升此 %（低接型要求）
+BREAKOUT_VOL_RATIO = 1.5   # 突破型：量要大於 5 日均量的幾倍
+BREAKOUT_STOP_PCT = 3.0    # 突破型停損：跌回箱頂下方此 %
+PULLBACK_MAX_K = 50        # 低接型：K 值要低於此（還在低檔）
+PULLBACK_MAX_VOL_RATIO = 0.8   # 低接型：量縮（小於 5 日均量的 0.8 倍）
+PULLBACK_STOP_PCT = 3.0    # 低接型停損：跌破月線下方此 %
+BOX_DAYS = 30              # 整理股：看最近幾個交易日的區間
+BOX_MAX_RANGE = 20.0       # 整理股：區間高低差小於此 %
+BOX_FLAT_SLOPE = 1.0       # 整理股：月線 5 日變化在 ±此 % 內（走平）
+OVEREXTEND_PCT = 10.0      # 乖離月線超過此 % → 排序往後、標 ⚠
 # ── 版本：同一次執行可以同時追蹤好幾個「規則版本」，成績單會並排比較 ──────────────
 # 環境變數 RADAR_VERSIONS（逗號分隔），第一個是主要版本：信件詳細內容與持股檢查都用它；其他版本在信裡只列一行對照。
 VERSIONS = [v.strip() for v in os.getenv("RADAR_VERSIONS", "v9.2,v9.1,v9.0,v9.3").split(",") if v.strip()]
@@ -85,14 +97,14 @@ BIG_BUY_MIN_DELTA = 0.0    # 買進：千張大戶持股比例本週增減（百
 BIG_SELL_DELTA = -0.5      # 賣出／放棄：千張大戶持股比例本週減少達此百分點（例如 -0.5 ＝ 減少 0.5 個百分點）
 HOLDER_COLS = ["date", "stock_id", "big_ratio", "big_people"]
 
-QUOTE_COLS = ["date", "stock_id", "stock_name", "market", "close", "volume", "turnover"]
+QUOTE_COLS = ["date", "stock_id", "stock_name", "market", "close", "volume", "turnover", "high", "low"]
 INST_COLS = ["date", "stock_id", "foreign_net", "trust_net", "dealer_prop", "dealer_hedge", "dealer_total", "market"]
 SIGNAL_COLS = ["signal_date", "stock_id", "stock_name", "market", "signal", "reason", "score",
                "close_at_signal", "trust_5d_net", "foreign_5d_net", "ma5", "ma10", "ma20", "tech"]
 _SIG_TYPES = {"score": "INTEGER", "close_at_signal": "REAL", "trust_5d_net": "INTEGER",
               "foreign_5d_net": "INTEGER", "ma5": "REAL", "ma10": "REAL", "ma20": "REAL"}
 EXPECTED_COLUMNS = {   # 表 → {欄位: 型別}，用來把舊資料庫補齊
-    "prices": {c: ("REAL" if c in ("close", "turnover") else "INTEGER" if c == "volume" else "TEXT")
+    "prices": {c: ("REAL" if c in ("close", "turnover", "high", "low") else "INTEGER" if c == "volume" else "TEXT")
                for c in QUOTE_COLS},
     "institutional": {c: ("TEXT" if c in ("date", "stock_id", "market") else "INTEGER") for c in INST_COLS},
     "signals": {c: _SIG_TYPES.get(c, "TEXT") for c in SIGNAL_COLS},
@@ -255,7 +267,7 @@ def init_db():
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     with db() as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS prices (date TEXT, stock_id TEXT, stock_name TEXT, market TEXT, "
-                     "close REAL, volume INTEGER, turnover REAL, PRIMARY KEY(date, stock_id))")
+                     "close REAL, volume INTEGER, turnover REAL, high REAL, low REAL, PRIMARY KEY(date, stock_id))")
         conn.execute("CREATE TABLE IF NOT EXISTS institutional (date TEXT, stock_id TEXT, foreign_net INTEGER, "
                      "trust_net INTEGER, dealer_prop INTEGER, dealer_hedge INTEGER, dealer_total INTEGER, "
                      "market TEXT, PRIMARY KEY(date, stock_id, market))")
@@ -348,7 +360,8 @@ def fetch_twse_quotes(d):
             continue
         rows.append({"date": date, "stock_id": sid, "stock_name": str(it.get("證券名稱", "")).strip(),
                      "market": "TWSE", "close": close, "volume": safe_float(it.get("成交股數")),
-                     "turnover": safe_float(it.get("成交金額"))})
+                     "turnover": safe_float(it.get("成交金額")),
+                     "high": safe_float(it.get("最高價")), "low": safe_float(it.get("最低價"))})
     return pd.DataFrame(rows, columns=QUOTE_COLS)
 
 
@@ -366,7 +379,8 @@ def fetch_twse_openapi():
             continue
         rows.append({"date": date, "stock_id": sid, "stock_name": str(it.get("Name", "")).strip(),
                      "market": "TWSE", "close": close, "volume": safe_float(it.get("TradeVolume")),
-                     "turnover": safe_float(it.get("TradeValue"))})
+                     "turnover": safe_float(it.get("TradeValue")),
+                     "high": safe_float(it.get("HighestPrice")), "low": safe_float(it.get("LowestPrice"))})
     return pd.DataFrame(rows, columns=QUOTE_COLS)
 
 
@@ -384,7 +398,9 @@ def fetch_tpex_quotes():
                      "stock_name": str(pick(it, "CompanyName", "Name") or "").strip(), "market": "TPEx",
                      "close": close,
                      "volume": safe_float(pick(it, "TradingShares", "TradeVolume", "Volume")),
-                     "turnover": safe_float(pick(it, "TransactionAmount", "TradeValue", "Amount"))})
+                     "turnover": safe_float(pick(it, "TransactionAmount", "TradeValue", "Amount")),
+                     "high": safe_float(pick(it, "High", "HighestPrice")),
+                     "low": safe_float(pick(it, "Low", "LowestPrice"))})
     df = pd.DataFrame(rows, columns=QUOTE_COLS)
     if not df.empty and df["volume"].isna().all():
         print("⚠ TPEx 成交量欄位對不上（全是空值），量比會失效。API 欄位：", list(data[0].keys()))
@@ -745,6 +761,29 @@ def grp_roll(s, key, n, fn):
     return getattr(s.groupby(key).rolling(n, min_periods=n), fn)().reset_index(level=0, drop=True)
 
 
+def calc_kd(df, n=9):
+    """KD(9,3)。有最高／最低價就用；舊資料沒有高低價時用收盤價代替（會略有誤差，資料累積後自然變準）。
+    df 必須已依 stock_id、date 排序。"""
+    close = df["close"]
+    hi = pd.to_numeric(df["high"], errors="coerce").fillna(close) if "high" in df.columns else close
+    lo = pd.to_numeric(df["low"], errors="coerce").fillna(close) if "low" in df.columns else close
+    key = df["stock_id"]
+    h9 = hi.groupby(key).rolling(n, min_periods=n).max().reset_index(level=0, drop=True)
+    l9 = lo.groupby(key).rolling(n, min_periods=n).min().reset_index(level=0, drop=True)
+    rsv = ((close - l9) / (h9 - l9).where(h9 > l9) * 100).fillna(50).where(h9.notna())
+    k_out, d_out = np.full(len(df), np.nan), np.full(len(df), np.nan)
+    for idx in df.groupby("stock_id").indices.values():
+        k = d = 50.0
+        for i in idx:
+            v = rsv.iat[i]
+            if pd.isna(v):
+                continue
+            k = k * 2 / 3 + v / 3
+            d = d * 2 / 3 + k / 3
+            k_out[i], d_out[i] = k, d
+    return pd.Series(k_out, index=df.index), pd.Series(d_out, index=df.index)
+
+
 def make_price_features(full):
     if full is None or full.empty:
         print("價格資料空")
@@ -785,9 +824,27 @@ def make_price_features(full):
     df["exploded"] = (df["vol_ratio_5d"] >= 2.5) & (df["return_5d"] >= 12)             # 散戶衝進來
     df["overheat"] = (df["dist_ma20"] > 12) | (df["dist_ma10"] > 10) | (df["return_5d"] > 15)
 
+    # ── v10 型態分類用 ──
+    df["ma20_slope5"] = (df["ma20"] / df["ma20"].groupby(key).shift(5) - 1) * 100   # 月線 5 日斜率 %
+    df["return_20d"] = (close / close.groupby(key).shift(20) - 1) * 100
+    df["new_high20"] = close > df["prev_high20"]                                    # 近 20 日新高
+    df["prev_high60"] = prev_close.groupby(key).rolling(60, min_periods=20).max().reset_index(level=0, drop=True)
+    df["new_high60"] = close > df["prev_high60"]                                    # 近 60 日新高（資料不足 60 天時用現有天數）
+    # 箱型：最近 BOX_DAYS 天（不含今天）的高低點
+    df["box_top"] = prev_close.groupby(key).rolling(BOX_DAYS, min_periods=20).max().reset_index(level=0, drop=True)
+    df["box_bottom"] = prev_close.groupby(key).rolling(BOX_DAYS, min_periods=20).min().reset_index(level=0, drop=True)
+    df["box_range"] = (df["box_top"] / df["box_bottom"] - 1) * 100
+    df["box_pos"] = (close - df["box_bottom"]) / (df["box_top"] - df["box_bottom"]) * 100   # 在箱子裡的位置 0=箱底 100=箱頂
+    df["is_box"] = (df["box_range"] < BOX_MAX_RANGE) & (df["ma20_slope5"].abs() < BOX_FLAT_SLOPE)
+    df["k9"], df["d9"] = calc_kd(df)
+    df["k9_prev"] = df["k9"].groupby(key).shift(1)
+
     latest = df["date"].max()
     out = df[df["date"] == latest].copy()
     ok = out["ma20"].notna()
+    rs_ok = out["return_20d"].notna()
+    mkt_r20 = float(out.loc[rs_ok, "return_20d"].median()) if rs_ok.sum() >= 200 else np.nan
+    out["rel_strength"] = out["return_20d"] - mkt_r20       # 近 20 日漲幅 − 全市場中位數（>0 = 贏大盤）
     breadth = float((out.loc[ok, "close"] > out.loc[ok, "ma20"]).mean() * 100) if ok.sum() >= 200 else np.nan
     out["mkt_breadth"] = breadth            # 大盤環境：站上月線的股票占幾 %（有 MA20 的股票不到 200 檔時算不準，記為空值）
     print("大盤環境：" + ("資料不足，無法判斷" if np.isnan(breadth) else
@@ -893,6 +950,68 @@ def classify(r):
     return "NONE", "未達標"
 
 
+# ───────────────────────── 型態分類（v10）：突破型／低接型／整理股 ─────────────────────────
+SETUP_LABEL = {"BREAKOUT": "🚀 突破型", "PULLBACK": "🎯 低接型", "PULLBACK_WAIT": "⏳ 低接等勾頭",
+               "BOX": "📦 整理股", "": ""}
+
+
+def classify_setup(r):
+    """回傳 (型態, 說明, 參考進場價, 停損價)。不符合任何型態回傳 ("", "", nan, nan)。
+    突破型：已經發動，確認後追進（帶量站上箱頂／前高）
+    低接型：強勢股拉回、法人還在買，提早埋伏
+    整理股：箱型來回、沒有方向，只列觀察，標出突破價與低接區"""
+    none = ("", "", np.nan, np.nan)
+    sid, c = str(r["stock_id"]), r["close"]
+    if sid in EXCLUDE_TOOL_STOCKS or r["hedge_dominant"] or c > MAX_PRICE:
+        return none
+    if not r["turnover"] >= MIN_DAILY_TURNOVER:
+        return none
+    if r["trust_5d"] < 0 and r["foreign_5d"] < 0:          # 土洋雙殺不列
+        return none
+    inst_net = r["trust_5d"] + r["foreign_5d"]
+    inst_buy = inst_net > 0 and (r["trust_5d"] > 0 or r["foreign_5d"] > 0)   # 土洋 5 日合計要淨買
+    inst_acc = (r["trust_acc"] or r["foreign_acc"]) and inst_net > 0          # 連續買（投信／外資任一）＋合計淨買
+    slope, rs, vr, k, kp = r["ma20_slope5"], r["rel_strength"], r["vol_ratio_5d"], r["k9"], r["k9_prev"]
+    if pd.isna(r["ma20"]) or pd.isna(slope) or pd.isna(vr):
+        return none
+    beats_mkt = pd.isna(rs) or rs > 0                       # 大盤資料不足時不擋
+
+    # 突破型：帶量站上箱頂（或前 20 日高），月線沒有往下，贏大盤，法人有買
+    top = r["box_top"] if pd.notna(r["box_top"]) else r["prev_high20"]
+    if (pd.notna(top) and c > top and vr >= BREAKOUT_VOL_RATIO and slope >= 0 and beats_mkt
+            and inst_acc and not r["exploded"]):
+        hi = "60日新高" if r["new_high60"] else "20日新高"
+        note = f"帶量 {vr:.1f} 倍站上箱頂 {top:.1f}｜{hi}｜月線 5日{slope:+.1f}%"
+        stop = max(top * (1 - BREAKOUT_STOP_PCT / 100), c * (1 - STOP_LOSS_PCT / 100))   # 最多虧 STOP_LOSS_PCT
+        return "BREAKOUT", note, c, round(stop, 2)
+
+    # 低接型：強勢股（月線明顯上揚＋贏大盤），法人持續買，拉回月線／10日線附近、量縮、K 低檔往上勾
+    near_ma = (c >= r["ma20"] * 0.98) and pd.notna(r["ma10"]) and (c <= r["ma10"] * 1.03)
+    if (slope >= MA20_SLOPE_MIN and beats_mkt and inst_acc and near_ma and vr < PULLBACK_MAX_VOL_RATIO
+            and pd.notna(k) and pd.notna(kp) and k < PULLBACK_MAX_K):
+        stop = round(r["ma20"] * (1 - PULLBACK_STOP_PCT / 100), 2)
+        if k > kp:
+            note = f"拉回均線量縮（量比{vr:.1f}）｜K {kp:.0f}→{k:.0f} 往上勾｜月線 5日{slope:+.1f}%"
+            return "PULLBACK", note, c, stop
+        note = f"拉回均線量縮（量比{vr:.1f}）｜K {kp:.0f}→{k:.0f} 還在往下，等勾頭再買｜月線 5日{slope:+.1f}%"
+        return "PULLBACK_WAIT", note, np.nan, stop
+
+    # 整理股：箱型、月線走平，法人有在買 → 只觀察，標出突破價與低接區
+    if r["is_box"] and inst_buy and pd.notna(r["box_pos"]):
+        pos = r["box_pos"]
+        kd = f"K{k:.0f}" if pd.notna(k) else "K-"
+        if pos >= 80 and pd.notna(k) and k >= 70:
+            where = "箱頂＋KD高檔，先別追"
+        elif pos <= 30:
+            where = "靠近箱底，可留意低接"
+        else:
+            where = "箱子中間"
+        note = (f"箱型 {r['box_bottom']:.1f}～{r['box_top']:.1f}（{r['box_range']:.0f}%）｜位置 {pos:.0f}%｜{kd}｜{where}"
+                f"｜帶量站上 {r['box_top']:.1f} 才算突破")
+        return "BOX", note, np.nan, np.nan
+    return none
+
+
 BOOL_COLS = ["trust_acc", "foreign_acc", "hedge_dominant", "is_multi_up", "above_ma10", "above_ma20",
              "is_consolidation", "near_high", "first_break", "pre_breakout", "exploded", "overheat"]
 NUM0_COLS = ["trust_5d", "foreign_5d", "dealer_5d", "trust_days", "foreign_days"]
@@ -932,6 +1051,15 @@ def build_radar(price_feat, inst_feat, holder_feat=None, margin_feat=None):
     df["score"] = df["signal_key"].map(SIGNAL_SCORE)
     df["rank"] = df["signal_key"].map(SIGNAL_RANK)
     df["tech"] = df.apply(tech_text, axis=1)
+    for c in ("rel_strength", "ma20_slope5", "k9", "k9_prev", "box_top", "box_bottom", "box_pos", "prev_high60"):
+        if c not in df.columns:
+            df[c] = np.nan
+    for c in ("is_box", "new_high20", "new_high60"):
+        df[c] = df[c].eq(True) if c in df.columns else False
+    st = df.apply(classify_setup, axis=1, result_type="expand")
+    df["setup"], df["setup_note"], df["setup_entry"], df["setup_stop"] = st[0], st[1], st[2], st[3]
+    df["overextended"] = df["dist_ma20"] > OVEREXTEND_PCT
+    print("型態分布：", df["setup"].value_counts().to_dict())
     df = df.sort_values(["rank", "turnover"], ascending=[True, False]).reset_index(drop=True)
     print("訊號分布：", df["signal_key"].value_counts().to_dict())
     return df
@@ -1260,7 +1388,59 @@ def fmt_rows(df, n):
     return "\n".join(out)
 
 
-LEGEND = """【搭順風車邏輯 - 買在還沒爆發前】
+def setup_groups(radar):
+    """依型態分組；乖離月線太大的排到後面。"""
+    out = {}
+    for key, sort_col in (("BREAKOUT", "vol_ratio_5d"), ("PULLBACK", "rel_strength"),
+                          ("PULLBACK_WAIT", "rel_strength"), ("BOX", "box_pos")):
+        g = radar[radar["setup"] == key].copy()
+        g["_pen"] = g["overextended"].astype(int)
+        asc = key == "BOX"                                  # 整理股：靠近箱底的排前面
+        out[key] = g.sort_values(["_pen", sort_col], ascending=[True, asc], na_position="last")
+    return out
+
+
+def fmt_setup_rows(df, n, with_price=True):
+    if df.empty:
+        return "（無）"
+    out = []
+    for _, r in df.head(n).iterrows():
+        t = f"{int(round(float(r['trust_5d']) / 1000)):+,d}"
+        f = f"{int(round(float(r['foreign_5d']) / 1000)):+,d}"
+        warn = f"⚠乖離月線{r['dist_ma20']:+.0f}% " if r["overextended"] else ""
+        price = (f"\n   參考進場 {r['setup_entry']:.2f}｜停損 {r['setup_stop']:.2f}"
+                 f"（{(r['setup_stop'] / r['setup_entry'] - 1) * 100:+.1f}%）"
+                 if with_price and pd.notna(r["setup_entry"]) else "")
+        rs = f" 贏大盤{r['rel_strength']:+.1f}%" if pd.notna(r["rel_strength"]) else ""
+        out.append(f"{warn}{r['stock_id']} {r['stock_name']}｜收盤 {_f(r['close'], '{:.2f}')}｜{r['setup_note']}\n"
+                   f"   投信{t}張 外資{f}張{rs}{price}")
+    return "\n".join(out)
+
+
+def build_setup_text(radar):
+    g = setup_groups(radar)
+    line = "━━━━━━━━━━━━"
+    return (f"{line}\n🚀 突破型 {len(g['BREAKOUT'])} 檔：已經發動，確認後追進（列前15）\n"
+            f"   停損設箱頂下方 {BREAKOUT_STOP_PCT:g}%；KD 高沒關係，重點是真的帶量突破\n"
+            f"{fmt_setup_rows(g['BREAKOUT'], 15)}\n\n"
+            f"{line}\n🎯 低接型 {len(g['PULLBACK'])} 檔：強勢股拉回、法人還在買，提早埋伏（列前15）\n"
+            f"   停損設月線下方 {PULLBACK_STOP_PCT:g}%；可能要等幾天才會動\n"
+            f"{fmt_setup_rows(g['PULLBACK'], 15)}\n\n"
+            f"⏳ 低接等勾頭 {len(g['PULLBACK_WAIT'])} 檔：條件都到了，只差 K 值還在往下（列前10，先放自選股）\n"
+            f"{fmt_setup_rows(g['PULLBACK_WAIT'], 10, with_price=False)}\n\n"
+            f"{line}\n📦 整理股觀察 {len(g['BOX'])} 檔：箱型來回沒方向，不是買點（靠近箱底的排前面，列前15）\n"
+            f"   帶量站上箱頂才轉突破型；箱頂＋KD高檔最危險\n"
+            f"{fmt_setup_rows(g['BOX'], 15, with_price=False)}\n\n")
+
+
+LEGEND = """【型態分類（v10）】
+🚀 突破型：帶量（大於5日均量""" + f"{BREAKOUT_VOL_RATIO:g}" + """倍）站上近""" + f"{BOX_DAYS}" + """日箱頂、月線沒有往下、近20日漲幅贏大盤、法人有買
+🎯 低接型：月線5日上升≥""" + f"{MA20_SLOPE_MIN:g}" + """%、贏大盤、法人持續買、股價拉回月線～10日線附近、量縮（量比<""" + f"{PULLBACK_MAX_VOL_RATIO:g}" + """）、K<""" + f"{PULLBACK_MAX_K}" + """且往上勾
+📦 整理股：近""" + f"{BOX_DAYS}" + """日高低差<""" + f"{BOX_MAX_RANGE:g}" + """%且月線走平。位置 0%=箱底、100%=箱頂
+⚠ 乖離月線超過""" + f"{OVEREXTEND_PCT:g}" + """%：容易拉回，排到後面
+大盤＝全市場股票近20日漲幅的中位數；KD(9,3) 舊資料沒有最高／最低價時用收盤價代替，會略有誤差
+
+【搭順風車邏輯 - 買在還沒爆發前】
 🔵 吸籌末端·土洋同買·第一根：盤整末端+土洋同買+快突破（收盤在前20日高點97%~100%）或首次站上前高+量比<2 = 上車點
 🔵 吸籌中·土洋同買·快突破：盤整吸籌+土洋同買+近前高
 🟣 先洋後土·跟：外資先佈局投信後跟，大戶先上車了
@@ -1297,6 +1477,7 @@ def build_email_body(radar, data_date, track_text="", hold_text=""):
     hold = f"{line}\n💼 我實際持有的股票（賣出檢查，賣掉了請從「股票追蹤」檔刪掉那一行）\n{hold_text}\n\n" if hold_text else ""
     return (f"台股雷達 {VERSION} 搭順風車版｜資料日 {data_date}\n{mkt}\n\n"
             f"{hold}"
+            f"{build_setup_text(radar)}"
             f"{line}\n🔵🟣 今日候選：吸籌末端·第一根 {len(best)} 檔（股價≤{MAX_PRICE:g}元，列前30）\n{fmt_rows(best, 30)}\n\n"
             f"{line}\n📌 追蹤中（候選股的買賣模擬）\n{track_text}\n\n"
             f"{line}\n🔵🟣 跟著大戶 {len(follow)} 檔（股價≤{MAX_PRICE:g}元，列前20）\n{fmt_rows(follow, 20)}\n\n"
@@ -1365,7 +1546,9 @@ def run(send_mail=True):
     hold_text, alerts = build_holdings_text(radar, load_holdings())
     if send_mail:
         best_n = int((radar["signal_key"].isin(GROUP_BEST) & (radar["close"] <= MAX_PRICE)).sum())
-        subject = (f"{'🚨' if alerts else ''}雷達 {VERSION}｜{data_date}｜第一根候選{best_n} 買進{len(events['buy'])} 賣出{len(events['sell'])}"
+        sc = radar["setup"].value_counts()
+        subject = (f"{'🚨' if alerts else ''}雷達 {VERSION}｜{data_date}｜突破{int(sc.get('BREAKOUT', 0))} "
+                   f"低接{int(sc.get('PULLBACK', 0))}｜第一根候選{best_n} 買進{len(events['buy'])} 賣出{len(events['sell'])}"
                    + (f"｜我的持股該賣{alerts}" if alerts else ""))
         send_email(subject, build_email_body(radar, data_date, track_text, hold_text))
     print("=== 完成 ===")
