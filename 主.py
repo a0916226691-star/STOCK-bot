@@ -1495,6 +1495,123 @@ def build_email_body(radar, data_date, track_text="", hold_text=""):
             f"{line}\n{LEGEND}\n")
 
 
+# ───────────────────────── 精簡信件（v10.1）：只寫 可買／觀察／賣出 ─────────────────────────
+BUY_MAX_N = 5              # 可買最多列幾檔
+WATCH_MAX_N = 8            # 觀察最多列幾檔
+TARGET_MIN_PCT = 5.0       # 目標價至少 +5%
+TARGET_MAX_PCT = 15.0      # 目標價最多 +15%
+
+
+def tick(p):
+    """台股升降單位。"""
+    return 0.01 if p < 10 else 0.05 if p < 50 else 0.1 if p < 100 else 0.5 if p < 500 else 1 if p < 1000 else 5
+
+
+def to_tick(p, up=False):
+    t = tick(p)
+    n = p / t
+    n = np.ceil(n - 1e-9) if up else np.floor(n + 1e-9)
+    return round(n * t, 2)
+
+
+def fmt_p(p):
+    return f"{p:,.2f}"
+
+
+def buy_plan(r):
+    """可買股票的 委託價格區間／目標價／停損價／持股週期。"""
+    c = float(r["close"])
+    if r["setup"] == "BREAKOUT":
+        low = c * 0.99
+        top, bot = r["box_top"], r["box_bottom"]
+        tgt = (top + (top - bot)) if pd.notna(top) and pd.notna(bot) else c * 1.08   # 箱型突破：再漲一個箱子高度
+        days = "3-7 天"
+    else:                                                    # PULLBACK
+        low = max(float(r["ma20"]), c * 0.98)
+        tgt = r["prev_high20"] if pd.notna(r["prev_high20"]) else c * 1.08          # 低接：回到前高
+        days = "5-10 天"
+    tgt = min(max(tgt, c * (1 + TARGET_MIN_PCT / 100)), c * (1 + TARGET_MAX_PCT / 100))
+    return {"low": to_tick(low, up=True), "high": to_tick(c), "target": to_tick(tgt),
+            "stop": to_tick(float(r["setup_stop"])), "days": days}
+
+
+def pick_buys(radar):
+    """可買：突破型＋低接型，乖離太大的不算（移到觀察）。依法人買超力道排序。"""
+    b = radar[radar["setup"].isin(["BREAKOUT", "PULLBACK"]) & ~radar["overextended"]].copy()
+    if b.empty:
+        return b
+    b["_force"] = (b["trust_5d"] + b["foreign_5d"]) / b["avg_vol_5d"].where(b["avg_vol_5d"] > 0)
+    return b.sort_values("_force", ascending=False, na_position="last").head(BUY_MAX_N)
+
+
+def pick_watches(radar, buy_ids):
+    """觀察：等勾頭的低接、乖離太大的突破（等拉回）、靠近箱底的整理股。回傳 [(row, 等什麼)]。"""
+    out = []
+    for _, r in radar[radar["setup"] == "PULLBACK_WAIT"].iterrows():
+        out.append((r, f"等 K 值勾頭，{fmt_p(to_tick(max(float(r['ma20']), r['close'] * 0.98), True))} 附近可買"))
+    ext = radar[radar["setup"].isin(["BREAKOUT", "PULLBACK"]) & radar["overextended"]]
+    for _, r in ext.sort_values("vol_ratio_5d", ascending=False).iterrows():
+        out.append((r, f"漲太急，等拉回 {fmt_p(to_tick(float(r['ma10'])))} 附近"))
+    box = radar[(radar["setup"] == "BOX") & (radar["box_pos"] <= 30)].sort_values("box_pos")
+    for _, r in box.iterrows():
+        out.append((r, f"整理中，帶量站上 {fmt_p(to_tick(float(r['box_top']), True))} 再買"))
+    return [x for x in out if x[0]["stock_id"] not in buy_ids][:WATCH_MAX_N]
+
+
+def check_holdings(radar, holdings):
+    """回傳 (該賣清單, 續抱清單)，每筆 dict。"""
+    rows = radar.drop_duplicates("stock_id").set_index("stock_id")
+    sell, keep = [], []
+    for sid, (cost, group) in holdings.items():
+        if sid not in rows.index:
+            keep.append({"sid": sid, "name": "", "close": np.nan, "cost": cost, "why": "今天沒有行情", "group": group})
+            continue
+        r = rows.loc[sid]
+        why = sell_reason(r, cost)
+        d = {"sid": sid, "name": r["stock_name"], "close": float(r["close"]), "cost": cost, "why": why, "group": group}
+        (sell if why else keep).append(d)
+    return sell, keep
+
+
+def build_simple_email(radar, data_date, holdings):
+    buys = pick_buys(radar)
+    watches = pick_watches(radar, set(buys["stock_id"]) if not buys.empty else set())
+    sell, keep = check_holdings(radar, holdings)
+    b = radar["mkt_breadth"].iloc[0] if "mkt_breadth" in radar.columns and len(radar) else np.nan
+    weak = pd.notna(b) and b < MARKET_MIN_BREADTH
+    parts = [f"📅 {data_date} 收盤" + ("｜⚠ 大盤偏弱，買進請減量" if weak else "")]
+
+    parts.append(f"\n🟢【可買】{len(buys)} 檔")
+    if buys.empty:
+        parts.append("今天沒有")
+    for _, r in buys.iterrows():
+        p = buy_plan(r)
+        parts.append(f"\n📊 股票代號：{r['stock_name']}({r['stock_id']})\n"
+                     f"💰 委託價格：{fmt_p(p['low'])}-{fmt_p(p['high'])}\n"
+                     f"🎯 目標價格：{fmt_p(p['target'])} 附近\n"
+                     f"🛑 停損價格：{fmt_p(p['stop'])}\n"
+                     f"📈 持股週期：{p['days']}")
+
+    parts.append(f"\n\n🟡【觀察】{len(watches)} 檔")
+    if not watches:
+        parts.append("今天沒有")
+    for r, wait in watches:
+        parts.append(f"• {r['stock_name']}({r['stock_id']})｜現價 {fmt_p(r['close'])}｜{wait}")
+
+    parts.append(f"\n\n🔴【賣出】{len(sell)} 檔")
+    if not sell:
+        parts.append("持股都不用賣" if holdings else "（股票追蹤清單是空的）")
+    for d in sell:
+        pnl = f"｜{(d['close'] / d['cost'] - 1) * 100:+.1f}%" if d["cost"] else ""
+        parts.append(f"• {d['name']}({d['sid']})｜現價 {fmt_p(d['close'])}{pnl}｜{d['why']}")
+    if keep:
+        parts.append("\n✅ 續抱：" + "、".join(
+            f"{d['name'] or d['sid']}({d['sid']})" + (f" {(d['close'] / d['cost'] - 1) * 100:+.1f}%"
+                                                     if d["cost"] and pd.notna(d["close"]) else "")
+            for d in keep))
+    return "\n".join(parts) + "\n", len(buys), len(watches), len(sell)
+
+
 def send_email(subject, body):
     user, pwd, to = (os.getenv(k) for k in ("GMAIL_USER", "GMAIL_APP_PASSWORD", "RECIPIENT_EMAIL"))
     if not (user and pwd and to):
@@ -1553,14 +1670,16 @@ def run(send_mail=True):
     if len(VERSIONS) > 1:
         track_text += ("\n\n【版本對照（成績單會比較哪個版本表現比較好）】\n"
                        + "\n".join(compare_line(v, results[v][1]) for v in VERSIONS))
-    hold_text, alerts = build_holdings_text(radar, load_holdings())
+    holdings = load_holdings()
+    hold_text, alerts = build_holdings_text(radar, holdings)
+    # 詳細版（原因、指標、模擬追蹤、版本對照）只印在 GitHub Actions 執行紀錄裡，信件只寄精簡版
+    print("\n===== 詳細報告（不寄信）=====\n" + build_email_body(radar, data_date, track_text, hold_text))
+    body, n_buy, n_watch, n_sell = build_simple_email(radar, data_date, holdings)
+    print("\n===== 信件內容 =====\n" + body)
     if send_mail:
-        best_n = int((radar["signal_key"].isin(GROUP_BEST) & (radar["close"] <= MAX_PRICE)).sum())
-        sc = radar["setup"].value_counts()
-        subject = (f"{'🚨' if alerts else ''}雷達 {VERSION}｜{data_date}｜突破{int(sc.get('BREAKOUT', 0))} "
-                   f"低接{int(sc.get('PULLBACK', 0))}｜第一根候選{best_n} 買進{len(events['buy'])} 賣出{len(events['sell'])}"
-                   + (f"｜我的持股該賣{alerts}" if alerts else ""))
-        send_email(subject, build_email_body(radar, data_date, track_text, hold_text))
+        md = f"{int(data_date[5:7])}/{data_date[8:]}"
+        subject = f"{'🚨' if n_sell else ''}台股雷達 {md}｜可買{n_buy} 觀察{n_watch} 賣出{n_sell}"
+        send_email(subject, body)
     print("=== 完成 ===")
 
 
