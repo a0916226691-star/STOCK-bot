@@ -1665,13 +1665,13 @@ def check_holdings(radar, holdings):
 
 
 def inst_light(r):
-    """法人動態燈號（台股習慣：紅＝進、綠＝出）：🔴 進場／🟡 持有／🟢 賣出。"""
+    """法人動態燈號：🟢 買進／🟡 持有／🔴 賣出。"""
     t5, f5, i3, streak = r["trust_5d"], r["foreign_5d"], r["inst_3d"], r["inst_sell_streak"]
     net5 = t5 + f5
     if (t5 < 0 and f5 < 0) or (net5 < 0 and pd.notna(streak) and streak >= 2):
-        return "🟢 賣出"
+        return "🔴 賣出"
     if net5 > 0 and (pd.isna(i3) or i3 > 0) and not (pd.notna(streak) and streak >= 1):
-        return "🔴 進場"
+        return "🟢 買進"
     return "🟡 持有"
 
 
@@ -1691,7 +1691,7 @@ def build_simple_email(radar, data_date, holdings):
     buys = pick_buys(radar)
     watches = pick_watches(radar, set(buys["stock_id"]) if not buys.empty else set())
     rows = radar.drop_duplicates("stock_id").set_index("stock_id")
-    parts = ["法人動態：🔴 進場　🟡 持有　🟢 賣出"]
+    parts = ["法人動態：🟢 買進　🟡 持有　🔴 賣出"]
 
     parts.append(f"\n【可買】{len(buys)} 檔")
     if buys.empty:
@@ -1719,7 +1719,7 @@ def build_simple_email(radar, data_date, holdings):
             parts.append(f"\n股票代號：{sid}\n目前價格：今天沒有行情資料")
             continue
         r = rows.loc[sid]
-        n_sell += inst_light(r).startswith("🟢")
+        n_sell += inst_light(r).startswith("🔴")
         parts.append("\n" + stock_block(r, sid))
     return "\n".join(parts) + "\n", len(buys), len(watches), n_sell
 
