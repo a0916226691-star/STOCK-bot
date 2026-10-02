@@ -60,7 +60,7 @@ MAX_PRICE = float(os.getenv("RADAR_MAX_PRICE", "150"))   # 股價上限（元）
 MIN_DAILY_TURNOVER = 30_000_000   # 成交金額下限（元）
 # ── 版本：同一次執行可以同時追蹤好幾個「規則版本」，成績單會並排比較 ──────────────
 # 環境變數 RADAR_VERSIONS（逗號分隔），第一個是主要版本：信件詳細內容與持股檢查都用它；其他版本在信裡只列一行對照。
-VERSIONS = [v.strip() for v in os.getenv("RADAR_VERSIONS", "v9.2,v9.1,v9.0").split(",") if v.strip()]
+VERSIONS = [v.strip() for v in os.getenv("RADAR_VERSIONS", "v9.2,v9.1,v9.0,v9.3").split(",") if v.strip()]
 VERSION = VERSIONS[0]
 SIGNAL_VERSION = os.getenv("RADAR_SIGNAL_VERSION", "v9.0")   # 「訊號分類」本身的版本標記（v9.0／v9.1／v9.2 的訊號分類相同）
 # 每個版本開哪些額外條件；沒列在這裡的版本名稱一律當作 v9.0（不開額外條件）
@@ -68,8 +68,10 @@ RULESETS = {
     "v9.0": {"dealer": False, "big": False},
     "v9.1": {"dealer": True, "big": True},    # v9.0 ＋ 自營商（三大法人合計）＋ 千張大戶持股變化
     "v9.2": {"dealer": True, "big": True, "market": True, "margin": True},   # v9.1 ＋ 大盤環境過濾 ＋ 融資（散戶）過熱
+    "v9.3": {"dealer": True, "big": True, "market": True, "margin": True, "early": True},   # v9.2 ＋ 提早買（快突破就買，不等突破）
 }
-RULE_DEFAULTS = {"dealer": False, "big": False, "market": False, "margin": False}
+RULE_DEFAULTS = {"dealer": False, "big": False, "market": False, "margin": False, "early": False}
+EARLY_BUY_RATIO = 0.99     # 提早買：收盤價達到前 20 日高點的 99% 就買（離前高不到 1%）
 # 大盤環境：全市場「收盤站上月線的股票」占幾 %。低於門檻＝大盤偏弱，v9.2 暫停新的買進
 MARKET_MIN_BREADTH = 40.0
 # 融資（散戶借錢買股）：5 個交易日增加太多＝散戶衝進來
@@ -956,12 +958,14 @@ def inst3_5d(r):
 def buy_check(r, rs=None):
     """買進條件：收盤突破前 20 日高、還沒爆量、還沒急漲、投信或外資 5 日淨買、成交金額夠。
     v9.1 再加：三大法人（含自營商）5 日合計淨買；千張大戶持股比例本週有增加（資料不足時不擋）。
-    v9.2 再加：大盤環境不能偏弱；融資 5 日增加不能太多。"""
+    v9.2 再加：大盤環境不能偏弱；融資 5 日增加不能太多。
+    v9.3 再加：提早買——收盤離前 20 日高不到 1% 就買，不等真的突破。"""
     rs = rs or rs_of(VERSION)
     ph, vr, r5 = r["prev_high20"], r["vol_ratio_5d"], r["return_5d"]
     if pd.isna(ph) or pd.isna(vr) or pd.isna(r5):
         return False
-    if not (r["close"] > ph and vr < BUY_MAX_VOL_RATIO and r5 < BUY_MAX_RET5
+    trigger = r["close"] > ph or (rs["early"] and r["close"] >= ph * EARLY_BUY_RATIO)   # 提早買：還沒突破但離前高不到 1%
+    if not (trigger and vr < BUY_MAX_VOL_RATIO and r5 < BUY_MAX_RET5
             and (r["trust_5d"] > 0 or r["foreign_5d"] > 0) and r["turnover"] >= MIN_DAILY_TURNOVER):
         return False
     if rs["dealer"] and inst3_5d(r) <= 0:
@@ -1025,8 +1029,10 @@ def _chip(r):
 
 def _enter(t, r, data_date, events):
     t.update(status="HOLD", entry_date=data_date, entry_price=float(r["close"]), days_held=0)
+    where = (f"突破前20日高 {r['prev_high20']:.1f}" if r["close"] > r["prev_high20"]
+             else f"提早買：離前20日高 {r['prev_high20']:.1f} 只差 {(r['prev_high20'] / r['close'] - 1) * 100:.1f}%")
     events["buy"].append(
-        f"{t['stock_id']} {t['stock_name']}｜買進價 {r['close']:.1f}｜突破前20日高 {r['prev_high20']:.1f}，"
+        f"{t['stock_id']} {t['stock_name']}｜買進價 {r['close']:.1f}｜{where}，"
         f"量比 {r['vol_ratio_5d']:.1f}，5日{r['return_5d']:+.1f}%｜{_chip(r)}｜停損價 {r['close'] * (1 - STOP_LOSS_PCT / 100):.1f}")
 
 
@@ -1105,6 +1111,8 @@ def rules_text(version):
         extra.append("三大法人（含自營商）5日合計要淨買／淨賣才買／賣")
     if rs["big"]:
         extra.append(f"千張大戶持股比例本週增加才買、減少{abs(BIG_SELL_DELTA):g}個百分點以上就賣")
+    if rs["early"]:
+        extra.append(f"提早買（收盤離前20日高不到{(1 - EARLY_BUY_RATIO) * 100:g}%就買，不等突破）")
     if rs["market"]:
         extra.append(f"大盤偏弱（站上月線的股票<{MARKET_MIN_BREADTH:g}%）不買")
     if rs["margin"]:
@@ -1272,6 +1280,7 @@ LEGEND = """【搭順風車邏輯 - 買在還沒爆發前】
 v9.1 另外加：買進要三大法人（投信＋外資＋自營商自行買賣）5日合計淨買、千張大戶持股比例本週增加；
 　　　　　　賣出多了「三大法人5日合計淨賣」「千張大戶本週減持""" + f"{abs(BIG_SELL_DELTA):g}" + """個百分點以上」
 v9.2 再加：大盤環境（全市場站上月線的股票<""" + f"{MARKET_MIN_BREADTH:g}" + """%＝偏弱）時不買；融資（散戶借錢買股）5日增加超過""" + f"{MARGIN_BUY_MAX_CHG:g}" + """%不買、達""" + f"{MARGIN_SELL_CHG:g}" + """%就賣
+v9.3 另外：提早買——收盤離前20日高不到""" + f"{(1 - EARLY_BUY_RATIO) * 100:g}" + """%就買，不等真的突破（跟 v9.2 比較「提早買」和「等突破才買」哪個比較好）
 千張大戶＝持股1000張以上的人合計佔比（集保每週公布一次，所以這項資料最多落後約一週；資料還不夠算週增減時，不會因此擋買進）
 損益未扣交易成本（來回約0.6%：手續費買賣各0.1425%＋證交稅0.3%，實際依券商折扣）"""
 
