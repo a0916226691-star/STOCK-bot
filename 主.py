@@ -897,7 +897,7 @@ INST_COST_MIN_DAYS = 2     # 至少要有幾天買超才算得出成本
 def make_inst_cost(inst, prices):
     """法人（投信＋外資）近 INST_COST_DAYS 天的平均買進成本。
     只算「當天土洋合計是買超」的日子，用當天均價（(高+低+收)/3，沒有高低價就用收盤）乘買超張數做加權平均。"""
-    cols = ["stock_id", "inst_cost", "inst_cost_days"]
+    cols = ["stock_id", "inst_cost", "inst_cost_days", "inst_1d", "inst_3d", "inst_sell_streak"]
     if inst is None or inst.empty or prices is None or prices.empty:
         return pd.DataFrame(columns=cols)
     i = inst.drop_duplicates(["date", "stock_id"], keep="last").copy()
@@ -914,6 +914,21 @@ def make_inst_cost(inst, prices):
     g = buy.groupby("stock_id").agg(amt=("amt", "sum"), net=("net", "sum"), inst_cost_days=("net", "size")).reset_index()
     g["inst_cost"] = g["amt"] / g["net"]
     g.loc[g["inst_cost_days"] < INST_COST_MIN_DAYS, "inst_cost"] = np.nan
+    # 近期法人資金動向：最近 1 天、3 天土洋合計，以及連續賣超天數
+    i = i.sort_values(["stock_id", "date"])
+    recent = i[i.groupby("stock_id").cumcount(ascending=False) < 3]
+
+    def streak(x):
+        n = 0
+        for v in x[::-1]:
+            if v < 0:
+                n += 1
+            else:
+                break
+        return n
+    flow = recent.groupby("stock_id")["net"].agg(inst_1d="last", inst_3d="sum",
+                                                 inst_sell_streak=lambda x: streak(list(x))).reset_index()
+    g = flow.merge(g, on="stock_id", how="left")
     print(f"法人成本：{int(g['inst_cost'].notna().sum())} 檔算得出來（近 {INST_COST_DAYS} 個交易日）")
     return g[cols]
 
@@ -1080,7 +1095,7 @@ def build_radar(price_feat, inst_feat, holder_feat=None, margin_feat=None):
     df["rank"] = df["signal_key"].map(SIGNAL_RANK)
     df["tech"] = df.apply(tech_text, axis=1)
     for c in ("rel_strength", "ma20_slope5", "k9", "k9_prev", "box_top", "box_bottom", "box_pos", "prev_high60",
-              "inst_cost"):
+              "inst_cost", "inst_1d", "inst_3d", "inst_sell_streak"):
         if c not in df.columns:
             df[c] = np.nan
     for c in ("is_box", "new_high20", "new_high60"):
@@ -1604,6 +1619,36 @@ def pick_watches(radar, buy_ids):
     return [x for x in out if x[0]["stock_id"] not in buy_ids][:WATCH_MAX_N]
 
 
+def hold_verdict(r, cost):
+    """持股判斷：回傳 (等級, 原因, 建議)。等級：SELL／WARN／HOLD。"""
+    c = float(r["close"])
+    t5, f5 = r["trust_5d"], r["foreign_5d"]
+    i3, streak, icost = r["inst_3d"], r["inst_sell_streak"], r["inst_cost"]
+    exit_px = icost * (1 - INST_COST_STOP_PCT / 100) if pd.notna(icost) else (r["ma10"] if pd.notna(r["ma10"]) else np.nan)
+    if cost:
+        exit_px = max(exit_px, cost * (1 - STOP_LOSS_PCT / 100)) if pd.notna(exit_px) else cost * (1 - STOP_LOSS_PCT / 100)
+    ex = f"{fmt_p(to_tick(exit_px))}" if pd.notna(exit_px) else "-"
+    # 🔴 賣出：法人明顯撤走，或已經觸發停損
+    if cost and c <= cost * (1 - STOP_LOSS_PCT / 100):
+        return "SELL", f"虧損超過 {STOP_LOSS_PCT:g}%", "已到停損，建議賣出"
+    if t5 < 0 and f5 < 0:
+        return "SELL", "投信、外資 5 日都在賣", "法人資金撤走，建議賣出"
+    if pd.notna(icost) and c < icost * (1 - INST_COST_STOP_PCT / 100):
+        return "SELL", f"跌破法人成本 {fmt_p(icost)}", "法人也套牢了，建議賣出"
+    if r["exploded"]:
+        return "SELL", "爆量急漲，散戶衝進來", "建議獲利了結"
+    # ⚠ 警示：法人開始撤的跡象
+    if pd.notna(streak) and streak >= 2:
+        return "WARN", f"法人連 {int(streak)} 天賣超", f"先減碼或不加碼，跌破 {ex} 全賣"
+    if pd.notna(i3) and i3 < 0 and (t5 + f5) > 0:
+        return "WARN", "5 日還是買超，但近 3 日轉賣", f"留意，跌破 {ex} 就賣"
+    if (t5 + f5) < 0:
+        return "WARN", "土洋 5 日合計賣超", f"留意，跌破 {ex} 就賣"
+    if pd.notna(r["ma10"]) and c < r["ma10"]:
+        return "WARN", "跌破 10 日線", f"留意，跌破 {ex} 就賣"
+    return "HOLD", "法人還在買", f"續抱，跌破 {ex} 再走"
+
+
 def check_holdings(radar, holdings):
     """回傳 (該賣清單, 續抱清單)，每筆 dict。"""
     rows = radar.drop_duplicates("stock_id").set_index("stock_id")
@@ -1622,7 +1667,10 @@ def check_holdings(radar, holdings):
 def build_simple_email(radar, data_date, holdings):
     buys = pick_buys(radar)
     watches = pick_watches(radar, set(buys["stock_id"]) if not buys.empty else set())
-    sell, keep = check_holdings(radar, holdings)
+    _rows = radar.drop_duplicates("stock_id").set_index("stock_id")
+    verdicts = {sid: hold_verdict(_rows.loc[sid], cost) for sid, (cost, _) in holdings.items() if sid in _rows.index}
+    n_sell = sum(1 for v in verdicts.values() if v[0] == "SELL")
+    n_warn = sum(1 for v in verdicts.values() if v[0] == "WARN")
     b = radar["mkt_breadth"].iloc[0] if "mkt_breadth" in radar.columns and len(radar) else np.nan
     weak = pd.notna(b) and b < MARKET_MIN_BREADTH
     parts = [f"📅 {data_date} 收盤" + ("｜⚠ 大盤偏弱，買進請減量" if weak else "")]
@@ -1644,18 +1692,32 @@ def build_simple_email(radar, data_date, holdings):
     for r, wait in watches:
         parts.append(f"• {r['stock_name']}({r['stock_id']})｜現價 {fmt_p(r['close'])}｜{wait}")
 
-    parts.append(f"\n\n🔴【賣出】{len(sell)} 檔")
-    if not sell:
-        parts.append("持股都不用賣" if holdings else "（股票追蹤清單是空的）")
-    for d in sell:
-        pnl = f"｜{(d['close'] / d['cost'] - 1) * 100:+.1f}%" if d["cost"] else ""
-        parts.append(f"• {d['name']}({d['sid']})｜現價 {fmt_p(d['close'])}{pnl}｜{d['why']}")
-    if keep:
-        parts.append("\n✅ 續抱：" + "、".join(
-            f"{d['name'] or d['sid']}({d['sid']})" + (f" {(d['close'] / d['cost'] - 1) * 100:+.1f}%"
-                                                     if d["cost"] and pd.notna(d["close"]) else "")
-            for d in keep))
-    return "\n".join(parts) + "\n", len(buys), len(watches), len(sell)
+    parts.append(f"\n\n💼【我的持股】{len(holdings)} 檔" + (f"｜🔴賣出 {n_sell}" if n_sell else "")
+                 + (f"｜⚠警示 {n_warn}" if n_warn else ""))
+    if not holdings:
+        parts.append("（股票追蹤清單是空的）")
+    rows = radar.drop_duplicates("stock_id").set_index("stock_id")
+    icon = {"SELL": "🔴 賣出", "WARN": "⚠ 警示", "HOLD": "✅ 續抱"}
+    cur = None
+    for sid, (cost, group) in holdings.items():
+        if len({g for _, g in holdings.values()}) > 1 and group != cur:
+            cur = group
+            parts.append(f"\n【{group}】")
+        if sid not in rows.index:
+            parts.append(f"\n❔ {sid}：今天沒有行情資料")
+            continue
+        r = rows.loc[sid]
+        level, why, advice = verdicts[sid]
+        c = float(r["close"])
+        pnl = f"（{(c / cost - 1) * 100:+.1f}%）" if cost else ""
+        k = lambda v: f"{int(round(float(v) / 1000)):+,d}張" if pd.notna(v) else "-"
+        flow = f"近5日 {k(r['trust_5d'] + r['foreign_5d'])}｜近3日 {k(r['inst_3d'])}"
+        parts.append(f"\n📊 {r['stock_name']}({sid})\n"
+                     f"💲 目前價格：{fmt_p(c)}{pnl}\n"
+                     f"🏦 法人資金：{flow}\n"
+                     f"{icon[level]}：{why}\n"
+                     f"💡 建議：{advice}")
+    return "\n".join(parts) + "\n", len(buys), len(watches), n_sell
 
 
 def send_email(subject, body):
@@ -1728,7 +1790,7 @@ def run(send_mail=True):
     print("\n===== 信件內容 =====\n" + body)
     if send_mail:
         md = f"{int(data_date[5:7])}/{data_date[8:]}"
-        subject = f"{'🚨' if n_sell else ''}台股雷達 {md}｜可買{n_buy} 觀察{n_watch} 賣出{n_sell}"
+        subject = f"{'🚨' if n_sell else ''}台股雷達 {md}｜可買{n_buy} 觀察{n_watch}" + (f" 持股賣出{n_sell}" if n_sell else "")
         send_email(subject, body)
     print("=== 完成 ===")
 
