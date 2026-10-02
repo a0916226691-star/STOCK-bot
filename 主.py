@@ -890,6 +890,34 @@ def make_inst_features(inst, price_feat):
                 "trust_acc", "foreign_acc", "hedge_dominant"]]
 
 
+INST_COST_DAYS = 10        # 法人成本：看最近幾個交易日的買超
+INST_COST_MIN_DAYS = 2     # 至少要有幾天買超才算得出成本
+
+
+def make_inst_cost(inst, prices):
+    """法人（投信＋外資）近 INST_COST_DAYS 天的平均買進成本。
+    只算「當天土洋合計是買超」的日子，用當天均價（(高+低+收)/3，沒有高低價就用收盤）乘買超張數做加權平均。"""
+    cols = ["stock_id", "inst_cost", "inst_cost_days"]
+    if inst is None or inst.empty or prices is None or prices.empty:
+        return pd.DataFrame(columns=cols)
+    i = inst.drop_duplicates(["date", "stock_id"], keep="last").copy()
+    i["net"] = pd.to_numeric(i["foreign_net"], errors="coerce").fillna(0) + pd.to_numeric(i["trust_net"], errors="coerce").fillna(0)
+    p = prices.drop_duplicates(["date", "stock_id"], keep="last").copy()
+    c = pd.to_numeric(p["close"], errors="coerce")
+    hi = pd.to_numeric(p["high"], errors="coerce") if "high" in p.columns else c
+    lo = pd.to_numeric(p["low"], errors="coerce") if "low" in p.columns else c
+    p["px"] = ((hi.fillna(c) + lo.fillna(c) + c) / 3)
+    df = i.merge(p[["date", "stock_id", "px"]], on=["date", "stock_id"], how="inner").sort_values(["stock_id", "date"])
+    df = df[df.groupby("stock_id").cumcount(ascending=False) < INST_COST_DAYS]
+    buy = df[(df["net"] > 0) & df["px"].notna()].copy()
+    buy["amt"] = buy["net"] * buy["px"]
+    g = buy.groupby("stock_id").agg(amt=("amt", "sum"), net=("net", "sum"), inst_cost_days=("net", "size")).reset_index()
+    g["inst_cost"] = g["amt"] / g["net"]
+    g.loc[g["inst_cost_days"] < INST_COST_MIN_DAYS, "inst_cost"] = np.nan
+    print(f"法人成本：{int(g['inst_cost'].notna().sum())} 檔算得出來（近 {INST_COST_DAYS} 個交易日）")
+    return g[cols]
+
+
 # ───────────────────────── 分類 ─────────────────────────
 def classify(r):
     """回傳 (訊號 key, 原因)。"""
@@ -1051,7 +1079,8 @@ def build_radar(price_feat, inst_feat, holder_feat=None, margin_feat=None):
     df["score"] = df["signal_key"].map(SIGNAL_SCORE)
     df["rank"] = df["signal_key"].map(SIGNAL_RANK)
     df["tech"] = df.apply(tech_text, axis=1)
-    for c in ("rel_strength", "ma20_slope5", "k9", "k9_prev", "box_top", "box_bottom", "box_pos", "prev_high60"):
+    for c in ("rel_strength", "ma20_slope5", "k9", "k9_prev", "box_top", "box_bottom", "box_pos", "prev_high60",
+              "inst_cost"):
         if c not in df.columns:
             df[c] = np.nan
     for c in ("is_box", "new_high20", "new_high60"):
@@ -1500,6 +1529,8 @@ BUY_MAX_N = 5              # 可買最多列幾檔
 WATCH_MAX_N = 8            # 觀察最多列幾檔
 TARGET_MIN_PCT = 5.0       # 目標價至少 +5%
 TARGET_MAX_PCT = 15.0      # 目標價最多 +15%
+INST_COST_MAX_GAP = 5.0    # 現價離法人成本超過此 % → 不列可買，改列觀察「等拉回法人成本」
+INST_COST_STOP_PCT = 3.0   # 停損：跌破法人成本此 %
 
 
 def tick(p):
@@ -1520,24 +1551,36 @@ def fmt_p(p):
 
 def buy_plan(r):
     """可買股票的 委託價格區間／目標價／停損價／持股週期。"""
-    c = float(r["close"])
+    c, cost = float(r["close"]), r["inst_cost"]
     if r["setup"] == "BREAKOUT":
-        low = c * 0.99
         top, bot = r["box_top"], r["box_bottom"]
         tgt = (top + (top - bot)) if pd.notna(top) and pd.notna(bot) else c * 1.08   # 箱型突破：再漲一個箱子高度
         days = "3-7 天"
     else:                                                    # PULLBACK
-        low = max(float(r["ma20"]), c * 0.98)
         tgt = r["prev_high20"] if pd.notna(r["prev_high20"]) else c * 1.08          # 低接：回到前高
         days = "5-10 天"
     tgt = min(max(tgt, c * (1 + TARGET_MIN_PCT / 100)), c * (1 + TARGET_MAX_PCT / 100))
+    if pd.notna(cost):
+        # 籌碼面：委託價掛在法人成本～現價之間（最多往下 3%，太低會買不到）；停損＝跌破法人成本 3%
+        low = min(max(cost, c * 0.97), c)
+        stop = cost * (1 - INST_COST_STOP_PCT / 100)
+    else:
+        # 算不出法人成本（買超天數太少）時退回技術面
+        low = c * 0.99 if r["setup"] == "BREAKOUT" else max(float(r["ma20"]), c * 0.98)
+        stop = float(r["setup_stop"])
+    stop = max(stop, c * (1 - STOP_LOSS_PCT / 100))          # 最多虧 STOP_LOSS_PCT
     return {"low": to_tick(low, up=True), "high": to_tick(c), "target": to_tick(tgt),
-            "stop": to_tick(float(r["setup_stop"])), "days": days}
+            "stop": to_tick(stop), "days": days}
+
+
+def far_from_cost(r):
+    return pd.notna(r["inst_cost"]) and r["close"] > r["inst_cost"] * (1 + INST_COST_MAX_GAP / 100)
 
 
 def pick_buys(radar):
     """可買：突破型＋低接型，乖離太大的不算（移到觀察）。依法人買超力道排序。"""
     b = radar[radar["setup"].isin(["BREAKOUT", "PULLBACK"]) & ~radar["overextended"]].copy()
+    b = b[~b.apply(far_from_cost, axis=1)] if not b.empty else b
     if b.empty:
         return b
     b["_force"] = (b["trust_5d"] + b["foreign_5d"]) / b["avg_vol_5d"].where(b["avg_vol_5d"] > 0)
@@ -1548,10 +1591,13 @@ def pick_watches(radar, buy_ids):
     """觀察：等勾頭的低接、乖離太大的突破（等拉回）、靠近箱底的整理股。回傳 [(row, 等什麼)]。"""
     out = []
     for _, r in radar[radar["setup"] == "PULLBACK_WAIT"].iterrows():
-        out.append((r, f"等 K 值勾頭，{fmt_p(to_tick(max(float(r['ma20']), r['close'] * 0.98), True))} 附近可買"))
-    ext = radar[radar["setup"].isin(["BREAKOUT", "PULLBACK"]) & radar["overextended"]]
+        base = r["inst_cost"] if pd.notna(r["inst_cost"]) else max(float(r["ma20"]), r["close"] * 0.98)
+        out.append((r, f"等 K 值勾頭，{fmt_p(to_tick(min(float(base), float(r['close'])), True))} 附近可買"))
+    cand = radar[radar["setup"].isin(["BREAKOUT", "PULLBACK"])]
+    ext = cand[cand["overextended"] | cand.apply(far_from_cost, axis=1)] if not cand.empty else cand
     for _, r in ext.sort_values("vol_ratio_5d", ascending=False).iterrows():
-        out.append((r, f"漲太急，等拉回 {fmt_p(to_tick(float(r['ma10'])))} 附近"))
+        back = r["inst_cost"] if pd.notna(r["inst_cost"]) else r["ma10"]
+        out.append((r, f"離法人成本太遠，等拉回 {fmt_p(to_tick(float(back), True))} 附近"))
     box = radar[(radar["setup"] == "BOX") & (radar["box_pos"] <= 30)].sort_values("box_pos")
     for _, r in box.iterrows():
         out.append((r, f"整理中，帶量站上 {fmt_p(to_tick(float(r['box_top']), True))} 再買"))
@@ -1650,7 +1696,11 @@ def run(send_mail=True):
         upsert("margin", margin, MARGIN_COLS)
 
     pf = make_price_features(load_table("prices", 120))
-    inf = make_inst_features(load_table("institutional", 30), pf)
+    inst_hist = load_table("institutional", 30)
+    inf = make_inst_features(inst_hist, pf)
+    cost = make_inst_cost(inst_hist, load_table("prices", 30))
+    if not inf.empty and not cost.empty:
+        inf = inf.merge(cost, on="stock_id", how="left")
     hf = make_holder_features(load_table("holders", 60))
     mf = make_margin_features(load_table("margin", 30))
     radar = build_radar(pf, inf, hf, mf)
