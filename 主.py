@@ -1664,59 +1664,63 @@ def check_holdings(radar, holdings):
     return sell, keep
 
 
+def inst_light(r):
+    """法人動態燈號（台股習慣：紅＝進、綠＝出）：🔴 進場／🟡 持有／🟢 賣出。"""
+    t5, f5, i3, streak = r["trust_5d"], r["foreign_5d"], r["inst_3d"], r["inst_sell_streak"]
+    net5 = t5 + f5
+    if (t5 < 0 and f5 < 0) or (net5 < 0 and pd.notna(streak) and streak >= 2):
+        return "🟢 賣出"
+    if net5 > 0 and (pd.isna(i3) or i3 > 0) and not (pd.notna(streak) and streak >= 1):
+        return "🔴 進場"
+    return "🟡 持有"
+
+
+def fmt_now(c):
+    t = f"{c:,.2f}".rstrip("0").rstrip(".")
+    return t
+
+
+def stock_block(r, sid=None):
+    sid = sid or r["stock_id"]
+    return (f"股票代號：{r['stock_name']}({sid})\n"
+            f"目前價格：{fmt_now(float(r['close']))}\n"
+            f"法人動態：{inst_light(r)}")
+
+
 def build_simple_email(radar, data_date, holdings):
     buys = pick_buys(radar)
     watches = pick_watches(radar, set(buys["stock_id"]) if not buys.empty else set())
-    _rows = radar.drop_duplicates("stock_id").set_index("stock_id")
-    verdicts = {sid: hold_verdict(_rows.loc[sid], cost) for sid, (cost, _) in holdings.items() if sid in _rows.index}
-    n_sell = sum(1 for v in verdicts.values() if v[0] == "SELL")
-    n_warn = sum(1 for v in verdicts.values() if v[0] == "WARN")
-    b = radar["mkt_breadth"].iloc[0] if "mkt_breadth" in radar.columns and len(radar) else np.nan
-    weak = pd.notna(b) and b < MARKET_MIN_BREADTH
-    parts = [f"📅 {data_date} 收盤" + ("｜⚠ 大盤偏弱，買進請減量" if weak else "")]
+    rows = radar.drop_duplicates("stock_id").set_index("stock_id")
+    parts = ["法人動態：🔴 進場　🟡 持有　🟢 賣出"]
 
-    parts.append(f"\n🟢【可買】{len(buys)} 檔")
+    parts.append(f"\n【可買】{len(buys)} 檔")
     if buys.empty:
         parts.append("今天沒有")
     for _, r in buys.iterrows():
-        p = buy_plan(r)
-        parts.append(f"\n📊 股票代號：{r['stock_name']}({r['stock_id']})\n"
-                     f"💰 委託價格：{fmt_p(p['low'])}-{fmt_p(p['high'])}\n"
-                     f"🎯 目標價格：{fmt_p(p['target'])} 附近\n"
-                     f"🛑 停損價格：{fmt_p(p['stop'])}\n"
-                     f"📈 持股週期：{p['days']}")
+        parts.append("\n" + stock_block(r))
 
-    parts.append(f"\n\n🟡【觀察】{len(watches)} 檔")
+    parts.append(f"\n\n【觀察】{len(watches)} 檔")
     if not watches:
         parts.append("今天沒有")
-    for r, wait in watches:
-        parts.append(f"• {r['stock_name']}({r['stock_id']})｜現價 {fmt_p(r['close'])}｜{wait}")
+    for r, _ in watches:
+        parts.append("\n" + stock_block(r))
 
-    parts.append(f"\n\n💼【我的持股】{len(holdings)} 檔" + (f"｜🔴賣出 {n_sell}" if n_sell else "")
-                 + (f"｜⚠警示 {n_warn}" if n_warn else ""))
+    n_sell = 0
+    parts.append(f"\n\n【我的持股】{len(holdings)} 檔")
     if not holdings:
         parts.append("（股票追蹤清單是空的）")
-    rows = radar.drop_duplicates("stock_id").set_index("stock_id")
-    icon = {"SELL": "🔴 賣出", "WARN": "⚠ 警示", "HOLD": "✅ 續抱"}
+    multi = len({g for _, g in holdings.values()}) > 1
     cur = None
     for sid, (cost, group) in holdings.items():
-        if len({g for _, g in holdings.values()}) > 1 and group != cur:
+        if multi and group != cur:
             cur = group
-            parts.append(f"\n【{group}】")
+            parts.append(f"\n〔{group}〕")
         if sid not in rows.index:
-            parts.append(f"\n❔ {sid}：今天沒有行情資料")
+            parts.append(f"\n股票代號：{sid}\n目前價格：今天沒有行情資料")
             continue
         r = rows.loc[sid]
-        level, why, advice = verdicts[sid]
-        c = float(r["close"])
-        pnl = f"（{(c / cost - 1) * 100:+.1f}%）" if cost else ""
-        k = lambda v: f"{int(round(float(v) / 1000)):+,d}張" if pd.notna(v) else "-"
-        flow = f"近5日 {k(r['trust_5d'] + r['foreign_5d'])}｜近3日 {k(r['inst_3d'])}"
-        parts.append(f"\n📊 {r['stock_name']}({sid})\n"
-                     f"💲 目前價格：{fmt_p(c)}{pnl}\n"
-                     f"🏦 法人資金：{flow}\n"
-                     f"{icon[level]}：{why}\n"
-                     f"💡 建議：{advice}")
+        n_sell += inst_light(r).startswith("🟢")
+        parts.append("\n" + stock_block(r, sid))
     return "\n".join(parts) + "\n", len(buys), len(watches), n_sell
 
 
