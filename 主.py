@@ -1303,9 +1303,12 @@ def build_tracking_text(recs, radar, events, version=None):
 
 # ───────────────────────── 我真正買的股票 ─────────────────────────
 def load_holdings():
-    """讀 holdings.csv。每行：股票代號,買進價（買進價可不填）。空行、# 開頭、標題列都會略過。賣掉了就把那一行刪掉。"""
+    """讀持股檔。每行：股票代號,買進價（買進價可不填）。空行、# 開頭、標題列都會略過。賣掉了就把那一行刪掉。
+    用 [區名] 一行把股票分區（例如 [原本持股]、[雷達短線]），信裡會分開列；沒寫區名的歸在「我的持股」。
+    回傳 {股票代號: (買進價或 None, 區名)}，順序同檔案。"""
     global HOLDINGS_FILE
     out = {}
+    group = "我的持股"
     found = next((p for p in HOLDINGS_FILES if p and os.path.exists(p)), None)
     if found is None and HOLDINGS_FILE and os.path.exists(HOLDINGS_FILE):
         found = HOLDINGS_FILE                      # 讓測試或環境變數指定的路徑也能用
@@ -1319,12 +1322,15 @@ def load_holdings():
                 line = line.strip().replace("，", ",")
                 if not line or line.startswith("#"):
                     continue
-                parts = [p.strip() for p in line.split(",")]
+                if line.startswith("[") and "]" in line:           # 分區標題
+                    group = line[1:line.index("]")].strip() or "我的持股"
+                    continue
+                parts = [p.strip() for p in line.replace("\t", ",").replace(" ", ",").split(",") if p.strip()]
                 sid = normalize_stock_id(parts[0])
                 if not is_stock_id(sid):
                     continue                           # 標題列或亂打的字
                 price = safe_float(parts[1]) if len(parts) > 1 else np.nan
-                out[sid] = None if pd.isna(price) or price <= 0 else float(price)
+                out[sid] = (None if pd.isna(price) or price <= 0 else float(price), group)
     except Exception as e:
         print(f"讀取 {HOLDINGS_FILE} 失敗：{e}")
     print(f"我的持股：{len(out)} 檔（{HOLDINGS_FILE}）")
@@ -1336,8 +1342,12 @@ def build_holdings_text(radar, holdings):
     if not holdings:
         return "", 0
     rows = radar.drop_duplicates("stock_id").set_index("stock_id")
-    out, alerts = [], 0
-    for sid, cost in holdings.items():
+    out, alerts, cur = [], 0, None
+    for sid, (cost, group) in holdings.items():
+        if group != cur:                                   # 分區標題
+            cur = group
+            n = sum(1 for g in holdings.values() if g[1] == group)
+            out.append(("\n" if out else "") + f"【{group}】{n} 檔")
         if sid not in rows.index:
             out.append(f"❔ {sid}｜今天沒有行情資料（休市、下市或代號打錯？）")
             continue
