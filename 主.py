@@ -57,7 +57,8 @@ BUY_MAX_RET5 = 12.0        # 買進條件：5日漲幅要小於此 %（還沒噴
 # 賣出條件「已爆發」的標準（量比 >= 2.5 且 5日漲 >= 12%）定義在 make_price_features 的 exploded
 EXCLUDE_TOOL_STOCKS = {"2330", "2454", "2308", "3711", "2881", "2882", "2884", "2886",
                        "2891", "2892", "2880", "0050", "0056", "00878", "006208", "00919", "00929"}
-MAX_PRICE = float(os.getenv("RADAR_MAX_PRICE", "150"))   # 股價上限（元）：一張最多約 15 萬。超過的不列入候選、不開始追蹤
+MAX_PRICE = float(os.getenv("RADAR_MAX_PRICE", "1e9"))   # 股價上限（元）：不設上限，買不起整張就買零股
+MIN_PRICE = float(os.getenv("RADAR_MIN_PRICE", "20"))    # 股價下限（元）：低於此的雞蛋水餃股不列入可買／觀察
 MIN_DAILY_TURNOVER = 30_000_000   # 成交金額下限（元）
 # ── 型態分類（v10）：突破型／低接型／整理股，報告分開列 ──────────────
 MA20_SLOPE_MIN = 1.5       # 強勢：月線 5 天內至少上升此 %（低接型要求）
@@ -1005,7 +1006,7 @@ def classify_setup(r):
     整理股：箱型來回、沒有方向，只列觀察，標出突破價與低接區"""
     none = ("", "", np.nan, np.nan)
     sid, c = str(r["stock_id"]), r["close"]
-    if sid in EXCLUDE_TOOL_STOCKS or r["hedge_dominant"] or c > MAX_PRICE:
+    if sid in EXCLUDE_TOOL_STOCKS or r["hedge_dominant"] or c > MAX_PRICE or c < MIN_PRICE:
         return none
     if not r["turnover"] >= MIN_DAILY_TURNOVER:
         return none
@@ -1532,9 +1533,9 @@ def build_email_body(radar, data_date, track_text="", hold_text=""):
     return (f"台股雷達 {VERSION} 搭順風車版｜資料日 {data_date}\n{mkt}\n\n"
             f"{hold}"
             f"{build_setup_text(radar)}"
-            f"{line}\n🔵🟣 今日候選：吸籌末端·第一根 {len(best)} 檔（股價≤{MAX_PRICE:g}元，列前30）\n{fmt_rows(best, 30)}\n\n"
+            f"{line}\n🔵🟣 今日候選：吸籌末端·第一根 {len(best)} 檔（列前30）\n{fmt_rows(best, 30)}\n\n"
             f"{line}\n📌 追蹤中（候選股的買賣模擬）\n{track_text}\n\n"
-            f"{line}\n🔵🟣 跟著大戶 {len(follow)} 檔（股價≤{MAX_PRICE:g}元，列前20）\n{fmt_rows(follow, 20)}\n\n"
+            f"{line}\n🔵🟣 跟著大戶 {len(follow)} 檔（列前20）\n{fmt_rows(follow, 20)}\n\n"
             f"{line}\n🔴 已爆發／過熱／雙殺 {len(danger)} 檔（只列前15）\n{fmt_rows(danger, 15)}\n\n"
             f"{line}\n{LEGEND}\n")
 
