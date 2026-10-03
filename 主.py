@@ -1713,9 +1713,14 @@ def fmt_now(c):
     return t
 
 
-def stock_block(r, sid=None, target=False):
+SETUP_SHORT = {"BREAKOUT": "突破", "PULLBACK": "低接", "ACCUM": "佈局"}
+
+
+def stock_block(r, sid=None, target=False, kind=False):
     sid = sid or r["stock_id"]
     tgt = f"目標價格：{fmt_now(daily_target(r))}\n" if target else ""
+    if kind and SETUP_SHORT.get(r.get("setup", "")):
+        tgt += f"類型：{SETUP_SHORT[r['setup']]}\n"
     return (f"股票代號：{r['stock_name']}({sid})\n"
             f"目前價格：{fmt_now(float(r['close']))}\n"
             f"{tgt}"
@@ -1732,7 +1737,7 @@ def build_simple_email(radar, data_date, holdings):
     if buys.empty:
         parts.append("今天沒有")
     for _, r in buys.iterrows():
-        parts.append("\n" + stock_block(r, target=True))
+        parts.append("\n" + stock_block(r, target=True, kind=True))
 
     parts.append(f"\n\n【觀察】{len(watches)} 檔")
     if not watches:
