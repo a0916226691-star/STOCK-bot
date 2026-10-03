@@ -1652,6 +1652,7 @@ def pick_watches(radar, buy_ids):
     box = radar[(radar["setup"] == "BOX") & (radar["box_pos"] <= 30)].sort_values("box_pos")
     for _, r in box.iterrows():
         out.append((r, f"整理中，帶量站上 {fmt_p(to_tick(float(r['box_top']), True))} 再買"))
+    out = [x for x in out if not inst_light(x[0]).startswith("🔴")]      # 法人在賣的不列觀察
     return [x for x in out if x[0]["stock_id"] not in buy_ids][:WATCH_MAX_N]
 
 
