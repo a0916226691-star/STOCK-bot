@@ -59,6 +59,8 @@ EXCLUDE_TOOL_STOCKS = {"2330", "2454", "2308", "3711", "2881", "2882", "2884", "
                        "2891", "2892", "2880", "0050", "0056", "00878", "006208", "00919", "00929"}
 MAX_PRICE = float(os.getenv("RADAR_MAX_PRICE", "1e9"))   # 股價上限（元）：不設上限，買不起整張就買零股
 MIN_PRICE = float(os.getenv("RADAR_MIN_PRICE", "20"))    # 股價下限（元）：低於此的雞蛋水餃股不列入可買／觀察
+ACCUM_MIN_POS = 50.0       # 佈局型：股價在箱子中上段（箱底 0%～箱頂 100%）
+ACCUM_MAX_VOL_RATIO = 1.2  # 佈局型：量還沒放大（散戶還沒注意到）
 INST_MIN_PART = 5.0        # 法人參與度：土洋 5 日買超張數至少要佔 5 日成交量的此 %（避免主力／投機大戶主導的股票）
 MIN_DAILY_TURNOVER = 30_000_000   # 成交金額下限（元）
 # ── 型態分類（v10）：突破型／低接型／整理股，報告分開列 ──────────────
@@ -996,7 +998,7 @@ def classify(r):
 
 
 # ───────────────────────── 型態分類（v10）：突破型／低接型／整理股 ─────────────────────────
-SETUP_LABEL = {"BREAKOUT": "🚀 突破型", "PULLBACK": "🎯 低接型", "PULLBACK_WAIT": "⏳ 低接等勾頭",
+SETUP_LABEL = {"BREAKOUT": "🚀 突破型", "PULLBACK": "🎯 低接型", "ACCUM": "🧲 佈局型", "PULLBACK_WAIT": "⏳ 低接等勾頭",
                "BOX": "📦 整理股", "": ""}
 
 
@@ -1043,6 +1045,14 @@ def classify_setup(r):
             return "PULLBACK", note, c, stop
         note = f"拉回均線量縮（量比{vr:.1f}）｜K {kp:.0f}→{k:.0f} 還在往下，等勾頭再買｜月線 5日{slope:+.1f}%"
         return "PULLBACK_WAIT", note, np.nan, stop
+
+    # 佈局型：箱型整理中、還沒突破，法人連續買、量還沒放大、股價在箱子中上段、站在月線上 → 散戶進來前先上車
+    if (pd.notna(r["box_top"]) and pd.notna(r["box_pos"]) and r["box_range"] < BOX_MAX_RANGE and slope > -BOX_FLAT_SLOPE
+            and c <= r["box_top"] and r["box_pos"] >= ACCUM_MIN_POS and vr < ACCUM_MAX_VOL_RATIO
+            and c >= r["ma20"] and inst_acc and (pd.isna(r["inst_3d"]) or r["inst_3d"] > 0)):
+        note = (f"箱型 {r['box_bottom']:.1f}～{r['box_top']:.1f} 整理中｜位置 {r['box_pos']:.0f}%｜量比 {vr:.1f}"
+                f"｜法人連續買，還沒突破")
+        return "ACCUM", note, c, round(r["box_bottom"] * 0.97, 2)
 
     # 整理股：箱型、月線走平，法人有在買 → 只觀察，標出突破價與低接區
     if r["is_box"] and inst_buy and pd.notna(r["box_pos"]):
@@ -1569,6 +1579,23 @@ def fmt_p(p):
     return f"{p:,.2f}"
 
 
+def daily_target(r):
+    """當日目標價：每天用最新收盤重新算，限制在現價 +TARGET_MIN_PCT%～+TARGET_MAX_PCT%。
+    還在箱子裡或剛突破 → 箱頂＋一個箱子高度；在前高下方 → 前 20 日高點；都算不出來 → 現價 +8%。"""
+    c = float(r["close"])
+    top, bot, ph = r.get("box_top", np.nan), r.get("box_bottom", np.nan), r.get("prev_high20", np.nan)
+    if r.get("setup") == "PULLBACK" and pd.notna(ph):
+        tgt = ph
+    elif pd.notna(top) and pd.notna(bot) and top > bot:
+        tgt = top + (top - bot)
+    elif pd.notna(ph) and ph > c:
+        tgt = ph
+    else:
+        tgt = c * (1 + TARGET_MIN_PCT / 100)
+    tgt = min(max(tgt, c * (1 + TARGET_MIN_PCT / 100)), c * (1 + TARGET_MAX_PCT / 100))
+    return to_tick(tgt)
+
+
 def buy_plan(r):
     """可買股票的 委託價格區間／目標價／停損價／持股週期。"""
     c, cost = float(r["close"]), r["inst_cost"]
@@ -1599,8 +1626,9 @@ def far_from_cost(r):
 
 def pick_buys(radar):
     """可買：突破型＋低接型，乖離太大的不算（移到觀察）。依法人買超力道排序。"""
-    b = radar[radar["setup"].isin(["BREAKOUT", "PULLBACK"]) & ~radar["overextended"]].copy()
+    b = radar[radar["setup"].isin(["BREAKOUT", "PULLBACK", "ACCUM"]) & ~radar["overextended"]].copy()
     b = b[~b.apply(far_from_cost, axis=1)] if not b.empty else b
+    b = b[b.apply(lambda r: inst_light(r).startswith("🟢"), axis=1)] if not b.empty else b   # 可買一定要法人🟢買進
     if b.empty:
         return b
     b["_force"] = (b["trust_5d"] + b["foreign_5d"]) / b["avg_vol_5d"].where(b["avg_vol_5d"] > 0)
@@ -1685,10 +1713,12 @@ def fmt_now(c):
     return t
 
 
-def stock_block(r, sid=None):
+def stock_block(r, sid=None, target=False):
     sid = sid or r["stock_id"]
+    tgt = f"目標價格：{fmt_now(daily_target(r))}\n" if target else ""
     return (f"股票代號：{r['stock_name']}({sid})\n"
             f"目前價格：{fmt_now(float(r['close']))}\n"
+            f"{tgt}"
             f"法人動態：{inst_light(r)}")
 
 
@@ -1702,7 +1732,7 @@ def build_simple_email(radar, data_date, holdings):
     if buys.empty:
         parts.append("今天沒有")
     for _, r in buys.iterrows():
-        parts.append("\n" + stock_block(r))
+        parts.append("\n" + stock_block(r, target=True))
 
     parts.append(f"\n\n【觀察】{len(watches)} 檔")
     if not watches:
@@ -1725,7 +1755,7 @@ def build_simple_email(radar, data_date, holdings):
             continue
         r = rows.loc[sid]
         n_sell += inst_light(r).startswith("🔴")
-        parts.append("\n" + stock_block(r, sid))
+        parts.append("\n" + stock_block(r, sid, target=True))
     return "\n".join(parts) + "\n", len(buys), len(watches), n_sell
 
 
