@@ -70,6 +70,22 @@ jobs:
           fi
           python 輔.py --detail --csv output/evaluation.csv $EXTRA
 
+      - name: Run A/B comparison report
+        # A 套（快突破第一根）與 B 套（精簡信可買）誰比較好：平常只印在執行紀錄裡，
+        # 2026-10-12（下下週一）早上與手動執行時才寄信。失敗不擋後面的存檔。
+        continue-on-error: true
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          EXTRA=""
+          if [ "$(TZ=Asia/Taipei date +%F)" = "2026-10-12" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            EXTRA="--email"
+          fi
+          python 輔.py --ab --since 2026-10-02 --csv output/ab_picks.csv $EXTRA
+
       - name: Check generated CSV files
         if: always()
         run: |

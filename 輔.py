@@ -222,6 +222,105 @@ def build_report(ev, args, multi_db, track_text=""):
     return "\n".join(lines)
 
 
+# ───────────────────────── A／B 兩套比較（看每天信裡實際推薦的股票，後來表現如何） ─────────────────────────
+AB_LABELS = {"A候選": "A 候選｜快突破／剛突破的第一根（信裡最上面的名單）",
+             "A買進": "A 買進｜A 套模擬買進（已突破、條件齊全）",
+             "B可買": "B 可買｜精簡信的「可買」",
+             "B觀察": "B 觀察｜精簡信的「觀察」"}
+
+
+def ab_report(path, since=None, until=None, cost=COST_PCT, csv_path=None):
+    """每天信裡推薦的股票（picks 表），從「第一次出現」那天持有到統計截止日，算報酬、勝率、超額、最大回檔。"""
+    if not os.path.exists(path):
+        return f"找不到資料庫：{path}"
+    conn = sqlite3.connect(path)
+    try:
+        has = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='picks'").fetchone()
+        if not has:
+            return "資料庫裡還沒有 picks 表（新版主程式跑過一次才會建立）。"
+        picks = pd.read_sql("SELECT * FROM picks", conn, dtype={"stock_id": str})
+        prices = pd.read_sql("SELECT date, stock_id, close FROM prices", conn, dtype={"stock_id": str})
+    finally:
+        conn.close()
+    if picks.empty:
+        return "picks 表還是空的，等主程式多跑幾天。"
+    if since:
+        picks = picks[picks["date"] >= since]
+    if until:
+        picks = picks[picks["date"] <= until]
+    px = prices.dropna(subset=["close"]).drop_duplicates(["date", "stock_id"], keep="last") \
+               .pivot(index="date", columns="stock_id", values="close").sort_index()
+    if picks.empty or px.empty:
+        return "指定區間內沒有推薦紀錄。"
+    last = min(until, px.index.max()) if until else px.index.max()
+    first = picks["date"].min()
+    days = [d for d in px.index if first <= d <= last]
+    picks = picks.sort_values("date").drop_duplicates(["grp", "stock_id"], keep="first")   # 同一檔同一組只算第一次出現
+
+    recs = []
+    for _, p in picks.iterrows():
+        sid = p["stock_id"]
+        if sid not in px.columns:
+            continue
+        later = [d for d in px.index if p["date"] < d <= last]
+        for mode in ("same", "next"):
+            if mode == "same":
+                e_date, e_px = p["date"], float(p["close"])
+            else:
+                if not later:
+                    continue
+                e_date = later[0]
+                e_px = px.at[e_date, sid]
+            end_px = px.at[last, sid] if last in px.index else np.nan
+            if e_date >= last or pd.isna(e_px) or pd.isna(end_px) or e_px <= 0:
+                continue
+            seg = px.loc[e_date:last, sid].dropna()
+            row_e, row_l = px.loc[e_date], px.loc[last]
+            m = ((row_l / row_e - 1) * 100).replace([np.inf, -np.inf], np.nan).dropna()
+            mkt = float(m.mean()) if len(m) else np.nan
+            ret = (end_px / e_px - 1) * 100 - cost
+            recs.append({"grp": p["grp"], "mode": mode, "stock_id": sid, "stock_name": p["stock_name"],
+                         "first_date": p["date"], "entry_date": e_date, "entry": e_px, "end": float(end_px),
+                         "ret_net": ret, "excess": ret - mkt if pd.notna(mkt) else np.nan,
+                         "maxdd": (seg.min() / e_px - 1) * 100})
+    out = [f"══════ 台股雷達 A／B 一週比較 ══════",
+           f"推薦期間 {first}～{last}（共 {len(days)} 個交易日，統計到 {last} 收盤）",
+           f"報酬 = 從第一次出現持有到 {last} 收盤，已扣來回成本 {cost}%；超額 = 報酬 − 同期全市場平均",
+           "同一檔同一組只算第一次出現；訊號當天收盤進場＝最理想，隔天收盤進場＝較貼近你早上看信才買的情況", ""]
+    if not recs:
+        out.append("目前還沒有「出現之後又過了至少一個交易日」的推薦，無法計算。")
+        return "\n".join(out)
+    df = pd.DataFrame(recs)
+    for mode, title in (("same", "【訊號當天收盤進場】"), ("next", "【訊號隔天收盤進場】")):
+        sub = df[df["mode"] == mode]
+        out.append(title)
+        out.append(f"{'組別':<6}{'檔數':>4}{'平均%':>8}{'中位%':>8}{'勝率%':>7}{'超額%':>8}{'最差%':>8}{'平均回檔%':>10}  備註")
+        for g in AB_LABELS:
+            x = sub[sub["grp"] == g]
+            if x.empty:
+                out.append(f"{g:<6}{0:>4}  （沒有資料）")
+                continue
+            out.append(f"{g:<6}{len(x):>4}{x['ret_net'].mean():>8.2f}{x['ret_net'].median():>8.2f}"
+                       f"{(x['ret_net'] > 0).mean() * 100:>7.0f}{x['excess'].mean():>8.2f}{x['ret_net'].min():>8.2f}"
+                       f"{x['maxdd'].mean():>10.2f}  {'樣本少' if len(x) < MIN_N else ''}")
+        out.append("")
+    both = set(df[df["grp"].str.startswith("A")]["stock_id"]) & set(df[df["grp"].str.startswith("B")]["stock_id"])
+    out.append(f"A、B 兩套都推薦過的股票：{len(both)} 檔")
+    same = df[df["mode"] == "same"]
+    for g in AB_LABELS:
+        x = same[same["grp"] == g].sort_values("ret_net", ascending=False)
+        if len(x):
+            top = "、".join(f"{r.stock_name}{r.ret_net:+.1f}%" for r in x.head(3).itertuples())
+            bot = "、".join(f"{r.stock_name}{r.ret_net:+.1f}%" for r in x.tail(3).iloc[::-1].itertuples())
+            out.append(f"{g} 最好：{top}｜最差：{bot}")
+    out += ["", "怎麼看：先看「超額%」與「勝率%」，再看「平均回檔%」（越接近 0 代表上車後越少被洗）。",
+            f"樣本少於 {MIN_N} 檔只能當參考，不要只憑一週的結果就決定放棄哪一套。過去表現不代表未來。"]
+    if csv_path:
+        df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+        out.append(f"已存 {csv_path}")
+    return "\n".join(out)
+
+
 def send_email(subject, body):
     user, pwd, to = (os.getenv(k) for k in ("GMAIL_USER", "GMAIL_APP_PASSWORD", "RECIPIENT_EMAIL"))
     if not (user and pwd and to):
@@ -247,10 +346,20 @@ def main(argv=None):
     ap.add_argument("--detail", action="store_true", help="另外列出每一種訊號的明細")
     ap.add_argument("--csv", metavar="檔名", help="把明細存成 CSV")
     ap.add_argument("--email", action="store_true", help="把成績單寄到信箱")
+    ap.add_argument("--ab", action="store_true", help="A／B 兩套比較（每天信裡實際推薦的股票後來表現如何）")
+    ap.add_argument("--since", metavar="YYYY-MM-DD", help="--ab 的起始日（預設從第一筆推薦開始）")
+    ap.add_argument("--until", metavar="YYYY-MM-DD", help="--ab 的截止日（預設到最新資料）")
     ap.add_argument("--cost", type=float, default=COST_PCT,
                     help=f"來回交易成本 %%（預設 {COST_PCT}：手續費買賣各0.1425%%＋證交稅0.3%%，有券商折扣可調低）")
     args = ap.parse_args(argv)
     args._csv_df = None
+
+    if args.ab:
+        text = ab_report((args.db or [DEFAULT_DB])[0].split("=", 1)[-1], args.since, args.until, args.cost, args.csv)
+        print(text)
+        if args.email:
+            send_email("台股雷達 A／B 一週比較報告", text)
+        return None
 
     specs = args.db or [DEFAULT_DB]
     frames, track_texts = [], []

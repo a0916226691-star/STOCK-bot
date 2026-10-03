@@ -302,6 +302,9 @@ def init_db():
         # 融資融券餘額（每日；單位：張）
         conn.execute("CREATE TABLE IF NOT EXISTS margin (date TEXT, stock_id TEXT, margin_bal REAL, "
                      "short_bal REAL, market TEXT, PRIMARY KEY(date, stock_id, market))")
+        # 每天信裡推薦的股票（A／B 兩套誰比較好，之後用這張表算成績）
+        conn.execute("CREATE TABLE IF NOT EXISTS picks (date TEXT, stock_id TEXT, stock_name TEXT, grp TEXT, "
+                     "close REAL, note TEXT, PRIMARY KEY(date, stock_id, grp))")
         # 集保千張大戶持股（每週一筆）
         conn.execute("CREATE TABLE IF NOT EXISTS holders (date TEXT, stock_id TEXT, big_ratio REAL, "
                      "big_people INTEGER, PRIMARY KEY(date, stock_id))")
@@ -1738,23 +1741,100 @@ def stock_block(r, sid=None, target=False, kind=False):
             f"法人動態：{inst_light(r)}")
 
 
+BEST_MAX_N = 20            # 「第一根候選」最多列幾檔
+PICK_GROUPS = {"A候選": "A 套：還沒突破、快突破（吸籌末端·第一根）", "A買進": "A 套：已突破、模擬買進",
+               "B可買": "B 套：精簡信的「可買」", "B觀察": "B 套：精簡信的「觀察」"}
+
+
+def select_picks(radar):
+    """今天信裡要列的股票。股價上限 MAX_PRICE 對 A、B 兩套都有效。回傳 (A候選, B可買, B觀察[(row, 等什麼)])。"""
+    cheap = radar[radar["close"] <= MAX_PRICE]
+    best = cheap[cheap["signal_key"].isin(GROUP_BEST)].head(BEST_MAX_N)     # radar 已依訊號等級、成交金額排序
+    buys = pick_buys(cheap)
+    watches = pick_watches(cheap, set(buys["stock_id"]) if not buys.empty else set())
+    return best, buys, watches
+
+
+def save_picks(radar, data_date, version=None):
+    """把今天 A、B 兩套的推薦存進資料庫（同一天重跑會覆蓋，不會重複）。"""
+    version = version or VERSION
+    best, buys, watches = select_picks(radar)
+    rows = []
+    for _, r in best.iterrows():
+        rows.append((data_date, r["stock_id"], r["stock_name"], "A候選", float(r["close"]),
+                     f"突破價 {fmt_now(float(r['prev_high20']))}" if pd.notna(r["prev_high20"]) else ""))
+    for _, r in buys.iterrows():
+        try:
+            p = buy_plan(r)
+            note = f"掛單 {fmt_now(p['low'])}~{fmt_now(p['high'])} 目標 {fmt_now(p['target'])} 停損 {fmt_now(p['stop'])}"
+        except Exception:
+            note = ""
+        rows.append((data_date, r["stock_id"], r["stock_name"], "B可買", float(r["close"]), note))
+    for r, why in watches:
+        rows.append((data_date, r["stock_id"], r["stock_name"], "B觀察", float(r["close"]), why))
+    try:                                           # A 套「已突破、模擬買進」：從追蹤紀錄抓當天買進的（重跑也不會漏）
+        with db() as conn:
+            tb = pd.read_sql("SELECT stock_id, stock_name, entry_price FROM tracking WHERE version=? AND entry_date=?",
+                             conn, params=(version, data_date), dtype={"stock_id": str})
+        for _, t in tb.iterrows():
+            rows.append((data_date, t["stock_id"], t["stock_name"], "A買進", float(t["entry_price"]), ""))
+    except Exception as e:
+        print(f"讀取 A 套買進紀錄失敗：{e}")
+    with db() as conn:
+        conn.execute("DELETE FROM picks WHERE date=?", (data_date,))
+        conn.executemany("INSERT OR REPLACE INTO picks (date, stock_id, stock_name, grp, close, note) "
+                         "VALUES (?,?,?,?,?,?)", rows)
+    from collections import Counter
+    print("今日推薦已存檔：", dict(Counter(x[3] for x in rows)))
+
+
+def plan_text(r):
+    """可買股票的「建議操作」：掛單價格區間、停損價、預計持有天數（算不出來的欄位用現價與停損比例補上）。"""
+    try:
+        p = buy_plan(r)
+    except Exception:
+        return ""
+    c = float(r["close"])
+    ok = lambda v: v is not None and not pd.isna(v)
+    low = p["low"] if ok(p["low"]) else to_tick(c, up=True)
+    high = p["high"] if ok(p["high"]) else to_tick(c)
+    stop = p["stop"] if ok(p["stop"]) else to_tick(c * (1 - STOP_LOSS_PCT / 100))
+    rng = fmt_now(high) if low >= high else f"{fmt_now(low)}～{fmt_now(high)}"
+    return (f"\n建議操作：{rng} 掛單，買不到不追"
+            f"\n停損價格：{fmt_now(stop)}，跌破就賣"
+            f"\n預計持有：{p['days']}")
+
+
 def build_simple_email(radar, data_date, holdings):
-    buys = pick_buys(radar)
-    watches = pick_watches(radar, set(buys["stock_id"]) if not buys.empty else set())
+    best, buys, watches = select_picks(radar)
     rows = radar.drop_duplicates("stock_id").set_index("stock_id")
     parts = ["法人動態：🟢 買進　🟡 持有　🔴 賣出"]
 
-    parts.append(f"\n【可買】{len(buys)} 檔")
+    cap = f"，股價≤{MAX_PRICE:g}元" if MAX_PRICE < 1e8 else ""
+    parts.append(f"\n【第一根候選】{len(best)} 檔（快突破或剛突破前高{cap}）")
+    if best.empty:
+        parts.append("今天沒有")
+    for _, r in best.iterrows():
+        ph = r["prev_high20"]
+        if pd.isna(ph):
+            how = ""
+        elif r["close"] > ph:
+            how = f"\n建議操作：已站上突破價（剛突破第一根），別追高，量沒爆再評估"
+        else:
+            how = f"\n建議操作：收盤站上 {fmt_now(float(ph))} 再買，現在還差 {(ph / r['close'] - 1) * 100:.1f}%"
+        parts.append("\n" + stock_block(r) + (f"\n突破價格：{fmt_now(float(ph))}" if pd.notna(ph) else "") + how)
+
+    parts.append(f"\n\n【可買】{len(buys)} 檔（已突破）")
     if buys.empty:
         parts.append("今天沒有")
     for _, r in buys.iterrows():
-        parts.append("\n" + stock_block(r, target=True, kind=True))
+        parts.append("\n" + stock_block(r, target=True, kind=True) + plan_text(r))
 
     parts.append(f"\n\n【觀察】{len(watches)} 檔")
     if not watches:
         parts.append("今天沒有")
-    for r, _ in watches:
-        parts.append("\n" + stock_block(r))
+    for r, why in watches:
+        parts.append("\n" + stock_block(r) + f"\n建議操作：{why}")
 
     n_sell = 0
     parts.append(f"\n\n【我的持股】{len(holdings)} 檔")
@@ -1841,6 +1921,10 @@ def run(send_mail=True):
     hold_text, alerts = build_holdings_text(radar, holdings)
     # 詳細版（原因、指標、模擬追蹤、版本對照）只印在 GitHub Actions 執行紀錄裡，信件只寄精簡版
     print("\n===== 詳細報告（不寄信）=====\n" + build_email_body(radar, data_date, track_text, hold_text))
+    try:
+        save_picks(radar, data_date)
+    except Exception as e:
+        print(f"存推薦紀錄失敗（不影響寄信）：{e}")
     body, n_buy, n_watch, n_sell = build_simple_email(radar, data_date, holdings)
     print("\n===== 信件內容 =====\n" + body)
     if send_mail:
