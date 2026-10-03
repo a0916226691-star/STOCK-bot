@@ -61,6 +61,9 @@ MAX_PRICE = float(os.getenv("RADAR_MAX_PRICE", "1e9"))   # 股價上限（元）
 MIN_PRICE = float(os.getenv("RADAR_MIN_PRICE", "20"))    # 股價下限（元）：低於此的雞蛋水餃股不列入可買／觀察
 ACCUM_MIN_POS = 50.0       # 佈局型：股價在箱子中上段（箱底 0%～箱頂 100%）
 ACCUM_MAX_VOL_RATIO = 1.2  # 佈局型：量還沒放大（散戶還沒注意到）
+DUMP_GIVEBACK = 0.5        # 單日大賣：當天賣超吐掉前幾天累積買超的此比例以上 → 直接🔴
+DUMP_VOL_PCT = 10.0        # 單日大賣：當天法人賣超佔當天成交量此 % 以上 → 直接🔴
+DUMP_MIN_VOL_PCT = 3.0     # 吐回比例那條，賣超至少也要佔成交量此 %（避免幾張就觸發）
 INST_MIN_PART = 5.0        # 法人參與度：土洋 5 日買超張數至少要佔 5 日成交量的此 %（避免主力／投機大戶主導的股票）
 MIN_DAILY_TURNOVER = 30_000_000   # 成交金額下限（元）
 # ── 型態分類（v10）：突破型／低接型／整理股，報告分開列 ──────────────
@@ -1703,6 +1706,13 @@ def inst_light(r):
     net5 = t5 + f5
     if (t5 < 0 and f5 < 0) or (net5 < 0 and pd.notna(streak) and streak >= 2):
         return "🔴 賣出"
+    # 單日大賣：法人突然倒貨，不等 5 日合計轉負
+    d1, vol = r.get("inst_1d", np.nan), r.get("volume", np.nan)
+    if pd.notna(d1) and d1 < 0 and pd.notna(vol) and vol > 0:
+        sell, prior = -d1, net5 - d1                 # prior＝今天以前那幾天的累積買超
+        vol_pct = sell / vol * 100
+        if vol_pct >= DUMP_VOL_PCT or (prior > 0 and sell >= prior * DUMP_GIVEBACK and vol_pct >= DUMP_MIN_VOL_PCT):
+            return "🔴 賣出"
     if net5 > 0 and (pd.isna(i3) or i3 > 0) and not (pd.notna(streak) and streak >= 1):
         return "🟢 買進"
     return "🟡 持有"
