@@ -15,6 +15,7 @@ CONSOL_RNG  = 0.07    # B：最近5日高低差占收盤 ≤7% 算盤整
 MIN_BASE    = 3       # 回檔低點後至少 3 天（有築底動作）
 MAX_B_FROM_HIGH = 0.08  # B：離前高至少還有 8% 空間
 TOP_N = 25
+MIN_LOT_PRICE = float(os.getenv('SW_MIN_PRICE', 300))  # 一張(1000股)至少30萬 → 股價≥300，上限不設
 
 def zigzag(h, l, c, pct):
     """回傳轉折點 [(idx, 'L'/'H', price)]"""
@@ -100,7 +101,7 @@ def run(send_mail=True):
         if len(g) < 40 or not (len(sid) == 4 and sid.isdigit()): continue
         if str(g["date"].iloc[-1]) != data_date: continue
         last = float(g["close"].iloc[-1])
-        if last < R.MIN_PRICE or liq.get(sid, 0) < R.MIN_DAILY_TURNOVER: continue
+        if last < MIN_LOT_PRICE or liq.get(sid, 0) < R.MIN_DAILY_TURNOVER: continue
         r = analyze(g)
         if not r: continue
         r.update(stock_id=sid, name=g["stock_name"].iloc[-1], close=last,
@@ -123,7 +124,7 @@ def run(send_mail=True):
                     f"   支撐區 {x['L1']:g}（{x['l1d']}前一次波段低點）｜這次回檔低點 {x['L2']:g}（{x['l2d']}，{x['hold']*100:+.1f}%）\n"
                     f"   前高壓力區 {x['H1']:g}（{x['h1d']}）｜還差 {x['to_high']*100:.0f}%｜近5日震幅 {x['rng5']*100:.1f}%")
         body = (f"支撐回檔掃描｜資料日 {data_date}（{ndays} 個交易日）\n"
-                f"股價回到前一次波段低點附近、沒有有效跌破、正在止跌盤整，之後有機會再挑戰前高：共 {len(B)} 檔（離支撐越近越前面）\n\n━━━━━━━━━━━━\n"
+                f"股價回到前一次波段低點附近、沒有有效跌破、正在止跌盤整，之後有機會再挑戰前高：共 {len(B)} 檔（一張30萬以上，離支撐越近越前面）\n\n━━━━━━━━━━━━\n"
                 + ("\n\n".join(fmt(x) for _, x in B.iterrows()) or "（沒有）")
                 + "\n\n━━━━━━━━━━━━\n【怎麼看】\n支撐區＝前一次波段低點；壓力區＝前一次波段高點。\n"
                   "條件：前低→漲15%以上到前高→回到前低上方5%內→收盤沒有跌破前低3%以上→低點後至少築底3天→最近5日震幅7%以內→離前高還有8%以上空間。\n"
