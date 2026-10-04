@@ -821,6 +821,8 @@ def make_price_features(full):
     prev_close = close.groupby(key).shift(1)
     df["return_5d"] = (close / close.groupby(key).shift(5) - 1) * 100
     df["chg_1d"] = (close / prev_close - 1) * 100
+    low60 = close.groupby(key).rolling(60, min_periods=20).min().reset_index(level=0, drop=True)
+    df["runup60"] = (close / low60 - 1) * 100                              # 離 60 日最低點已經漲了幾 %
 
     # 前 20 日（不含今天）的高低點：用來判斷盤整與突破
     df["prev_high20"] = grp_roll(prev_close, key, 20, "max")
@@ -1576,6 +1578,8 @@ BUY_MAX_N = 5              # 可買最多列幾檔
 WATCH_MAX_N = 8            # 觀察最多列幾檔
 TARGET_MIN_PCT = 8.0       # 目標價至少 +8%
 TARGET_MAX_PCT = 10.0      # 目標價最多 +10%
+MAX_RUNUP_PCT = 20.0       # 可買：離 60 日最低點最多漲了此 %（漲太多＝肉不多了，改列觀察）
+SETUP_ORDER = {"ACCUM": 0, "PULLBACK": 1, "BREAKOUT": 2}   # 可買排序：佈局最前（最早上車）
 INST_COST_MAX_GAP = 5.0    # 現價離法人成本超過此 % → 不列可買，改列觀察「等拉回法人成本」
 INST_COST_STOP_PCT = 3.0   # 停損：跌破法人成本此 %
 
@@ -1646,10 +1650,13 @@ def pick_buys(radar):
     b = radar[radar["setup"].isin(["BREAKOUT", "PULLBACK", "ACCUM"]) & ~radar["overextended"]].copy()
     b = b[~b.apply(far_from_cost, axis=1)] if not b.empty else b
     b = b[b.apply(lambda r: inst_light(r).startswith("🟢"), axis=1)] if not b.empty else b   # 可買一定要法人🟢買進
+    if not b.empty and "runup60" in b.columns:
+        b = b[~(b["runup60"] > MAX_RUNUP_PCT)]                     # 離低點漲太多的不列可買
     if b.empty:
         return b
     b["_force"] = (b["trust_5d"] + b["foreign_5d"]) / b["avg_vol_5d"].where(b["avg_vol_5d"] > 0)
-    return b.sort_values("_force", ascending=False, na_position="last").head(BUY_MAX_N)
+    b["_ord"] = b["setup"].map(SETUP_ORDER).fillna(9)
+    return b.sort_values(["_ord", "_force"], ascending=[True, False], na_position="last").head(BUY_MAX_N)
 
 
 def pick_watches(radar, buy_ids):
