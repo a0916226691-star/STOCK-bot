@@ -79,20 +79,27 @@ def chip_light(x):
     if c >= -3: return "🟡", "法人小賣"
     return "🔴", "法人在賣、沒撐住"
 
+def tick(p):
+    """台股升降單位：把價格湊成實際能掛的價位"""
+    if pd.isna(p): return p
+    t = 0.01 if p < 10 else 0.05 if p < 50 else 0.1 if p < 100 else 0.5 if p < 500 else 1 if p < 1000 else 5
+    return round(round(p / t) * t, 2)
+
 def fmt(x):
     lt = chip_light(x)
-    s = (f"{lt[0]} {x['name']}({x['stock_id']})｜收盤 {x['close']:g}｜離最低點 +{x['above']:.1f}%\n"
-         f"   高點 {x['high']:g}（{x['high_date']}）→ 最低點 {x['low']:g}（{x['low_date']}，{x['age']} 個交易日前）｜跌幅 {x['drop']:.0f}%")
-    if pd.notna(x.get("trap", np.nan)):
-        rr = (x['trap'] / x['close'] - 1) / max(x['close'] / x['low'] - 1, 0.005)
-        s += f"\n   上下空間｜支撐＝最低點 {x['low']:g}（現價往下 {(x['close']/x['low']-1)*100:.1f}%）｜壓力＝套牢區（往上 {(x['trap']/x['close']-1)*100:+.1f}%）｜報酬風險比 約 {rr:.1f} 比 1"
-        s += (f"\n   反彈壓力區（下跌這段的成交均價＝套牢區成本）{x['trap']:g}｜現價到壓力區還有 {(x['trap']/x['close']-1)*100:+.1f}%｜前高 {x['high']:g}（{(x['high']/x['close']-1)*100:+.0f}%）")
-    if pd.notna(x.get("chip_pct", np.nan)):
-        note = "" if x.get("chip_full", False) else f"（法人資料只從 6/8 起，抓得到 {int(x['chip_days'])} 個交易日）"
-        s += (f"\n   籌碼｜低點區（近10個法人資料日）外資＋投信合計 {x['chip10']:+.1f}%（外資 {x['chip10_f']:+.1f}%、投信 {x['chip10_t']:+.1f}%）\n   　　　自高點以來 {x['chip_pct']:+.1f}%（外資 {x['chip_f']:+.1f}%、投信 {x['chip_t']:+.1f}%，占同期成交量）{note}")
-        s += f"\n   　　　近20日 外資 {x['f20']:+.1f}%、投信 {x['t20']:+.1f}%｜自最低點以來 外資 {x['since_low_f']:+,.0f} 張、投信 {x['since_low_t']:+,.0f} 張"
+    c, lo, hi = x["close"], x["low"], x["high"]
+    trap = tick(x["trap"]) if pd.notna(x.get("trap", np.nan)) else np.nan
+    s = f"{lt[0]} {x['name']}({x['stock_id']})｜收盤 {c:g}\n"
+    s += f"   支撐（最低點）{lo:g}｜壓力（套牢區成交均價）{trap:g}｜前高 {hi:g}\n" if pd.notna(trap) else f"   支撐（最低點）{lo:g}｜前高 {hi:g}\n"
+    if pd.notna(trap):
+        rr = (trap / c - 1) / max(c / lo - 1, 0.005)
+        s += f"   往下到支撐 {c - lo:.2f} 元（{(c/lo-1)*100:.1f}%）｜往上到壓力 {trap - c:.2f} 元（{(trap/c-1)*100:.1f}%）｜報酬風險比 {rr:.1f} 比 1\n".replace(".00 元", " 元")
+    if pd.notna(x.get("chip10", np.nan)):
+        s += f"   籌碼：近10日 外資 {x['chip10_f']:+.1f}%、投信 {x['chip10_t']:+.1f}%（占成交量）→ {lt[1]}"
+        if not x.get("chip_full", True): s += "（法人資料只從 6/8 起）"
     else:
-        s += "\n   籌碼｜資料不足（上櫃股票法人資料還在累積）"
+        s += "   籌碼：法人資料不足（上櫃股票還在累積）"
+    s += f"\n   高點 {hi:g}（{x['high_date']}）→ 最低點 {lo:g}（{x['low_date']}），跌 {x['drop']:.0f}%"
     return s
 
 def run(send_mail=True):
@@ -117,7 +124,7 @@ def run(send_mail=True):
                 + "\n\n━━━━━━━━━━━━\n【怎麼看】\n"
                   "條件：最近 120 個交易日內，從高點到最低點跌了 35% 以上；現在價格在最低點上方 10% 內（最低點可以是今天或剛過幾天）。\n"
                   "籌碼燈號（低點有沒有法人撐著）：看最近 10 個法人資料日，外資＋投信合計買賣超占成交量的 %。🟢 0% 以上＝法人在撐（有買或沒賣）；🟡 0% 到 -3%＝小賣；🔴 低於 -3%＝法人在賣、沒撐住。排序：🟢 在前，同燈號離最低點近的在前。「自高點以來」的數字當背景參考。報酬風險比＝（現價到套牢區）÷（現價到最低點）。\n"
-                  "反彈壓力區：從高點到最低點這段的成交均價，代表套牢的人平均成本，反彈到這附近賣壓通常比較大；前高是更上面的壓力。\n"
+                  "壓力（套牢區成交均價）：從高點跌到最低點這段的成交均價，代表套牢者的平均成本，反彈到這附近賣壓通常比較大；前高是更上面的壓力。價格已湊成實際可掛的價位。\n"
                   "注意：法人資料只有 2026-06-08 之後，高點早於這個日期的股票，籌碼只算到有資料的部分；上櫃股票法人資料還在累積。\n"
                   "我用歷史資料測過「自高點以來籌碼沒跑」，沒有看出後續報酬比較好（樣本只有 63 次）；低點有沒有法人撐著還沒驗證，所以都只當參考。不含產業面，僅供參考，不保證獲利。")
     print(body)
