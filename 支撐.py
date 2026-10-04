@@ -57,6 +57,8 @@ def analyze(g):
     h = np.where(g["high"].notna(), g["high"], g["close"]).astype(float)
     l = np.where(g["low"].notna(), g["low"], g["close"]).astype(float)
     n = len(c)
+    if n > 1 and (np.abs(c[1:] / c[:-1] - 1) > 0.115).any():
+        return None   # 單日漲跌超過 11.5%＝可能是分割／減資，股價沒還原，跳過
     piv = zigzag(h, l, c, SWING_PCT)
     best = None
     # 找 L1(低) → H1(高) → 之後回到 L1 附近
