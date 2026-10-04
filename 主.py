@@ -1947,13 +1947,17 @@ LT_MIN_DROP = 0.5          # 外資持股從高點減少至少此比例（0.5＝
 LT_MIN_PRICE_DD = 30.0     # 股價離一年高點至少跌了此 %
 LT_MIN_DAYS = 120          # 至少要有幾天外資持股資料才判斷
 LT_MAX_N = 15              # 信裡最多列幾檔
-LT_BACK_BUYDAYS = 3        # 法人回來：近 5 天至少幾天買超
-LT_OFF_LOW_PCT = 3.0       # 法人回來：股價要比近 20 天最低收盤高出此 %（不再創新低）
+LT_BACK_BUYDAYS = 3        # 🟡 法人開始買：近 5 天至少幾天買超
+LT_BOTTOM_DAYS = 60        # 底部＝近 60 個交易日的最低價
+LT_BOTTOM_HOLD = 10        # 🟡 底部守住：最低點至少是此天數以前出現的，而且之後沒再跌破
+LT_BASE_DAYS = 20          # 🟢 噴出：收盤站上近 20 天（不含今天）的最高價
+LT_BREAK_VOL = 1.5         # 🟢 噴出：成交量至少是前 5 日均量的此倍數
 
 
 def build_longtrack(radar):
     """回傳長線追蹤名單 DataFrame：stock_id, stock_name, close, qfii_now, qfii_peak, lt_light, lt_text, ...。"""
-    cols = ["stock_id", "stock_name", "close", "qfii_now", "qfii_peak", "lt_light", "lt_text", "lt_order", "drop_rel"]
+    cols = ["stock_id", "stock_name", "close", "qfii_now", "qfii_peak", "lt_light", "lt_text", "lt_order", "drop_rel",
+            "bottom", "base_high"]
     fh = load_table("foreign_hold", 400)
     if fh.empty:
         print("長線追蹤：還沒有外資持股資料（需要先回補）")
@@ -1993,15 +1997,29 @@ def build_longtrack(radar):
         i5 = ig.get(sid)
         last5 = i5["net"].tail(5) if i5 is not None else pd.Series(dtype=float)
         net5, buy5 = float(last5.sum()), int((last5 > 0).sum())
-        off_low = c > np.nanmin(cl[-20:]) * (1 + LT_OFF_LOW_PCT / 100)
-        if net5 > 0 and buy5 >= LT_BACK_BUYDAYS and chg5 > 0 and off_low:
-            light, text, order = "🟢", "法人回來了", 0
+        hi = pd.to_numeric(p["high"], errors="coerce").fillna(pd.to_numeric(p["close"], errors="coerce")).to_numpy()
+        lo = pd.to_numeric(p["low"], errors="coerce").fillna(pd.to_numeric(p["close"], errors="coerce")).to_numpy()
+        lows = lo[-LT_BOTTOM_DAYS:]
+        k = int(np.nanargmin(lows))
+        bottom, bottom_age = float(lows[k]), len(lows) - 1 - k                # 底部價格、幾天前出現
+        base_high = float(np.nanmax(hi[-LT_BASE_DAYS - 1:-1]))                  # 近 20 天（不含今天）最高價
+        buying = net5 > 0 and buy5 >= LT_BACK_BUYDAYS                           # 法人開始買
+        holds = bottom_age >= LT_BOTTOM_HOLD and c > bottom                     # 底部守住（最近 10 天沒破底）
+        vr = r.get("vol_ratio_5d", np.nan)
+        breakout = c > base_high and pd.notna(vr) and vr >= LT_BREAK_VOL        # 帶量站上整理區高點＝噴出
+        if buying and holds and breakout:
+            light, text, order = "🟢", "噴出了，可以買", 0
+        elif buying and holds:
+            light, text, order = "🟡", "法人開始買、底部守住，等噴出", 1
+        elif bottom_age < LT_BOTTOM_HOLD:
+            light, text, order = "🔴", "還在破底", 2
         elif net5 < 0 or chg5 < -0.1:
-            light, text, order = "🔴", "還在賣", 2
+            light, text, order = "🔴", "法人還在賣", 2
         else:
-            light, text, order = "🟡", "賣壓停了，等法人回來", 1
+            light, text, order = "🔴", "法人還沒開始買", 2
         out.append({"stock_id": sid, "stock_name": r["stock_name"], "close": c, "qfii_now": now, "qfii_peak": peak,
-                    "lt_light": light, "lt_text": text, "lt_order": order, "drop_rel": 1 - now / peak})
+                    "lt_light": light, "lt_text": text, "lt_order": order, "drop_rel": 1 - now / peak,
+                    "bottom": bottom, "base_high": base_high})
     df = pd.DataFrame(out, columns=cols)
     if not df.empty:
         df = df.sort_values(["lt_order", "drop_rel"], ascending=[True, False]).reset_index(drop=True)
@@ -2048,7 +2066,9 @@ def build_simple_email(radar, data_date, holdings, track=None):
             parts.append(f"\n股票代號：{x['stock_name']}({x['stock_id']})\n"
                          f"目前價格：{fmt_now(float(x['close']))}\n"
                          f"外資持股：{x['qfii_now']:.1f}%（高點 {x['qfii_peak']:.1f}%）\n"
-                         f"法人動態：{x['lt_light']} {x['lt_text']}")
+                         + (f"底部價格：{fmt_now(float(x['bottom']))}（跌破就重新觀察）\n" if x["lt_light"] != "🔴" else "")
+                         + (f"噴出價格：{fmt_now(float(x['base_high']))}（帶量站上就買）\n" if x["lt_light"] == "🟡" else "")
+                         + f"法人動態：{x['lt_light']} {x['lt_text']}")
 
     n_sell = 0
     parts.append(f"\n\n【我的持股】{len(holdings)} 檔")
