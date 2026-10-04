@@ -1578,7 +1578,8 @@ BUY_MAX_N = 5              # 可買最多列幾檔
 WATCH_MAX_N = 8            # 觀察最多列幾檔
 TARGET_MIN_PCT = 8.0       # 目標價至少 +8%
 TARGET_MAX_PCT = 10.0      # 目標價最多 +10%
-MAX_RUNUP_PCT = 20.0       # 可買：離 60 日最低點最多漲了此 %（漲太多＝肉不多了，改列觀察）
+MAX_RUNUP_PCT = 20.0       # 可買：離 60 日最低點最多漲了此 %（漲太多＝肉不多了）
+MIN_RUNUP_PCT = 5.0        # 可買：離 60 日最低點至少彈上來此 %（確認已經離開低點，不是還在破底）
 SETUP_ORDER = {"ACCUM": 0, "PULLBACK": 1, "BREAKOUT": 2}   # 可買排序：佈局最前（最早上車）
 INST_COST_MAX_GAP = 5.0    # 現價離法人成本超過此 % → 不列可買，改列觀察「等拉回法人成本」
 INST_COST_STOP_PCT = 3.0   # 停損：跌破法人成本此 %
@@ -1651,7 +1652,7 @@ def pick_buys(radar):
     b = b[~b.apply(far_from_cost, axis=1)] if not b.empty else b
     b = b[b.apply(lambda r: inst_light(r).startswith("🟢"), axis=1)] if not b.empty else b   # 可買一定要法人🟢買進
     if not b.empty and "runup60" in b.columns:
-        b = b[~(b["runup60"] > MAX_RUNUP_PCT)]                     # 離低點漲太多的不列可買
+        b = b[~(b["runup60"] > MAX_RUNUP_PCT) & ~(b["runup60"] < MIN_RUNUP_PCT)]   # 離低點 +5%～+20% 才列可買
     if b.empty:
         return b
     b["_force"] = (b["trust_5d"] + b["foreign_5d"]) / b["avg_vol_5d"].where(b["avg_vol_5d"] > 0)
