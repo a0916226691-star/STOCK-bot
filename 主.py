@@ -1942,7 +1942,7 @@ def run(send_mail=True, collect_only=False):
         return
 
     pf = make_price_features(load_table("prices", 120))
-    inst_hist = load_table("institutional", 30)
+    inst_hist = load_table("institutional", 45)    # 45 個日曆天 ≈ 30 個交易日，夠算近 20 日累計
     inf = make_inst_features(inst_hist, pf)
     cost = make_inst_cost(inst_hist, load_table("prices", 30))
     if not inf.empty and not cost.empty:
