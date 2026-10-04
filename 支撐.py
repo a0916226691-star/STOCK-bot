@@ -15,6 +15,8 @@ CONSOL_RNG  = 0.07    # B：最近5日高低差占收盤 ≤7% 算盤整
 MIN_BASE    = 3       # 回檔低點後至少 3 天（有築底動作）
 MAX_B_FROM_HIGH = 0.08  # B：離前高至少還有 8% 空間
 TOP_N = 25
+MIN_DIST = float(os.getenv('SW_MIN_DIST', 0.04))      # 進榜時要高於前低多少（0.04＝至少已彈 4%）
+MIN_BREADTH = float(os.getenv('SW_MIN_BREADTH', 0.0)) # 大盤環境：站上月線的股票占比低於這個值就不新進榜
 REPLAY_DAYS = int(os.getenv('SW_REPLAY', 40))  # 第一次執行時，往回模擬幾個交易日
 MAX_HOLD = 40       # 追蹤超過 40 個交易日還沒結果 → 逾期結案
 COOLDOWN = 10       # 結案後 10 個交易日內不重複追蹤同一檔
@@ -86,7 +88,7 @@ def analyze(g):
                 best = r; continue
         else:
             rng5 = (h[-5:].max() - l[-5:].min()) / last
-            if (last <= L1 * (1 + 0.08) and last >= L1 * (1 - BREAK_LO) and rng5 <= CONSOL_RNG
+            if (last <= L1 * (1 + 0.08) and last >= L1 * (1 + MIN_DIST) and last >= L1 * (1 - BREAK_LO) and rng5 <= CONSOL_RNG
                     and last * (1 + MAX_B_FROM_HIGH) <= H1 and n - 1 - k <= 25):
                 r.update(kind="B", rng5=rng5)
                 best = r
@@ -117,7 +119,7 @@ def scan(groups, d, liq):
         out.append(r)
     return out
 
-def step_day(conn, d, closes, matches, dates):
+def step_day(conn, d, closes, matches, dates, breadth=None):
     """用 d 的收盤價更新追蹤中的股票，再把新符合的加進來"""
     cur = conn.execute("SELECT stock_id,first_date,support,resist,entry_px,days FROM sr_track WHERE status='追蹤中'")
     for sid, fd, L1, H1, e, days in cur.fetchall():
@@ -131,6 +133,8 @@ def step_day(conn, d, closes, matches, dates):
         conn.execute("UPDATE sr_track SET last_date=?,last_px=?,days=?,status=?,end_date=?,end_px=? WHERE stock_id=? AND first_date=?",
                      (d, px, days, st, d if st != "追蹤中" else None, px if st != "追蹤中" else None, sid, fd))
     new = []
+    if breadth is not None and breadth.get(d, 1.0) < MIN_BREADTH:
+        return new
     di = dates.index(d)
     cool = dates[max(0, di - COOLDOWN)]
     for r in matches:
@@ -217,8 +221,8 @@ def build_body(conn, data_date, new_today, ndays, flows):
             + sep + f"📍 追蹤中 {len(opn)} 檔（尚未突破前高、也沒跌破支撐）\n\n" + ("\n\n".join(line_open(x) for _, x in opn.iterrows()) or "（沒有）")
             + sep + "🏁 最近結案\n\n" + ("\n".join(line_done(x) for _, x in recent.iterrows()) or "（最近沒有）")
             + sep + "📊 成績\n" + score
-            + sep + "【燈號】\n🟢 在低點位置（前低上方8%內）盤整，法人沒有撤離＝可留意買進\n🟡 接近前高（5%內），法人沒有撤離＝有機會突破前高\n🔴 資金撤離（近5日法人合計淨賣超，且連3天賣或賣超占成交量2%以上），或收盤跌到支撐下方＝可能假支撐／假突破，不要碰或要走\n⚪ 在支撐與前高中間，沒有明確訊號\n法人＝外資＋投信（上櫃股票的法人資料累積天數還少，不足時只看價格）。\n\n【怎麼看】\n支撐區＝前一次波段低點；壓力區＝前一次波段高點。\n"
-              "進榜：前低→漲15%以上到前高→回到前低上方5%內→低點後築底3天以上→近5日震幅7%以內→離前高還有8%以上空間。\n"
+            + sep + "【燈號】\n🟢 在低點位置（前低上方4%到8%）盤整，法人沒有撤離＝可留意買進\n🟡 接近前高（5%內），法人沒有撤離＝有機會突破前高\n🔴 資金撤離（近5日法人合計淨賣超，且連3天賣或賣超占成交量2%以上），或收盤跌到支撐下方＝可能假支撐／假突破，不要碰或要走\n⚪ 在支撐與前高中間，沒有明確訊號\n法人＝外資＋投信（上櫃股票的法人資料累積天數還少，不足時只看價格）。\n\n【怎麼看】\n支撐區＝前一次波段低點；壓力區＝前一次波段高點。\n"
+              "進榜：前低→漲15%以上到前高→回到前低上方4%到8%之間（已確認彈起、但還在底部區）→低點後築底3天以上→近5日震幅7%以內→離前高還有8%以上空間。\n"
               "結案：收盤站上前高＝成功；收盤跌破前低3%＝失敗；追蹤超過40個交易日沒結果＝逾期。\n"
               "第一次執行時，會用資料庫裡的歷史資料倒推模擬，所以成績一開始就有；之後每天自動追蹤。\n"
               "只看日K價格，不含產業與法人面；僅供參考。")
@@ -238,6 +242,9 @@ def run(send_mail=True, replay=None, reset=False):
     px["date"] = px["date"].astype(str)
     groups = {sid: g.reset_index(drop=True) for sid, g in px.groupby("stock_id")}
     liq = px.groupby("stock_id")["turnover"].apply(lambda s: s.tail(20).mean())
+    pv = px.pivot_table(index='date', columns='stock_id', values='close')
+    ma = pv.rolling(20, min_periods=20).mean()
+    breadth = ((pv > ma).sum(axis=1) / ma.notna().sum(axis=1).replace(0, np.nan)).dropna().to_dict()
     with R.db() as conn:
         row = conn.execute("SELECT v FROM sr_meta WHERE k='last'").fetchone()
         last = row[0] if row else None
@@ -246,7 +253,7 @@ def run(send_mail=True, replay=None, reset=False):
         new_today = []
         for d in todo:
             closes = {sid: float(g.loc[g["date"] == d, "close"].iloc[0]) for sid, g in groups.items() if (g["date"] == d).any()}
-            new = step_day(conn, d, closes, scan(groups, d, liq), dates)
+            new = step_day(conn, d, closes, scan(groups, d, liq), dates, breadth)
             if d == data_date: new_today = new
             conn.execute("INSERT OR REPLACE INTO sr_meta VALUES ('last', ?)", (d,))
             conn.commit()
