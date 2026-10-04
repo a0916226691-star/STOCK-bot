@@ -42,7 +42,7 @@ jobs:
         run: |
           mkdir -p output
 
-      - name: Collect market data
+      - name: Run radar (collect data + email)
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
@@ -55,18 +55,19 @@ jobs:
             exit 0
           fi
           if [ -n "$BACKFILL_DAYS" ] && [ "$BACKFILL_DAYS" != "0" ]; then
-            python 主.py --collect-only --backfill "$BACKFILL_DAYS"
+            python 主.py --backfill "$BACKFILL_DAYS"
           else
-            python 主.py --collect-only
+            python 主.py
           fi
 
-      - name: Run low-zone scan
-        env:
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
-        run: |
-          python 低檔.py
+      # 低檔止跌掃描（谷底型）暫停：跟「法人確定進場才買」的風格不同。低檔.py 保留，要恢復就把下面幾行的 # 拿掉
+      # - name: Run low-zone scan
+      #   env:
+      #     GMAIL_USER: ${{ secrets.GMAIL_USER }}
+      #     GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+      #     RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+      #   run: |
+      #     python 低檔.py
 
       - name: Check generated CSV files
         if: always()

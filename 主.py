@@ -64,6 +64,9 @@ ACCUM_MAX_VOL_RATIO = 1.2  # 佈局型：量還沒放大（散戶還沒注意到
 DUMP_GIVEBACK = 0.5        # 單日大賣：當天賣超吐掉前幾天累積買超的此比例以上 → 直接🔴
 DUMP_VOL_PCT = 10.0        # 單日大賣：當天法人賣超佔當天成交量此 % 以上 → 直接🔴
 DUMP_MIN_VOL_PCT = 3.0     # 吐回比例那條，賣超至少也要佔成交量此 %（避免幾張就觸發）
+DROP_VOL_RATIO = 2.0       # 爆量下跌：成交量至少是前 5 日均量的此倍數
+DROP_PCT = 3.0             # 爆量下跌：當天跌幅至少此 % → 🟡
+BELOW_COST_PCT = 3.0       # 跌破法人成本此 % → 🔴（法人自己都套牢了）
 SHADOW_VOL_RATIO = 2.0     # 爆量長上影線：成交量至少是前 5 日均量的此倍數
 SHADOW_MIN_PCT = 3.0       # 爆量長上影線：上影線（最高價到收盤）至少此 %
 SHADOW_MAX_POS = 0.5       # 爆量長上影線：收盤落在當天高低區間的下半段（0＝最低、1＝最高）
@@ -817,6 +820,7 @@ def make_price_features(full):
     df["ma20"] = grp_roll(close, key, 20, "mean")
     prev_close = close.groupby(key).shift(1)
     df["return_5d"] = (close / close.groupby(key).shift(5) - 1) * 100
+    df["chg_1d"] = (close / prev_close - 1) * 100
 
     # 前 20 日（不含今天）的高低點：用來判斷盤整與突破
     df["prev_high20"] = grp_roll(prev_close, key, 20, "max")
@@ -1724,6 +1728,9 @@ def inst_light(r):
     """法人動態燈號：🟢 買進／🟡 持有／🔴 賣出。"""
     if long_upper_shadow(r):
         return "🔴 賣出"                              # 爆量長上影線：不管是法人還是主力在倒貨
+    icost = r.get("inst_cost", np.nan)
+    if pd.notna(icost) and r["close"] < icost * (1 - BELOW_COST_PCT / 100):
+        return "🔴 賣出"                              # 跌破法人成本 3%：這一波失敗
     t5, f5, i3, streak = r["trust_5d"], r["foreign_5d"], r["inst_3d"], r["inst_sell_streak"]
     net5 = t5 + f5
     if (t5 < 0 and f5 < 0) or (net5 < 0 and pd.notna(streak) and streak >= 2):
@@ -1739,6 +1746,9 @@ def inst_light(r):
     avg_pct = (-d1 / avg5 * 100) if (pd.notna(d1) and d1 < 0 and pd.notna(avg5) and avg5 > 0) else 0.0
     if avg_pct >= DUMP_AVGVOL_PCT:
         return "🔴 賣出"                              # 賣超超過前 5 日均量 15%
+    chg, vr = r.get("chg_1d", np.nan), r.get("vol_ratio_5d", np.nan)
+    if pd.notna(chg) and pd.notna(vr) and chg <= -DROP_PCT and vr >= DROP_VOL_RATIO:
+        return "🟡 持有"                              # 爆量下跌：有人在倒貨（多半是主力）
     if net5 > 0 and (pd.isna(i3) or i3 > 0) and not (pd.notna(streak) and streak >= 1):
         return "🟢 買進"
     return "🟡 持有"
@@ -1828,35 +1838,21 @@ def plan_text(r):
 
 
 def build_simple_email(radar, data_date, holdings):
-    best, buys, watches = select_picks(radar)
+    _, buys, watches = select_picks(radar)      # 第一根候選只存進紀錄（算勝率用），不寫進信裡
     rows = radar.drop_duplicates("stock_id").set_index("stock_id")
     parts = ["法人動態：🟢 買進　🟡 持有　🔴 賣出"]
 
-    cap = f"，股價≤{MAX_PRICE:g}元" if MAX_PRICE < 1e8 else ""
-    parts.append(f"\n【第一根候選】{len(best)} 檔（快突破或剛突破前高{cap}）")
-    if best.empty:
-        parts.append("今天沒有")
-    for _, r in best.iterrows():
-        ph = r["prev_high20"]
-        if pd.isna(ph):
-            how = ""
-        elif r["close"] > ph:
-            how = f"\n建議操作：已站上突破價（剛突破第一根），別追高，量沒爆再評估"
-        else:
-            how = f"\n建議操作：收盤站上 {fmt_now(float(ph))} 再買，現在還差 {(ph / r['close'] - 1) * 100:.1f}%"
-        parts.append("\n" + stock_block(r) + (f"\n突破價格：{fmt_now(float(ph))}" if pd.notna(ph) else "") + how)
-
-    parts.append(f"\n\n【可買】{len(buys)} 檔（已突破）")
+    parts.append(f"\n【可買】{len(buys)} 檔")
     if buys.empty:
         parts.append("今天沒有")
     for _, r in buys.iterrows():
-        parts.append("\n" + stock_block(r, target=True, kind=True) + plan_text(r))
+        parts.append("\n" + stock_block(r, target=True, kind=True))
 
     parts.append(f"\n\n【觀察】{len(watches)} 檔")
     if not watches:
         parts.append("今天沒有")
-    for r, why in watches:
-        parts.append("\n" + stock_block(r) + f"\n建議操作：{why}")
+    for r, _ in watches:
+        parts.append("\n" + stock_block(r))
 
     n_sell = 0
     parts.append(f"\n\n【我的持股】{len(holdings)} 檔")
