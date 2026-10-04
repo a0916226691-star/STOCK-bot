@@ -38,53 +38,26 @@ jobs:
         run: |
           mkdir -p output
 
-      - name: Run stock script
+      - name: Collect market data
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
-          # 同時追蹤哪些規則版本（逗號分隔，第一個是信件詳細內容用的主要版本）。
-          # v9.0＝基本規則；v9.1＝v9.0＋自營商＋千張大戶；v9.2＝v9.1＋大盤環境過濾＋融資（散戶）過熱；v9.3＝v9.2＋提早買（快突破就買）。成績單會並排比較。
-          RADAR_VERSIONS: "v9.2,v9.1,v9.0,v9.3"
           BACKFILL_DAYS: ${{ github.event.inputs.backfill_days }}
         run: |
           if [ -n "$BACKFILL_DAYS" ] && [ "$BACKFILL_DAYS" != "0" ]; then
-            python 主.py --backfill "$BACKFILL_DAYS"
+            python 主.py --collect-only --backfill "$BACKFILL_DAYS"
           else
-            python 主.py
+            python 主.py --collect-only
           fi
 
-      - name: Run evaluation report
-        # 成績單失敗不應該擋住後面「存檔」的步驟，所以允許失敗
-        continue-on-error: true
+      - name: Run support-retest scan
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
-          EVENT_NAME: ${{ github.event_name }}
         run: |
-          # 平常只把成績單印在執行紀錄裡；每週五與手動執行時才寄信
-          EXTRA=""
-          if [ "$(TZ=Asia/Taipei date +%u)" = "5" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            EXTRA="--email"
-          fi
-          python 輔.py --detail --csv output/evaluation.csv $EXTRA
-
-      - name: Run A/B comparison report
-        # A 套（快突破第一根）與 B 套（精簡信可買）誰比較好：平常只印在執行紀錄裡，
-        # 2026-10-12（下下週一）早上與手動執行時才寄信。失敗不擋後面的存檔。
-        continue-on-error: true
-        env:
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          EXTRA=""
-          if [ "$(TZ=Asia/Taipei date +%F)" = "2026-10-12" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            EXTRA="--email"
-          fi
-          python 輔.py --ab --since 2026-10-02 --csv output/ab_picks.csv $EXTRA
+          python 支撐.py
 
       - name: Check generated CSV files
         if: always()

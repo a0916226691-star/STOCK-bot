@@ -1874,7 +1874,7 @@ def send_email(subject, body):
 
 
 # ───────────────────────── 主流程 ─────────────────────────
-def run(send_mail=True):
+def run(send_mail=True, collect_only=False):
     init_db()
     print(f"=== 台股雷達 開始 {now_tw():%Y-%m-%d %H:%M}｜追蹤版本 {VERSIONS}（主要：{VERSION}）===")
     hist_price = load_table("prices", 120)
@@ -1891,6 +1891,9 @@ def run(send_mail=True):
     margin = collect_margin()
     if not margin.empty:
         upsert("margin", margin, MARGIN_COLS)
+    if collect_only:
+        print("=== 只收資料完成（舊版訊號與信件已略過）===")
+        return
 
     pf = make_price_features(load_table("prices", 120))
     inst_hist = load_table("institutional", 30)
@@ -1938,11 +1941,12 @@ def main():
     ap = argparse.ArgumentParser(description="台股雷達 v9.2")
     ap.add_argument("--backfill", type=int, default=0, metavar="N", help="先回補最近 N 個日曆天的上市行情與法人")
     ap.add_argument("--no-email", action="store_true", help="不寄信")
+    ap.add_argument("--collect-only", action="store_true", help="只收資料進資料庫，不跑舊版訊號與信件")
     args = ap.parse_args()
     if args.backfill:
         init_db()
         backfill(args.backfill)
-    run(send_mail=not args.no_email)
+    run(send_mail=not args.no_email, collect_only=args.collect_only)
 
 
 if __name__ == "__main__":
