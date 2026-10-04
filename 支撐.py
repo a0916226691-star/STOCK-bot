@@ -119,19 +119,63 @@ def scan(groups, d, liq):
         out.append(r)
     return out
 
-def step_day(conn, d, closes, matches, dates, breadth=None):
-    """用 d 的收盤價更新追蹤中的股票，再把新符合的加進來"""
-    cur = conn.execute("SELECT stock_id,first_date,support,resist,entry_px,days FROM sr_track WHERE status='追蹤中'")
-    for sid, fd, L1, H1, e, days in cur.fetchall():
+OPEN_ST = ("追蹤中", "待賣黃", "待賣紅")
+BUY_DIST = 0.04      # 綠燈：收盤要在前低上方 4% 以上（含更往上）
+SELL_STREAK = 2      # 黃燈：外資＋投信連續 2 天合計淨賣超＝資金開始鬆動
+def pct(a, b): return (a / b - 1) * 100
+
+def make_flow_fn(inst, px):
+    """回傳 flow(stock_id, 日期)：該日往前5個法人資料日的外資＋投信合計買賣、連賣天數；資料不足回傳 None"""
+    inst = inst.copy(); inst["date"] = inst["date"].astype(str)
+    inst["net"] = inst["foreign_net"].fillna(0) + inst["trust_net"].fillna(0)
+    by = {sid: g.sort_values("date") for sid, g in inst.groupby("stock_id")}
+    vol = px.set_index(["stock_id", "date"])["volume"]
+    cache = {}
+    def flow(sid, d):
+        k = (sid, d)
+        if k in cache: return cache[k]
+        g = by.get(sid); out = None
+        if g is not None:
+            g = g[g["date"] <= d].tail(5)
+            if len(g) == 5 and g["date"].iloc[-1] == d:
+                net = g["net"].to_numpy(float); st = 0
+                for x in net[::-1]:
+                    if x < 0: st += 1
+                    else: break
+                v = float(sum(vol.get((sid, x), 0) or 0 for x in g["date"]))
+                out = dict(net5=float(net.sum()), streak=st, pct=(net.sum() / v * 100) if v else 0.0)
+        cache[k] = out
+        return out
+    return flow
+
+def light(last, L1, H1, flow):
+    """🟢 可買/續抱 🟡 法人鬆動→賣 🔴 跌破支撐→走 ⚪ 回到前低4%內，先觀望。回傳 (燈號, 原因)"""
+    if last < L1 * 0.995:
+        return "🔴", "收盤跌到前低下方，是假支撐、真跌破 → 該走"
+    if flow and flow["streak"] >= SELL_STREAK:
+        return "🟡", f"法人（外資＋投信）連 {flow['streak']} 天賣超，資金開始鬆動 → 賣出"
+    note = "法人資金沒跑" if flow else "法人資料不足，只看價格"
+    if last >= L1 * (1 + BUY_DIST):
+        return "🟢", f"還在前低上方 {pct(last, L1):.1f}%，{note} → 可買進／續抱"
+    return "⚪", f"回到前低上方 4% 以內，還沒確認 → 先觀望（{note}）"
+
+def step_day(conn, d, closes, matches, dates, flow, breadth=None):
+    """用 d 的收盤更新追蹤中的股票：出現黃/紅燈→標「待賣」，下一個交易日收盤價當賣出價；再把新符合且是綠燈的加進來"""
+    cur = conn.execute("SELECT stock_id,first_date,support,resist,days,status FROM sr_track WHERE status IN ('追蹤中','待賣黃','待賣紅')")
+    for sid, fd, L1, H1, days, status in cur.fetchall():
         px = closes.get(sid)
         if px is None: continue
         days += 1
-        st = "追蹤中"
-        if px > H1: st = "成功"
-        elif px < L1 * (1 - BREAK_LO): st = "失敗"
-        elif days >= MAX_HOLD: st = "逾期"
-        conn.execute("UPDATE sr_track SET last_date=?,last_px=?,days=?,status=?,end_date=?,end_px=? WHERE stock_id=? AND first_date=?",
-                     (d, px, days, st, d if st != "追蹤中" else None, px if st != "追蹤中" else None, sid, fd))
+        if status in ("待賣黃", "待賣紅"):           # 昨天出訊號，今天收盤當賣出價
+            conn.execute("UPDATE sr_track SET last_date=?,last_px=?,days=?,status=?,end_date=?,end_px=? WHERE stock_id=? AND first_date=?",
+                         (d, px, days, "黃燈賣" if status == "待賣黃" else "跌破賣", d, px, sid, fd))
+            continue
+        lt = light(px, L1, H1, flow(sid, d))[0]
+        st = "待賣黃" if lt == "🟡" else "待賣紅" if lt == "🔴" else "追蹤中"
+        if st == "追蹤中" and days >= MAX_HOLD:
+            conn.execute("UPDATE sr_track SET last_date=?,last_px=?,days=?,status='逾期',end_date=?,end_px=? WHERE stock_id=? AND first_date=?", (d, px, days, d, px, sid, fd))
+            continue
+        conn.execute("UPDATE sr_track SET last_date=?,last_px=?,days=?,status=? WHERE stock_id=? AND first_date=?", (d, px, days, st, sid, fd))
     new = []
     if breadth is not None and breadth.get(d, 1.0) < MIN_BREADTH:
         return new
@@ -139,93 +183,60 @@ def step_day(conn, d, closes, matches, dates, breadth=None):
     cool = dates[max(0, di - COOLDOWN)]
     for r in matches:
         sid = r["stock_id"]
-        busy = conn.execute("SELECT 1 FROM sr_track WHERE stock_id=? AND (status='追蹤中' OR end_date>=?)", (sid, cool)).fetchone()
+        f0 = flow(sid, d)
+        if f0 is None or light(r["close"], r["L1"], r["H1"], f0)[0] != "🟢": continue   # 要有法人資料、而且當天是綠燈才算
+        busy = conn.execute("SELECT 1 FROM sr_track WHERE stock_id=? AND (status IN ('追蹤中','待賣黃','待賣紅') OR end_date>=?)", (sid, cool)).fetchone()
         if busy: continue
         conn.execute("INSERT OR REPLACE INTO sr_track VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                      (sid, d, r["name"], r["close"], r["L1"], r["H1"], d, r["close"], 0, "追蹤中", None, None))
         new.append(r)
     return new
 
-def pct(a, b): return (a / b - 1) * 100
-
-NEAR_HIGH = 0.05     # 離前高 5% 內＝接近前高
-LEAVE_PCT = 2.0      # 近5日法人淨賣超占成交量 2% 以上＝資金撤離
-def inst_flow(inst, px, ids):
-    """每檔：近5日法人（外資＋投信）淨買賣超、連續淨賣超天數、占近5日成交量%"""
-    out = {}
-    if inst is None or inst.empty: return out
-    inst = inst.copy(); inst["date"] = inst["date"].astype(str)
-    inst["net"] = inst["foreign_net"].fillna(0) + inst["trust_net"].fillna(0)
-    vol = px.set_index(["stock_id", "date"])["volume"]
-    for sid, g in inst[inst["stock_id"].isin(ids)].groupby("stock_id"):
-        g = g.sort_values("date").tail(5)
-        if len(g) < 3: continue
-        v = float(sum(vol.get((sid, d), 0) or 0 for d in g["date"]))
-        net = g["net"].to_numpy(float)
-        streak = 0
-        for x in net[::-1]:
-            if x < 0: streak += 1
-            else: break
-        out[sid] = dict(net5=float(net.sum()), streak=streak, pct=(net.sum() / v * 100) if v else 0.0, n=len(g))
-    return out
-
-def light(last, L1, H1, flow):
-    """回傳 (燈號, 原因)"""
-    leave = bool(flow) and flow["net5"] < 0 and (flow["streak"] >= 3 or flow["pct"] <= -LEAVE_PCT)
-    if last < L1 * 0.995 or (leave and last <= L1 * 1.08):
-        why = "收盤已跌到支撐下方，要小心是假支撐" if last < L1 * 0.995 else "在支撐區但法人在賣，可能是假支撐"
-        return "🔴", why
-    if leave:
-        return "🔴", "法人在賣，上漲可能沒有資金撐（假突破風險）"
-    if last >= H1 * (1 - NEAR_HIGH):
-        return "🟡", "接近前高，法人沒有撤離，有機會突破" if flow else "接近前高（法人資料不足）"
-    if last <= L1 * 1.08:
-        return "🟢", "在低點位置盤整，法人沒有撤離" if flow else "在低點位置盤整（法人資料不足）"
-    return "⚪", "在支撐與前高中間，沒有明確訊號"
-
-def build_body(conn, data_date, new_today, ndays, flows):
+def build_body(conn, data_date, new_today, ndays, flow):
     tr = pd.read_sql("SELECT * FROM sr_track", conn)
-    opn = tr[tr.status == "追蹤中"].sort_values("first_date", ascending=False)
-    done = tr[tr.status != "追蹤中"]
-    for df_ in (opn,):
-        df_["lt"] = [light(r.last_px, r.support, r.resist, flows.get(r.stock_id)) for r in df_.itertuples()]
-    order = {"🟢": 0, "🟡": 1, "⚪": 2, "🔴": 3}
+    opn = tr[tr.status.isin(OPEN_ST)].copy()
+    done = tr[~tr.status.isin(OPEN_ST)]
+    opn["lt"] = [light(r.last_px, r.support, r.resist, flow(r.stock_id, data_date)) for r in opn.itertuples()]
+    order = {"🟡": 0, "🔴": 1, "🟢": 2, "⚪": 3}      # 要賣的排最前面
     opn = opn.assign(_o=[order[a] for a, _ in opn["lt"]]).sort_values(["_o", "first_date"], ascending=[True, False])
     cnt = {k: sum(1 for a, _ in opn["lt"] if a == k) for k in order}
     def line_open(x):
         return (f"{x['lt'][0]} {x['stock_name']}({x['stock_id']})｜進榜 {x['first_date'][5:]} 價 {x['entry_px']:g} → 現價 {x['last_px']:g}（{pct(x['last_px'], x['entry_px']):+.1f}%，第 {x['days']} 天）\n"
                 f"   {x['lt'][1]}\n"
-                f"   支撐區 {x['support']:g}（收盤跌破 {x['support']*(1-BREAK_LO):.4g}＝失敗）｜前高壓力區 {x['resist']:g}（還差 {pct(x['resist'], x['last_px']):.0f}%）")
+                f"   支撐區 {x['support']:g}｜前高壓力區 {x['resist']:g}（還差 {pct(x['resist'], x['last_px']):.0f}%）")
     def line_done(x):
-        icon = {"成功": "✅", "失敗": "❌", "逾期": "⏱"}[x["status"]]
-        return (f"{icon}{x['stock_name']}({x['stock_id']})｜{x['first_date'][5:]} 進榜價 {x['entry_px']:g} → {x['end_date'][5:]} {x['end_px']:g}"
-                f"（{pct(x['end_px'], x['entry_px']):+.1f}%，{x['status']}，{x['days']} 天）")
+        r = pct(x['end_px'], x['entry_px'])
+        icon = "✅" if r > 0 else "❌"
+        return f"{icon}{x['stock_name']}({x['stock_id']})｜{x['first_date'][5:]} 進榜價 {x['entry_px']:g} → {x['end_date'][5:]} {x['end_px']:g}（{r:+.1f}%，{x['status']}，{x['days']} 天）"
     def fmt_new(x):
-        lt = light(x['close'], x['L1'], x['H1'], flows.get(x['stock_id']))
+        lt = light(x['close'], x['L1'], x['H1'], flow(x['stock_id'], data_date))
         return (f"{lt[0]} {x['name']}({x['stock_id']})｜收盤 {x['close']:g}\n   {lt[1]}\n"
                 f"   支撐區 {x['L1']:g}（{x['l1d']}前一次波段低點）｜這次回檔低點 {x['L2']:g}（{x['l2d']}）\n"
                 f"   前高壓力區 {x['H1']:g}（{x['h1d']}）｜還差 {pct(x['H1'], x['close']):.0f}%｜近5日震幅 {x['rng5']*100:.1f}%")
-    recent = done[done.end_date >= str(sorted(tr["last_date"].unique())[-6] if tr["last_date"].nunique() > 6 else "")].sort_values("end_date", ascending=False)
+    dd = sorted(tr["last_date"].unique())
+    recent = done[done.end_date >= (dd[-6] if len(dd) > 6 else "")].sort_values("end_date", ascending=False)
     if len(done):
-        ok = done[done.status == "成功"]; bad = done[done.status == "失敗"]
-        rets = [pct(r.end_px, r.entry_px) for r in done.itertuples()]
-        score = (f"累計結案 {len(done)} 檔：成功 {len(ok)}｜失敗 {len(bad)}｜逾期 {len(done)-len(ok)-len(bad)}\n"
-                 f"   成功率 {len(ok)/len(done)*100:.0f}%｜平均報酬 {np.mean(rets):+.1f}%"
-                 f"｜成功平均 {np.mean([pct(r.end_px, r.entry_px) for r in ok.itertuples()]) if len(ok) else 0:+.1f}%"
-                 f"｜失敗平均 {np.mean([pct(r.end_px, r.entry_px) for r in bad.itertuples()]) if len(bad) else 0:+.1f}%")
+        rets = pd.Series([pct(r.end_px, r.entry_px) for r in done.itertuples()])
+        w, l = rets[rets > 0], rets[rets <= 0]
+        score = (f"累計結案 {len(done)} 檔：賺 {len(w)}｜賠 {len(l)}｜勝率 {len(w)/len(done)*100:.0f}%\n"
+                 f"   平均報酬 {rets.mean():+.1f}%｜賺的平均 {w.mean() if len(w) else 0:+.1f}%｜賠的平均 {l.mean() if len(l) else 0:+.1f}%｜平均持有 {done['days'].mean():.0f} 天")
     else:
-        score = "還沒有結案的股票（要等股價突破前高或跌破支撐才算結案）"
+        score = "還沒有結案的股票"
+    hold = [x for _, x in opn.iterrows() if x["lt"][0] in ("🟢", "⚪") and x["first_date"] != data_date]
+    sell = [x for _, x in opn.iterrows() if x["lt"][0] in ("🟡", "🔴")]
     sep = "\n\n━━━━━━━━━━━━\n"
-    return (f"支撐回檔掃描｜資料日 {data_date}（{ndays} 個交易日）\n追蹤中 {len(opn)} 檔（🟢{cnt['🟢']} 🟡{cnt['🟡']} ⚪{cnt['⚪']} 🔴{cnt['🔴']}）｜今天新進 {len(new_today)} 檔｜一張30萬以上"
-            + sep + f"🆕 今天新進榜 {len(new_today)} 檔（回到前低、止跌盤整）\n\n" + ("\n\n".join(fmt_new(x) for x in sorted(new_today, key=lambda r: r['close']/r['L1'])) or "（今天沒有新進）")
-            + sep + f"📍 追蹤中 {len(opn)} 檔（尚未突破前高、也沒跌破支撐）\n\n" + ("\n\n".join(line_open(x) for _, x in opn.iterrows()) or "（沒有）")
-            + sep + "🏁 最近結案\n\n" + ("\n".join(line_done(x) for _, x in recent.iterrows()) or "（最近沒有）")
+    return (f"支撐回檔掃描｜資料日 {data_date}（{ndays} 個交易日）\n追蹤中 {len(opn)} 檔（🟢{cnt['🟢']} 🟡{cnt['🟡']} 🔴{cnt['🔴']} ⚪{cnt['⚪']}）｜今天新進 {len(new_today)} 檔｜一張30萬以上"
+            + sep + f"🚨 該賣出 {len(sell)} 檔（黃燈＝法人鬆動、紅燈＝跌破支撐）\n\n" + ("\n\n".join(line_open(x) for x in sell) or "（沒有）")
+            + sep + f"🆕 今天新進榜 {len(new_today)} 檔（綠燈才列入，可買進）\n\n" + ("\n\n".join(fmt_new(x) for x in sorted(new_today, key=lambda r: r['close']/r['L1'])) or "（今天沒有新進）")
+            + sep + f"🟢 續抱／觀察中 {len(hold)} 檔\n\n" + ("\n\n".join(line_open(x) for x in hold) or "（沒有）")
+            + sep + "🏁 最近結案（賣出價＝訊號出現後下一個交易日收盤）\n\n" + ("\n".join(line_done(x) for _, x in recent.iterrows()) or "（最近沒有）")
             + sep + "📊 成績\n" + score
-            + sep + "【燈號】\n🟢 在低點位置（前低上方4%到8%）盤整，法人沒有撤離＝可留意買進\n🟡 接近前高（5%內），法人沒有撤離＝有機會突破前高\n🔴 資金撤離（近5日法人合計淨賣超，且連3天賣或賣超占成交量2%以上），或收盤跌到支撐下方＝可能假支撐／假突破，不要碰或要走\n⚪ 在支撐與前高中間，沒有明確訊號\n法人＝外資＋投信（上櫃股票的法人資料累積天數還少，不足時只看價格）。\n\n【怎麼看】\n支撐區＝前一次波段低點；壓力區＝前一次波段高點。\n"
-              "進榜：前低→漲15%以上到前高→回到前低上方4%到8%之間（已確認彈起、但還在底部區）→低點後築底3天以上→近5日震幅7%以內→離前高還有8%以上空間。\n"
-              "結案：收盤站上前高＝成功；收盤跌破前低3%＝失敗；追蹤超過40個交易日沒結果＝逾期。\n"
-              "第一次執行時，會用資料庫裡的歷史資料倒推模擬，所以成績一開始就有；之後每天自動追蹤。\n"
-              "只看日K價格，不含產業與法人面；僅供參考。")
+            + sep + "【燈號】\n🟢 收盤在前低上方 4% 以上（含更往上），法人（外資＋投信）資金沒跑＝可買進、續抱\n"
+              "🟡 法人連 2 天合計淨賣超，資金開始鬆動＝賣出\n🔴 收盤跌到前低下方＝假支撐、真跌破＝走\n⚪ 回到前低上方 4% 內，還沒確認＝先觀望\n"
+              "進榜條件：前低→漲15%以上到前高→回到前低上方4%到8%之間→低點後築底3天以上→近5日震幅7%以內→離前高還有8%以上空間，而且當天是綠燈。\n"
+              "進榜一定要有法人資料（法人資料還不足的股票先不列入）。燈號在收盤後算出，實際賣出會比結案價晚一天，價格可能不同。\n"
+              "歷史回測樣本還少，僅供參考，不保證獲利。")
+
 
 def run(send_mail=True, replay=None, reset=False):
     global REPLAY_DAYS
@@ -245,6 +256,7 @@ def run(send_mail=True, replay=None, reset=False):
     pv = px.pivot_table(index='date', columns='stock_id', values='close')
     ma = pv.rolling(20, min_periods=20).mean()
     breadth = ((pv > ma).sum(axis=1) / ma.notna().sum(axis=1).replace(0, np.nan)).dropna().to_dict()
+    flow = make_flow_fn(R.load_table("institutional", 150 + int(REPLAY_DAYS * 1.6)), px)
     with R.db() as conn:
         row = conn.execute("SELECT v FROM sr_meta WHERE k='last'").fetchone()
         last = row[0] if row else None
@@ -253,19 +265,17 @@ def run(send_mail=True, replay=None, reset=False):
         new_today = []
         for d in todo:
             closes = {sid: float(g.loc[g["date"] == d, "close"].iloc[0]) for sid, g in groups.items() if (g["date"] == d).any()}
-            new = step_day(conn, d, closes, scan(groups, d, liq), dates, breadth)
+            new = step_day(conn, d, closes, scan(groups, d, liq), dates, flow, breadth)
             if d == data_date: new_today = new
             conn.execute("INSERT OR REPLACE INTO sr_meta VALUES ('last', ?)", (d,))
             conn.commit()
-        ids = set(pd.read_sql("SELECT stock_id FROM sr_track WHERE status='追蹤中'", conn)["stock_id"]) | {r["stock_id"] for r in new_today}
-        flows = inst_flow(R.load_table("institutional", 20), px, ids)
-        body = build_body(conn, data_date, new_today, len(dates), flows)
+        body = build_body(conn, data_date, new_today, len(dates), flow)
         pd.read_sql("SELECT * FROM sr_track ORDER BY first_date DESC", conn).to_csv(
             os.path.join(R.OUTPUT_DIR, "support_track.csv"), index=False, encoding="utf-8-sig")
     print(body)
     if send_mail:
-        n_open = body.split("追蹤中 ")[1].split(" 檔")[0]
-        R.send_email(f"支撐回檔掃描 {data_date[5:].replace('-','/')}｜新進{len(new_today)} 追蹤{n_open}", body)
+        n_sell = body.split("該賣出 ")[1].split(" 檔")[0]
+        R.send_email(f"支撐回檔掃描 {data_date[5:].replace('-','/')}｜新進{len(new_today)} 該賣{n_sell}", body)
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--no-email", action="store_true")
