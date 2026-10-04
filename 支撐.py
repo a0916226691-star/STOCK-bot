@@ -121,7 +121,10 @@ def scan(groups, d, liq):
 
 OPEN_ST = ("追蹤中", "待賣黃", "待賣紅")
 BUY_DIST = 0.04      # 綠燈：收盤要在前低上方 4% 以上（含更往上）
-SELL_STREAK = 2      # 黃燈：外資＋投信連續 2 天合計淨賣超＝資金開始鬆動
+SELL_STREAK = 2      # （舊）連續賣超天數
+LOOSE_MODE = os.getenv("SW_LOOSE", "streak")   # cum20＝近20個法人資料日累計淨賣超；cum10＝近10日；streak＝連賣天數
+LOOSE_TH = float(os.getenv("SW_LOOSE_TH", 0.0))  # 累計賣超占成交量 % 的門檻（0＝只要累計轉負）
+HIST_N = 20
 def pct(a, b): return (a / b - 1) * 100
 
 def make_flow_fn(inst, px):
@@ -136,24 +139,31 @@ def make_flow_fn(inst, px):
         if k in cache: return cache[k]
         g = by.get(sid); out = None
         if g is not None:
-            g = g[g["date"] <= d].tail(5)
-            if len(g) == 5 and g["date"].iloc[-1] == d:
+            g = g[g["date"] <= d].tail(HIST_N)
+            if len(g) == HIST_N and g["date"].iloc[-1] == d:
                 net = g["net"].to_numpy(float); st = 0
                 for x in net[::-1]:
                     if x < 0: st += 1
                     else: break
-                v = float(sum(vol.get((sid, x), 0) or 0 for x in g["date"]))
-                out = dict(net5=float(net.sum()), streak=st, pct=(net.sum() / v * 100) if v else 0.0)
+                vs = np.array([float(vol.get((sid, x), 0) or 0) for x in g["date"]])
+                def rp(n): return (net[-n:].sum() / vs[-n:].sum() * 100) if vs[-n:].sum() else 0.0
+                out = dict(net5=float(net[-5:].sum()), streak=st, pct=rp(5), pct10=rp(10), pct20=rp(20))
         cache[k] = out
         return out
     return flow
+
+def loosened(flow):
+    if not flow: return False
+    if LOOSE_MODE == "streak": return flow["streak"] >= SELL_STREAK
+    key = "pct10" if LOOSE_MODE == "cum10" else "pct20"
+    return flow[key] < LOOSE_TH if LOOSE_TH >= 0 else flow[key] <= LOOSE_TH
 
 def light(last, L1, H1, flow):
     """🟢 可買/續抱 🟡 法人鬆動→賣 🔴 跌破支撐→走 ⚪ 回到前低4%內，先觀望。回傳 (燈號, 原因)"""
     if last < L1 * 0.995:
         return "🔴", "收盤跌到前低下方，是假支撐、真跌破 → 該走"
-    if flow and flow["streak"] >= SELL_STREAK:
-        return "🟡", f"法人（外資＋投信）連 {flow['streak']} 天賣超，資金開始鬆動 → 賣出"
+    if loosened(flow):
+        return "🟡", f"法人（外資＋投信）近{10 if LOOSE_MODE == 'cum10' else 20}天累計轉成賣超（占成交量 {flow['pct10' if LOOSE_MODE == 'cum10' else 'pct20']:+.1f}%），資金開始鬆動 → 賣出"
     note = "法人資金沒跑" if flow else "法人資料不足，只看價格"
     if last >= L1 * (1 + BUY_DIST):
         return "🟢", f"還在前低上方 {pct(last, L1):.1f}%，{note} → 可買進／續抱"
@@ -184,7 +194,7 @@ def step_day(conn, d, closes, matches, dates, flow, breadth=None):
     for r in matches:
         sid = r["stock_id"]
         f0 = flow(sid, d)
-        if f0 is None or light(r["close"], r["L1"], r["H1"], f0)[0] != "🟢": continue   # 要有法人資料、而且當天是綠燈才算
+        if f0 is None or (LOOSE_MODE != "streak" and f0["pct20"] <= 0) or light(r["close"], r["L1"], r["H1"], f0)[0] != "🟢": continue   # 要有法人資料、而且當天是綠燈才算
         busy = conn.execute("SELECT 1 FROM sr_track WHERE stock_id=? AND (status IN ('追蹤中','待賣黃','待賣紅') OR end_date>=?)", (sid, cool)).fetchone()
         if busy: continue
         conn.execute("INSERT OR REPLACE INTO sr_track VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
