@@ -140,6 +140,9 @@ def run(send_mail=True, now=None, quotes=None):
     want = {sid: ("otc" if market.get(sid) == "TPEx" else "tse")
             for sid in list(buys["stock_id"] if not buys.empty else []) + list(waits["stock_id"] if not waits.empty else [])
             + list(holdings)}
+    if not want:
+        print("今天沒有可買、等噴出、持股要看，不寄盤中信。")
+        return
     quotes = quotes if quotes is not None else fetch_quotes(want)
     today = now.strftime("%Y%m%d")
     live = {k: v for k, v in quotes.items() if v["date"] == today and pd.notna(v["price"]) and pd.notna(v["prev"])}
