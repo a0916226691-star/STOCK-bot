@@ -1947,7 +1947,8 @@ LT_MIN_DROP = 0.5          # 外資持股從高點減少至少此比例（0.5＝
 LT_MIN_PRICE_DD = 30.0     # 股價離一年高點至少跌了此 %
 LT_MIN_DAYS = 120          # 至少要有幾天外資持股資料才判斷
 LT_MAX_N = 15              # 信裡最多列幾檔
-LT_BACK_BUYDAYS = 3        # 🟡 法人開始買：近 5 天至少幾天買超
+LT_BUY_WINDOW = 10         # 🟡 法人一直買：看最近幾天
+LT_BACK_BUYDAYS = 7        # 🟡 法人一直買：近 10 天至少幾天買超（不賣了不算，買賣交錯也不算）
 LT_BOTTOM_DAYS = 60        # 底部＝近 60 個交易日的最低價
 LT_BOTTOM_HOLD = 10        # 🟡 底部守住：最低點至少是此天數以前出現的，而且之後沒再跌破
 LT_BASE_DAYS = 20          # 🟢 噴出：收盤站上近 20 天（不含今天）的最高價
@@ -2003,7 +2004,10 @@ def build_longtrack(radar):
         k = int(np.nanargmin(lows))
         bottom, bottom_age = float(lows[k]), len(lows) - 1 - k                # 底部價格、幾天前出現
         base_high = float(np.nanmax(hi[-LT_BASE_DAYS - 1:-1]))                  # 近 20 天（不含今天）最高價
-        buying = net5 > 0 and buy5 >= LT_BACK_BUYDAYS                           # 法人開始買
+        lastw = i5["net"].tail(LT_BUY_WINDOW) if i5 is not None else pd.Series(dtype=float)
+        q_up = len(q) > LT_BUY_WINDOW and now > float(q[-LT_BUY_WINDOW - 1])     # 外資持股比 10 天前高
+        buying = (len(lastw) >= LT_BUY_WINDOW and int((lastw > 0).sum()) >= LT_BACK_BUYDAYS
+                  and float(lastw.sum()) > 0 and net5 > 0 and q_up)              # 法人一直買
         holds = bottom_age >= LT_BOTTOM_HOLD and c > bottom                     # 底部守住（最近 10 天沒破底）
         vr = r.get("vol_ratio_5d", np.nan)
         breakout = c > base_high and pd.notna(vr) and vr >= LT_BREAK_VOL        # 帶量站上整理區高點＝噴出
@@ -2015,8 +2019,10 @@ def build_longtrack(radar):
             light, text, order = "🔴", "還在破底", 2
         elif net5 < 0 or chg5 < -0.1:
             light, text, order = "🔴", "法人還在賣", 2
+        elif net5 > 0:
+            light, text, order = "🔴", "法人買賣交錯，還不算一直買", 2
         else:
-            light, text, order = "🔴", "法人還沒開始買", 2
+            light, text, order = "🔴", "法人不賣了，但還沒開始買", 2
         out.append({"stock_id": sid, "stock_name": r["stock_name"], "close": c, "qfii_now": now, "qfii_peak": peak,
                     "lt_light": light, "lt_text": text, "lt_order": order, "drop_rel": 1 - now / peak,
                     "bottom": bottom, "base_high": base_high})
