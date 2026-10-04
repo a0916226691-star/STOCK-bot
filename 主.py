@@ -64,6 +64,7 @@ ACCUM_MAX_VOL_RATIO = 1.2  # 佈局型：量還沒放大（散戶還沒注意到
 DUMP_GIVEBACK = 0.5        # 單日大賣：當天賣超吐掉前幾天累積買超的此比例以上 → 直接🔴
 DUMP_VOL_PCT = 10.0        # 單日大賣：當天法人賣超佔當天成交量此 % 以上 → 直接🔴
 DUMP_MIN_VOL_PCT = 3.0     # 吐回比例那條，賣超至少也要佔成交量此 %（避免幾張就觸發）
+DUMP_AVGVOL_PCT = 15.0     # 單日大賣：當天法人賣超超過「前 5 日平均成交量」此 % → 直接🔴（倒貨當天爆量也不會被稀釋）
 INST_MIN_PART = 5.0        # 法人參與度：土洋 5 日買超張數至少要佔 5 日成交量的此 %（避免主力／投機大戶主導的股票）
 MIN_DAILY_TURNOVER = 30_000_000   # 成交金額下限（元）
 # ── 型態分類（v10）：突破型／低接型／整理股，報告分開列 ──────────────
@@ -1720,6 +1721,10 @@ def inst_light(r):
         vol_pct = sell / vol * 100
         if vol_pct >= DUMP_VOL_PCT or (prior > 0 and sell >= prior * DUMP_GIVEBACK and vol_pct >= DUMP_MIN_VOL_PCT):
             return "🔴 賣出"
+    avg5 = r.get("avg_vol_5d", np.nan)
+    avg_pct = (-d1 / avg5 * 100) if (pd.notna(d1) and d1 < 0 and pd.notna(avg5) and avg5 > 0) else 0.0
+    if avg_pct >= DUMP_AVGVOL_PCT:
+        return "🔴 賣出"                              # 賣超超過前 5 日均量 15%
     if net5 > 0 and (pd.isna(i3) or i3 > 0) and not (pd.notna(streak) and streak >= 1):
         return "🟢 買進"
     return "🟡 持有"
