@@ -64,6 +64,9 @@ ACCUM_MAX_VOL_RATIO = 1.2  # 佈局型：量還沒放大（散戶還沒注意到
 DUMP_GIVEBACK = 0.5        # 單日大賣：當天賣超吐掉前幾天累積買超的此比例以上 → 直接🔴
 DUMP_VOL_PCT = 10.0        # 單日大賣：當天法人賣超佔當天成交量此 % 以上 → 直接🔴
 DUMP_MIN_VOL_PCT = 3.0     # 吐回比例那條，賣超至少也要佔成交量此 %（避免幾張就觸發）
+SHADOW_VOL_RATIO = 2.0     # 爆量長上影線：成交量至少是前 5 日均量的此倍數
+SHADOW_MIN_PCT = 3.0       # 爆量長上影線：上影線（最高價到收盤）至少此 %
+SHADOW_MAX_POS = 0.5       # 爆量長上影線：收盤落在當天高低區間的下半段（0＝最低、1＝最高）
 DUMP_AVGVOL_PCT = 15.0     # 單日大賣：當天法人賣超超過「前 5 日平均成交量」此 % → 直接🔴（倒貨當天爆量也不會被稀釋）
 INST_MIN_PART = 5.0        # 法人參與度：土洋 5 日買超張數至少要佔 5 日成交量的此 %（避免主力／投機大戶主導的股票）
 MIN_DAILY_TURNOVER = 30_000_000   # 成交金額下限（元）
@@ -1708,8 +1711,19 @@ def check_holdings(radar, holdings):
     return sell, keep
 
 
+def long_upper_shadow(r):
+    """爆量長上影線：量 ≥ 前 5 日均量 2 倍、上影線 ≥ 3%、收盤在當天高低區間下半段。沒有高低價資料時不判斷。"""
+    hi, lo, c, vr = r.get("high", np.nan), r.get("low", np.nan), r.get("close", np.nan), r.get("vol_ratio_5d", np.nan)
+    if any(pd.isna(x) for x in (hi, lo, c, vr)) or hi <= lo or c <= 0:
+        return False
+    return (vr >= SHADOW_VOL_RATIO and (hi - c) / c * 100 >= SHADOW_MIN_PCT
+            and (c - lo) / (hi - lo) <= SHADOW_MAX_POS)
+
+
 def inst_light(r):
     """法人動態燈號：🟢 買進／🟡 持有／🔴 賣出。"""
+    if long_upper_shadow(r):
+        return "🔴 賣出"                              # 爆量長上影線：不管是法人還是主力在倒貨
     t5, f5, i3, streak = r["trust_5d"], r["foreign_5d"], r["inst_3d"], r["inst_sell_streak"]
     net5 = t5 + f5
     if (t5 < 0 and f5 < 0) or (net5 < 0 and pd.notna(streak) and streak >= 2):
