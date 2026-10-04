@@ -58,6 +58,11 @@ def pick(px, inst, data_date):
             r["chip_f"] = (sh["foreign_net"].fillna(0).sum() / vsh * 100) if vsh else np.nan
             r["chip_t"] = (sh["trust_net"].fillna(0).sum() / vsh * 100) if vsh else np.nan
             r["chip_days"] = len(sh); r["chip_full"] = bool(len(ig) and ig["date"].iloc[0] <= dates[hi_i])
+            t10 = ig.tail(10)
+            v10 = float(vol.reindex(t10["date"]).fillna(0).sum())
+            r["chip10"] = (t10["net"].sum() / v10 * 100) if v10 else np.nan
+            r["chip10_f"] = (t10["foreign_net"].fillna(0).sum() / v10 * 100) if v10 else np.nan
+            r["chip10_t"] = (t10["trust_net"].fillna(0).sum() / v10 * 100) if v10 else np.nan
             since = ig[ig["date"] >= dates[k]]
             r["since_low_shares"] = float(since["net"].sum()) / 1000   # 張
             r["since_low_f"] = float(since["foreign_net"].fillna(0).sum()) / 1000
@@ -67,21 +72,24 @@ def pick(px, inst, data_date):
     return pd.DataFrame(rows)
 
 def chip_light(x):
-    c = x.get("chip_pct", np.nan)
+    """低點有沒有法人撐著：看最近10個法人資料日，外資＋投信合計買賣超占成交量的 %"""
+    c = x.get("chip10", np.nan)
     if pd.isna(c): return "⚪", "資料不足"
-    if c >= -3: return "🟢", "籌碼沒跑"
-    if c >= -8: return "🟡", "法人有在賣"
-    return "🔴", "法人大賣"
+    if c >= 0: return "🟢", "法人撐著（近10日合計沒在賣）"
+    if c >= -3: return "🟡", "法人小賣"
+    return "🔴", "法人在賣、沒撐住"
 
 def fmt(x):
     lt = chip_light(x)
     s = (f"{lt[0]} {x['name']}({x['stock_id']})｜收盤 {x['close']:g}｜離最低點 +{x['above']:.1f}%\n"
          f"   高點 {x['high']:g}（{x['high_date']}）→ 最低點 {x['low']:g}（{x['low_date']}，{x['age']} 個交易日前）｜跌幅 {x['drop']:.0f}%")
     if pd.notna(x.get("trap", np.nan)):
+        rr = (x['trap'] / x['close'] - 1) / max(x['close'] / x['low'] - 1, 0.005)
+        s += f"\n   上下空間｜支撐＝最低點 {x['low']:g}（現價往下 {(x['close']/x['low']-1)*100:.1f}%）｜壓力＝套牢區（往上 {(x['trap']/x['close']-1)*100:+.1f}%）｜報酬風險比 約 {rr:.1f} 比 1"
         s += (f"\n   反彈壓力區（下跌這段的成交均價＝套牢區成本）{x['trap']:g}｜現價到壓力區還有 {(x['trap']/x['close']-1)*100:+.1f}%｜前高 {x['high']:g}（{(x['high']/x['close']-1)*100:+.0f}%）")
     if pd.notna(x.get("chip_pct", np.nan)):
         note = "" if x.get("chip_full", False) else f"（法人資料只從 6/8 起，抓得到 {int(x['chip_days'])} 個交易日）"
-        s += (f"\n   籌碼｜自高點以來外資＋投信合計 {x['chip_pct']:+.1f}%（外資 {x['chip_f']:+.1f}%、投信 {x['chip_t']:+.1f}%，占同期成交量）{note}")
+        s += (f"\n   籌碼｜低點區（近10個法人資料日）外資＋投信合計 {x['chip10']:+.1f}%（外資 {x['chip10_f']:+.1f}%、投信 {x['chip10_t']:+.1f}%）\n   　　　自高點以來 {x['chip_pct']:+.1f}%（外資 {x['chip_f']:+.1f}%、投信 {x['chip_t']:+.1f}%，占同期成交量）{note}")
         s += f"\n   　　　近20日 外資 {x['f20']:+.1f}%、投信 {x['t20']:+.1f}%｜自最低點以來 外資 {x['since_low_f']:+,.0f} 張、投信 {x['since_low_t']:+,.0f} 張"
     else:
         s += "\n   籌碼｜資料不足（上櫃股票法人資料還在累積）"
@@ -104,17 +112,17 @@ def run(send_mail=True):
         df.drop(columns=["_o"]).to_csv(os.path.join(R.OUTPUT_DIR, f"lowzone_{data_date}.csv"), index=False, encoding="utf-8-sig")
         cnt = {k: int((df["lt"] == k).sum()) for k in ["🟢", "🟡", "🔴", "⚪"]}
         body = (f"低檔止跌掃描｜資料日 {data_date}\n原本在高點、被賣下來，現在回到最近 6 個月最低點附近的股票：共 {len(df)} 檔（一張10萬以上）\n"
-                f"籌碼：🟢沒跑 {cnt['🟢']}｜🟡有在賣 {cnt['🟡']}｜🔴大賣 {cnt['🔴']}｜⚪資料不足 {cnt['⚪']}\n\n━━━━━━━━━━━━\n"
+                f"低點籌碼：🟢法人撐著 {cnt['🟢']}｜🟡小賣 {cnt['🟡']}｜🔴沒撐住 {cnt['🔴']}｜⚪資料不足 {cnt['⚪']}\n\n━━━━━━━━━━━━\n"
                 + "\n\n".join(fmt(x) for _, x in df.iterrows())
                 + "\n\n━━━━━━━━━━━━\n【怎麼看】\n"
                   "條件：最近 120 個交易日內，從高點到最低點跌了 35% 以上；現在價格在最低點上方 10% 內（最低點可以是今天或剛過幾天）。\n"
-                  "籌碼燈號：自高點以來，外資＋投信合計買賣超占同期成交量的 %。🟢 -3% 以上＝法人沒有明顯在賣（價格跌但籌碼沒跑，可能是被動賣壓或避險）；🟡 -3% 到 -8%；🔴 低於 -8%＝法人真的在大賣。排序：🟢 在前，同燈號離最低點近的在前。\n"
+                  "籌碼燈號（低點有沒有法人撐著）：看最近 10 個法人資料日，外資＋投信合計買賣超占成交量的 %。🟢 0% 以上＝法人在撐（有買或沒賣）；🟡 0% 到 -3%＝小賣；🔴 低於 -3%＝法人在賣、沒撐住。排序：🟢 在前，同燈號離最低點近的在前。「自高點以來」的數字當背景參考。報酬風險比＝（現價到套牢區）÷（現價到最低點）。\n"
                   "反彈壓力區：從高點到最低點這段的成交均價，代表套牢的人平均成本，反彈到這附近賣壓通常比較大；前高是更上面的壓力。\n"
                   "注意：法人資料只有 2026-06-08 之後，高點早於這個日期的股票，籌碼只算到有資料的部分；上櫃股票法人資料還在累積。\n"
-                  "我用歷史資料測過，「籌碼沒跑」目前沒有看出會讓後續報酬比較好（樣本只有 63 次），所以只當參考。不含產業面，僅供參考，不保證獲利。")
+                  "我用歷史資料測過「自高點以來籌碼沒跑」，沒有看出後續報酬比較好（樣本只有 63 次）；低點有沒有法人撐著還沒驗證，所以都只當參考。不含產業面，僅供參考，不保證獲利。")
     print(body)
     if send_mail and not df.empty:
-        R.send_email(f"低檔止跌掃描 {data_date[5:].replace('-','/')}｜{len(df)}檔（籌碼沒跑{cnt['🟢']}）", body)
+        R.send_email(f"低檔止跌掃描 {data_date[5:].replace('-','/')}｜{len(df)}檔（法人撐著{cnt['🟢']}）", body)
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--no-email", action="store_true")
