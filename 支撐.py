@@ -20,7 +20,7 @@ MIN_BREADTH = float(os.getenv('SW_MIN_BREADTH', 0.0)) # 大盤環境：站上月
 REPLAY_DAYS = int(os.getenv('SW_REPLAY', 40))  # 第一次執行時，往回模擬幾個交易日
 MAX_HOLD = 40       # 追蹤超過 40 個交易日還沒結果 → 逾期結案
 COOLDOWN = 10       # 結案後 10 個交易日內不重複追蹤同一檔
-MIN_LOT_PRICE = float(os.getenv('SW_MIN_PRICE', 300))  # 一張(1000股)至少30萬 → 股價≥300，上限不設
+MIN_LOT_PRICE = float(os.getenv('SW_MIN_PRICE', 100))  # 一張10萬以上（股價≥100），上限不設
 
 def zigzag(h, l, c, pct):
     """回傳轉折點 [(idx, 'L'/'H', price)]"""
@@ -238,7 +238,7 @@ def build_body(conn, data_date, new_today, ndays, flow):
     hold = [x for _, x in opn.iterrows() if x["lt"][0] in ("🟢", "⚪") and x["first_date"] != data_date]
     sell = [x for _, x in opn.iterrows() if x["lt"][0] in ("🟡", "🔴")]
     sep = "\n\n━━━━━━━━━━━━\n"
-    return (f"支撐回檔掃描｜資料日 {data_date}（{ndays} 個交易日）\n追蹤中 {len(opn)} 檔（🟢{cnt['🟢']} 🟡{cnt['🟡']} 🔴{cnt['🔴']} ⚪{cnt['⚪']}）｜今天新進 {len(new_today)} 檔｜一張30萬以上"
+    return (f"支撐回檔掃描｜資料日 {data_date}（{ndays} 個交易日）\n追蹤中 {len(opn)} 檔（🟢{cnt['🟢']} 🟡{cnt['🟡']} 🔴{cnt['🔴']} ⚪{cnt['⚪']}）｜今天新進 {len(new_today)} 檔｜一張10萬以上"
             + sep + f"🚨 該賣出 {len(sell)} 檔（黃燈＝法人鬆動、紅燈＝跌破支撐）\n\n" + ("\n\n".join(line_open(x) for x in sell) or "（沒有）")
             + sep + f"🆕 今天新進榜 {len(new_today)} 檔（綠燈才列入，可買進）\n\n" + ("\n\n".join(fmt_new(x) for x in sorted(new_today, key=lambda r: r['close']/r['L1'])) or "（今天沒有新進）")
             + sep + f"🟢 續抱／觀察中 {len(hold)} 檔\n\n" + ("\n\n".join(line_open(x) for x in hold) or "（沒有）")
