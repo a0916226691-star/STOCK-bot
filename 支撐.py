@@ -122,7 +122,7 @@ def run(send_mail=True):
             s = (f"{x['name']}({x['stock_id']})｜收盤 {x['close']:g}\n"
                  f"   支撐區 {x['L1']:g}（{x['l1d']}前低）｜回檔低點 {x['L2']:g}（{x['l2d']}，{x['hold']*100:+.1f}%）\n"
                  f"   壓力區 {x['H1']:g}（{x['h1d']}前高）")
-            if a: s += f"｜已突破 {int(x["brk_days"])} 天，站上前高 {(x['close']/x['H1']-1)*100:+.1f}%"
+            if a: s += f"｜已突破 {int(x['brk_days'])} 天，站上前高 {(x['close']/x['H1']-1)*100:+.1f}%"
             else: s += f"｜還差 {x['to_high']*100:.0f}% 到前高｜近5日震幅 {x['rng5']*100:.1f}%"
             return s
         body = (f"波段回測支撐掃描｜資料日 {data_date}（{ndays} 個交易日）\n\n━━━━━━━━━━━━\n"
