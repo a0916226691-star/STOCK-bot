@@ -734,10 +734,11 @@ def collect_inst():
     return frames
 
 
-def backfill(days):
+def backfill(days, prices_only=False):
     """回補上市（TWSE）歷史行情與法人。TPEx 的歷史資料沒有穩定的公開 API，只能每天累積。"""
     with db() as conn:
-        have_p = {r[0] for r in conn.execute("SELECT DISTINCT date FROM prices WHERE market='TWSE'")}
+        # 已有最高/最低價的日期才算「已補過」（舊資料沒有高低價，會重抓一次補上）
+        have_p = {r[0] for r in conn.execute("SELECT DISTINCT date FROM prices WHERE market='TWSE' AND high IS NOT NULL")}
         have_i = {r[0] for r in conn.execute("SELECT DISTINCT date FROM institutional WHERE market='TWSE'")}
         have_m = {r[0] for r in conn.execute("SELECT DISTINCT date FROM margin WHERE market='TWSE'")}
     for d in weekdays_back(days):
@@ -749,6 +750,8 @@ def backfill(days):
             except Exception as e:
                 print(f"回補行情 {iso} 失敗：{e}")
             time.sleep(2)
+        if prices_only:
+            continue
         if iso not in have_m:
             try:
                 n = upsert("margin", fetch_twse_margin(d), MARGIN_COLS)
@@ -1940,12 +1943,16 @@ def run(send_mail=True, collect_only=False):
 def main():
     ap = argparse.ArgumentParser(description="台股雷達 v9.2")
     ap.add_argument("--backfill", type=int, default=0, metavar="N", help="先回補最近 N 個日曆天的上市行情與法人")
+    ap.add_argument("--backfill-prices", type=int, default=0, metavar="N", help="只回補最近 N 個日曆天的上市股價（含高低價），不補法人與融資")
     ap.add_argument("--no-email", action="store_true", help="不寄信")
     ap.add_argument("--collect-only", action="store_true", help="只收資料進資料庫，不跑舊版訊號與信件")
     args = ap.parse_args()
     if args.backfill:
         init_db()
         backfill(args.backfill)
+    if args.backfill_prices:
+        init_db()
+        backfill(args.backfill_prices, prices_only=True)
     run(send_mail=not args.no_email, collect_only=args.collect_only)
 
 

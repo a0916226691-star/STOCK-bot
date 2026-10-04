@@ -178,12 +178,18 @@ def build_body(conn, data_date, new_today, ndays):
             + sep + "【怎麼看】\n支撐區＝前一次波段低點；壓力區＝前一次波段高點。\n"
               "進榜：前低→漲15%以上到前高→回到前低上方5%內→低點後築底3天以上→近5日震幅7%以內→離前高還有8%以上空間。\n"
               "結案：收盤站上前高＝成功；收盤跌破前低3%＝失敗；追蹤超過40個交易日沒結果＝逾期。\n"
-              "第一次執行時，會用資料庫裡最近40個交易日倒推模擬，所以成績一開始就有；之後每天自動追蹤。\n"
+              "第一次執行時，會用資料庫裡的歷史資料倒推模擬，所以成績一開始就有；之後每天自動追蹤。\n"
               "只看日K價格，不含產業與法人面；僅供參考。")
 
-def run(send_mail=True):
+def run(send_mail=True, replay=None, reset=False):
+    global REPLAY_DAYS
+    if replay: REPLAY_DAYS = replay
     R.init_db(); init_tables()
-    px = R.load_table("prices", 150).sort_values(["stock_id", "date"])
+    if reset:
+        with R.db() as c:
+            c.execute("DELETE FROM sr_track"); c.execute("DELETE FROM sr_meta")
+        print("已清除舊的追蹤紀錄，重新倒推")
+    px = R.load_table("prices", 150 + int(REPLAY_DAYS * 1.6)).sort_values(["stock_id", "date"])
     px = px[px["stock_id"].str.fullmatch(r"\d{4}")]
     dates = sorted(px["date"].astype(str).unique())
     data_date = dates[-1]
@@ -212,4 +218,7 @@ def run(send_mail=True):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--no-email", action="store_true")
-    run(not ap.parse_args().no_email)
+    ap.add_argument("--replay", type=int, default=0, help="第一次執行時往回模擬幾個交易日")
+    ap.add_argument("--reset", action="store_true", help="清掉追蹤紀錄重算")
+    a = ap.parse_args()
+    run(not a.no_email, a.replay or None, a.reset)
