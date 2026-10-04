@@ -2045,29 +2045,23 @@ def longtrack_buys(radar, track):
 
 
 def build_simple_email(radar, data_date, holdings, track=None):
-    _, buys, watches = select_picks(radar)      # 第一根候選只存進紀錄（算勝率用），不寫進信裡
-    rb = longtrack_buys(radar, track)                                        # 長線追蹤 → 法人回來了 → 可買（回補）
-    if not rb.empty:
-        rb = rb[~rb["stock_id"].isin(set(buys["stock_id"]))]
-        buys = pd.concat([rb, buys], ignore_index=True)
+    """信件只放「長線追蹤」這套：法人賣到底 → 一直買、底部守住 → 帶量噴出才買。
+    舊的佈局／突破／低接還是會算、存進紀錄（之後比較勝率用），但不寫進信裡。"""
     rows = radar.drop_duplicates("stock_id").set_index("stock_id")
-    parts = ["法人動態：🟢 買進　🟡 持有　🔴 賣出"]
+    buys = longtrack_buys(radar, track)
+    parts = ["法人動態：🟢 買進　🟡 持有／等待　🔴 賣出／繼續等"]
 
-    parts.append(f"\n【可買】{len(buys)} 檔")
+    parts.append(f"\n【可買】{len(buys)} 檔（長線追蹤裡法人一直買、底部守住、帶量噴出）")
     if buys.empty:
-        parts.append("今天沒有")
+        parts.append("今天沒有，耐心等")
     for _, r in buys.iterrows():
         parts.append("\n" + stock_block(r, target=True, kind=True))
 
-    parts.append(f"\n\n【觀察】{len(watches)} 檔")
-    if not watches:
-        parts.append("今天沒有")
-    for r, _ in watches:
-        parts.append("\n" + stock_block(r))
-
+    watches = []
     if track is not None and not track.empty:
         t = track.head(LT_MAX_N)
-        parts.append(f"\n\n【長線追蹤】{len(track)} 檔（法人賣到快沒貨，等法人回來，只看不買）")
+        n_y = int((track["lt_light"] == "🟡").sum())
+        parts.append(f"\n\n【長線追蹤】{len(track)} 檔（🟡 {n_y} 檔等噴出，其他繼續等）")
         for _, x in t.iterrows():
             parts.append(f"\n股票代號：{x['stock_name']}({x['stock_id']})\n"
                          f"目前價格：{fmt_now(float(x['close']))}\n"
@@ -2075,6 +2069,9 @@ def build_simple_email(radar, data_date, holdings, track=None):
                          + (f"底部價格：{fmt_now(float(x['bottom']))}（跌破就重新觀察）\n" if x["lt_light"] != "🔴" else "")
                          + (f"噴出價格：{fmt_now(float(x['base_high']))}（帶量站上就買）\n" if x["lt_light"] == "🟡" else "")
                          + f"法人動態：{x['lt_light']} {x['lt_text']}")
+        watches = list(track.loc[track["lt_light"] == "🟡", "stock_id"])
+    else:
+        parts.append("\n\n【長線追蹤】今天沒有資料")
 
     n_sell = 0
     parts.append(f"\n\n【我的持股】{len(holdings)} 檔")
@@ -2174,12 +2171,15 @@ def run(send_mail=True, collect_only=False):
         if not track.empty:
             track.to_csv(os.path.join(OUTPUT_DIR, f"longtrack_{data_date}.csv"), index=False, encoding="utf-8-sig")
             rb = longtrack_buys(radar, track)
-            if not rb.empty:
-                with db() as conn:
+            yl = track[track["lt_light"] == "🟡"]
+            recs = ([(data_date, x["stock_id"], x["stock_name"], "C回補", float(x["close"]), "") for _, x in rb.iterrows()]
+                    + [(data_date, x["stock_id"], x["stock_name"], "C等噴出", float(x["close"]),
+                        f"{x['base_high']}|{x['bottom']}") for _, x in yl.iterrows()])
+            with db() as conn:
+                conn.execute("DELETE FROM picks WHERE date=? AND grp IN ('C回補','C等噴出')", (data_date,))
+                if recs:
                     conn.executemany("INSERT OR REPLACE INTO picks (date, stock_id, stock_name, grp, close, note) "
-                                     "VALUES (?,?,?,?,?,?)",
-                                     [(data_date, x["stock_id"], x["stock_name"], "C回補", float(x["close"]), "")
-                                      for _, x in rb.iterrows()])
+                                     "VALUES (?,?,?,?,?,?)", recs)
     except Exception as e:
         print(f"長線追蹤失敗（不影響寄信）：{e}")
         track = None
@@ -2187,7 +2187,7 @@ def run(send_mail=True, collect_only=False):
     print("\n===== 信件內容 =====\n" + body)
     if send_mail:
         md = f"{int(data_date[5:7])}/{data_date[8:]}"
-        subject = f"{'🚨' if n_sell else ''}台股雷達 {md}｜可買{n_buy} 觀察{n_watch}" + (f" 持股賣出{n_sell}" if n_sell else "")
+        subject = f"{'🚨' if n_sell else ''}台股雷達 {md}｜可買{n_buy} 等噴出{n_watch}" + (f" 持股賣出{n_sell}" if n_sell else "")
         send_email(subject, body)
     print("=== 完成 ===")
 

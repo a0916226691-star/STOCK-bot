@@ -82,9 +82,11 @@ def load_context():
     """從資料庫抓：最新一天的可買名單、每檔的市場別、前 5 日均量（張）、法人成本。"""
     R.init_db()
     with R.db() as conn:
-        last = conn.execute("SELECT MAX(date) FROM picks WHERE grp='B可買'").fetchone()[0]
-        buys = pd.read_sql("SELECT stock_id, stock_name, close FROM picks WHERE date=? AND grp='B可買'",
+        last = conn.execute("SELECT MAX(date) FROM picks").fetchone()[0]          # 早上那封信的資料日
+        buys = pd.read_sql("SELECT stock_id, stock_name, close FROM picks WHERE date=? AND grp='C回補'",
                            conn, params=(last,), dtype={"stock_id": str}) if last else pd.DataFrame()
+        waits = pd.read_sql("SELECT stock_id, stock_name, close, note FROM picks WHERE date=? AND grp='C等噴出'",
+                            conn, params=(last,), dtype={"stock_id": str}) if last else pd.DataFrame()
     px = R.load_table("prices", 40)
     px = px.sort_values(["stock_id", "date"])
     market = px.groupby("stock_id")["market"].last().to_dict()
@@ -92,7 +94,7 @@ def load_context():
     names = px.groupby("stock_id")["stock_name"].last().to_dict()
     cost = R.make_inst_cost(R.load_table("institutional", 30), R.load_table("prices", 30))
     cost = cost.set_index("stock_id")["inst_cost"].to_dict() if not cost.empty else {}
-    return last, buys, market, vol5, names, cost
+    return last, buys, waits, market, vol5, names, cost
 
 
 def buy_status(q, vol5, frac):
@@ -133,10 +135,11 @@ def block(name, sid, q, chg, status):
 
 def run(send_mail=True, now=None, quotes=None):
     now = now or R.now_tw()
-    last, buys, market, vol5, names, cost = load_context()
+    last, buys, waits, market, vol5, names, cost = load_context()
     holdings = R.load_holdings()
     want = {sid: ("otc" if market.get(sid) == "TPEx" else "tse")
-            for sid in list(buys["stock_id"] if not buys.empty else []) + list(holdings)}
+            for sid in list(buys["stock_id"] if not buys.empty else []) + list(waits["stock_id"] if not waits.empty else [])
+            + list(holdings)}
     quotes = quotes if quotes is not None else fetch_quotes(want)
     today = now.strftime("%Y%m%d")
     live = {k: v for k, v in quotes.items() if v["date"] == today and pd.notna(v["price"]) and pd.notna(v["prev"])}
@@ -156,6 +159,27 @@ def run(send_mail=True, now=None, quotes=None):
             continue
         chg, st = buy_status(q, vol5.get(b["stock_id"]), frac)
         parts.append("\n" + block(b["stock_name"], b["stock_id"], q, chg, st))
+
+    if not waits.empty:
+        parts.append(f"\n\n【等噴出】{len(waits)} 檔（長線追蹤🟡）")
+        for _, w in waits.iterrows():
+            q = live.get(w["stock_id"])
+            if q is None:
+                continue
+            base_high, bottom = (float(x) for x in str(w["note"]).split("|"))
+            chg = (q["price"] / q["prev"] - 1) * 100
+            proj = q["vol_lots"] / frac if pd.notna(q["vol_lots"]) else np.nan
+            v5 = vol5.get(w["stock_id"])
+            heavy = pd.notna(proj) and pd.notna(v5) and v5 > 0 and proj >= v5 * 1.5
+            if q["price"] < bottom:
+                st = "🔴 跌破底部，重新觀察"
+            elif q["price"] > base_high and heavy:
+                st = f"🟢 盤中帶量站上 {R.fmt_now(base_high)}，噴出了"
+            elif q["price"] > base_high:
+                st = f"🟡 站上 {R.fmt_now(base_high)} 但量還不夠，等收盤確認"
+            else:
+                st = f"🟡 還沒噴（噴出價格 {R.fmt_now(base_high)}）"
+            parts.append("\n" + block(w["stock_name"], w["stock_id"], q, chg, st))
 
     n_red = 0
     parts.append(f"\n\n【我的持股】{len(holdings)} 檔")
