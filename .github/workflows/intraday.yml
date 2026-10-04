@@ -1,0 +1,32 @@
+name: Intraday 10am Check
+
+on:
+  schedule:
+    - cron: "57 1 * * 1-5"  # 台灣時間週一至週五 09:57 啟動（GitHub 常延遲幾分鐘，信大約 10:00～10:15 到）
+  workflow_dispatch:        # 手動觸發按鈕（盤中才有報價）
+
+jobs:
+  intraday:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests
+
+      - name: Run intraday check
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        run: |
+          python 盤中.py
