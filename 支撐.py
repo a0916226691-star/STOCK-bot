@@ -115,28 +115,22 @@ def run(send_mail=True):
         df["to_high"] = df["H1"] / df["close"] - 1
         df["to_low"] = df["close"] / df["L1"] - 1
         df["hold"] = df["L2"] / df["L1"] - 1
-        A = df[df.kind == "A"].sort_values("brk_days").head(TOP_N)
-        B = df[df.kind == "B"].sort_values("to_low").head(TOP_N)
+        B = df[df.kind == "B"].sort_values("to_low")
+        df = B
         df.to_csv(os.path.join(R.OUTPUT_DIR, f"support_{data_date}.csv"), index=False, encoding="utf-8-sig")
-        def fmt(x, a):
-            s = (f"{x['name']}({x['stock_id']})｜收盤 {x['close']:g}\n"
-                 f"   支撐區 {x['L1']:g}（{x['l1d']}前低）｜回檔低點 {x['L2']:g}（{x['l2d']}，{x['hold']*100:+.1f}%）\n"
-                 f"   壓力區 {x['H1']:g}（{x['h1d']}前高）")
-            if a: s += f"｜已突破 {int(x['brk_days'])} 天，站上前高 {(x['close']/x['H1']-1)*100:+.1f}%"
-            else: s += f"｜還差 {x['to_high']*100:.0f}% 到前高｜近5日震幅 {x['rng5']*100:.1f}%"
-            return s
-        body = (f"波段回測支撐掃描｜資料日 {data_date}（{ndays} 個交易日）\n\n━━━━━━━━━━━━\n"
-                f"🅱 回檔到前低、正在止跌盤整，還沒突破 {len(B)} 檔（尚未噴，離支撐近→優先）\n\n"
-                + ("\n\n".join(fmt(x, False) for _, x in B.iterrows()) or "（沒有）")
-                + f"\n\n━━━━━━━━━━━━\n🅰 已經突破前高 {len(A)} 檔（確認趨勢延續，剛突破的在前）\n\n"
-                + ("\n\n".join(fmt(x, True) for _, x in A.iterrows()) or "（沒有）")
+        def fmt(x):
+            return (f"{x['name']}({x['stock_id']})｜收盤 {x['close']:g}\n"
+                    f"   支撐區 {x['L1']:g}（{x['l1d']}前一次波段低點）｜這次回檔低點 {x['L2']:g}（{x['l2d']}，{x['hold']*100:+.1f}%）\n"
+                    f"   前高壓力區 {x['H1']:g}（{x['h1d']}）｜還差 {x['to_high']*100:.0f}%｜近5日震幅 {x['rng5']*100:.1f}%")
+        body = (f"支撐回檔掃描｜資料日 {data_date}（{ndays} 個交易日）\n"
+                f"股價回到前一次波段低點附近、沒有有效跌破、正在止跌盤整，之後有機會再挑戰前高：共 {len(B)} 檔（離支撐越近越前面）\n\n━━━━━━━━━━━━\n"
+                + ("\n\n".join(fmt(x) for _, x in B.iterrows()) or "（沒有）")
                 + "\n\n━━━━━━━━━━━━\n【怎麼看】\n支撐區＝前一次波段低點；壓力區＝前一次波段高點。\n"
-                  "條件：前低→漲 15% 以上到前高→回到前低上方 5% 內→收盤沒有跌破前低 3% 以上→低點後至少築底 3 天。\n"
-                  "B 還要：最近5日震幅 ≤7%、離前高還有 8% 以上空間。A：收盤已站上前高。\n"
-                  "停損參考：收盤跌破支撐區（前低 −3%）就代表失敗。只用日K價格，不含產業與法人面；僅供參考。")
+                  "條件：前低→漲15%以上到前高→回到前低上方5%內→收盤沒有跌破前低3%以上→低點後至少築底3天→最近5日震幅7%以內→離前高還有8%以上空間。\n"
+                  "失敗訊號：收盤跌破支撐區（前低−3%）。只看日K價格，不含產業與法人面；僅供參考。")
     print(body)
     if send_mail and not df.empty:
-        R.send_email(f"支撐回測掃描 {data_date[5:].replace('-','/')}｜回檔{len(B)} 突破{len(A)}", body)
+        R.send_email(f"支撐回檔掃描 {data_date[5:].replace('-','/')}｜{len(B)}檔", body)
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--no-email", action="store_true")
