@@ -140,20 +140,21 @@ def make_flow_fn(inst, px):
         g = by.get(sid); out = None
         if g is not None:
             g = g[g["date"] <= d].tail(HIST_N)
-            if len(g) == HIST_N and g["date"].iloc[-1] == d:
+            if len(g) >= 5 and g["date"].iloc[-1] == d:
                 net = g["net"].to_numpy(float); st = 0
                 for x in net[::-1]:
                     if x < 0: st += 1
                     else: break
                 vs = np.array([float(vol.get((sid, x), 0) or 0) for x in g["date"]])
                 def rp(n): return (net[-n:].sum() / vs[-n:].sum() * 100) if vs[-n:].sum() else 0.0
-                out = dict(net5=float(net[-5:].sum()), streak=st, pct=rp(5), pct10=rp(10), pct20=rp(20))
+                out = dict(n=len(g), net5=float(net[-5:].sum()), streak=st, pct=rp(5), pct10=rp(10), pct20=rp(20))
         cache[k] = out
         return out
     return flow
 
 def loosened(flow):
     if not flow: return False
+    if LOOSE_MODE != "streak" and flow["n"] < HIST_N: return False
     if LOOSE_MODE == "streak": return flow["streak"] >= SELL_STREAK
     key = "pct10" if LOOSE_MODE == "cum10" else "pct20"
     return flow[key] < LOOSE_TH if LOOSE_TH >= 0 else flow[key] <= LOOSE_TH
@@ -194,7 +195,7 @@ def step_day(conn, d, closes, matches, dates, flow, breadth=None):
     for r in matches:
         sid = r["stock_id"]
         f0 = flow(sid, d)
-        if f0 is None or (LOOSE_MODE != "streak" and f0["pct20"] <= 0) or light(r["close"], r["L1"], r["H1"], f0)[0] != "🟢": continue   # 要有法人資料、而且當天是綠燈才算
+        if f0 is None or (LOOSE_MODE != "streak" and (f0["n"] < HIST_N or f0["pct20"] <= 0)) or light(r["close"], r["L1"], r["H1"], f0)[0] != "🟢": continue   # 要有法人資料、而且當天是綠燈才算
         busy = conn.execute("SELECT 1 FROM sr_track WHERE stock_id=? AND (status IN ('追蹤中','待賣黃','待賣紅') OR end_date>=?)", (sid, cool)).fetchone()
         if busy: continue
         conn.execute("INSERT OR REPLACE INTO sr_track VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
