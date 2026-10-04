@@ -1113,7 +1113,7 @@ def classify_setup(r):
     整理股：箱型來回、沒有方向，只列觀察，標出突破價與低接區"""
     none = ("", "", np.nan, np.nan)
     sid, c = str(r["stock_id"]), r["close"]
-    if sid in EXCLUDE_TOOL_STOCKS or r["hedge_dominant"] or c > MAX_PRICE or c < MIN_PRICE:
+    if sid in EXCLUDE_TOOL_STOCKS or sid.startswith("00") or r["hedge_dominant"] or c > MAX_PRICE or c < MIN_PRICE:
         return none
     if not r["turnover"] >= MIN_DAILY_TURNOVER:
         return none
@@ -1863,7 +1863,7 @@ def fmt_now(c):
     return t
 
 
-SETUP_SHORT = {"BREAKOUT": "突破", "PULLBACK": "低接", "ACCUM": "佈局"}
+SETUP_SHORT = {"BREAKOUT": "突破", "PULLBACK": "低接", "ACCUM": "佈局", "REBOUND": "回補"}
 
 
 def stock_block(r, sid=None, target=False, kind=False):
@@ -1941,8 +1941,91 @@ def plan_text(r):
             f"\n預計持有：{p['days']}")
 
 
-def build_simple_email(radar, data_date, holdings):
+# ───────────────────────── 長線追蹤：法人賣到快沒貨 → 等法人回來 ─────────────────────────
+LT_MIN_PEAK = 5.0          # 外資持股高點至少此 %（本來就沒什麼外資的股票不算）
+LT_MIN_DROP = 0.5          # 外資持股從高點減少至少此比例（0.5＝賣掉一半以上）
+LT_MIN_PRICE_DD = 30.0     # 股價離一年高點至少跌了此 %
+LT_MIN_DAYS = 120          # 至少要有幾天外資持股資料才判斷
+LT_MAX_N = 15              # 信裡最多列幾檔
+LT_BACK_BUYDAYS = 3        # 法人回來：近 5 天至少幾天買超
+LT_OFF_LOW_PCT = 3.0       # 法人回來：股價要比近 20 天最低收盤高出此 %（不再創新低）
+
+
+def build_longtrack(radar):
+    """回傳長線追蹤名單 DataFrame：stock_id, stock_name, close, qfii_now, qfii_peak, lt_light, lt_text, ...。"""
+    cols = ["stock_id", "stock_name", "close", "qfii_now", "qfii_peak", "lt_light", "lt_text", "lt_order", "drop_rel"]
+    fh = load_table("foreign_hold", 400)
+    if fh.empty:
+        print("長線追蹤：還沒有外資持股資料（需要先回補）")
+        return pd.DataFrame(columns=cols)
+    fh = fh.sort_values(["stock_id", "date"])
+    px = load_table("prices", 400)
+    px = px[px["market"] == "TWSE"].sort_values(["stock_id", "date"])
+    inst = load_table("institutional", 45)
+    inst["net"] = pd.to_numeric(inst["foreign_net"], errors="coerce").fillna(0) + pd.to_numeric(inst["trust_net"], errors="coerce").fillna(0)
+    inst = inst.sort_values(["stock_id", "date"])
+    trust_all = load_table("institutional", 400)
+    trust_cum = trust_all.groupby("stock_id")["trust_net"].sum() if not trust_all.empty else pd.Series(dtype=float)
+    rows = radar.drop_duplicates("stock_id").set_index("stock_id")
+    pg = {k: g for k, g in px.groupby("stock_id")}
+    ig = {k: g for k, g in inst.groupby("stock_id")}
+    out = []
+    for sid, g in fh.groupby("stock_id"):
+        if sid not in rows.index or sid in EXCLUDE_TOOL_STOCKS or sid.startswith("00") or len(g) < LT_MIN_DAYS:
+            continue
+        r = rows.loc[sid]
+        c = float(r["close"])
+        if c < MIN_PRICE or not r.get("turnover", 0) >= MIN_DAILY_TURNOVER:
+            continue
+        q = g["qfii_ratio"].astype(float).tail(250).to_numpy()
+        peak, now = float(np.nanmax(q)), float(q[-1])
+        if peak < LT_MIN_PEAK or now > peak * (1 - LT_MIN_DROP):
+            continue                                            # 外資沒賣掉一半以上
+        p = pg.get(sid)
+        if p is None or len(p) < 60:
+            continue
+        cl = pd.to_numeric(p["close"], errors="coerce").tail(250).to_numpy()
+        if c > np.nanmax(cl) * (1 - LT_MIN_PRICE_DD / 100):
+            continue                                            # 股價沒跌一大段
+        if sid in trust_cum.index and trust_cum[sid] > 0:
+            continue                                            # 投信不是在賣
+        chg5 = now - (float(q[-6]) if len(q) >= 6 else now)
+        i5 = ig.get(sid)
+        last5 = i5["net"].tail(5) if i5 is not None else pd.Series(dtype=float)
+        net5, buy5 = float(last5.sum()), int((last5 > 0).sum())
+        off_low = c > np.nanmin(cl[-20:]) * (1 + LT_OFF_LOW_PCT / 100)
+        if net5 > 0 and buy5 >= LT_BACK_BUYDAYS and chg5 > 0 and off_low:
+            light, text, order = "🟢", "法人回來了", 0
+        elif net5 < 0 or chg5 < -0.1:
+            light, text, order = "🔴", "還在賣", 2
+        else:
+            light, text, order = "🟡", "賣壓停了，等法人回來", 1
+        out.append({"stock_id": sid, "stock_name": r["stock_name"], "close": c, "qfii_now": now, "qfii_peak": peak,
+                    "lt_light": light, "lt_text": text, "lt_order": order, "drop_rel": 1 - now / peak})
+    df = pd.DataFrame(out, columns=cols)
+    if not df.empty:
+        df = df.sort_values(["lt_order", "drop_rel"], ascending=[True, False]).reset_index(drop=True)
+    print(f"長線追蹤：{len(df)} 檔｜" + str(df["lt_light"].value_counts().to_dict() if not df.empty else {}))
+    return df
+
+
+def longtrack_buys(radar, track):
+    """長線追蹤裡亮🟢（法人回來了）、而且當天法人燈號也是🟢的 → 列可買，類型「回補」。"""
+    if track is None or track.empty:
+        return radar.iloc[0:0]
+    ids = set(track.loc[track["lt_light"] == "🟢", "stock_id"])
+    b = radar[radar["stock_id"].isin(ids)].drop_duplicates("stock_id").copy()
+    b = b[b.apply(lambda r: inst_light(r).startswith("🟢"), axis=1)] if not b.empty else b
+    b["setup"] = "REBOUND"
+    return b
+
+
+def build_simple_email(radar, data_date, holdings, track=None):
     _, buys, watches = select_picks(radar)      # 第一根候選只存進紀錄（算勝率用），不寫進信裡
+    rb = longtrack_buys(radar, track)                                        # 長線追蹤 → 法人回來了 → 可買（回補）
+    if not rb.empty:
+        rb = rb[~rb["stock_id"].isin(set(buys["stock_id"]))]
+        buys = pd.concat([rb, buys], ignore_index=True)
     rows = radar.drop_duplicates("stock_id").set_index("stock_id")
     parts = ["法人動態：🟢 買進　🟡 持有　🔴 賣出"]
 
@@ -1957,6 +2040,15 @@ def build_simple_email(radar, data_date, holdings):
         parts.append("今天沒有")
     for r, _ in watches:
         parts.append("\n" + stock_block(r))
+
+    if track is not None and not track.empty:
+        t = track.head(LT_MAX_N)
+        parts.append(f"\n\n【長線追蹤】{len(track)} 檔（法人賣到快沒貨，等法人回來，只看不買）")
+        for _, x in t.iterrows():
+            parts.append(f"\n股票代號：{x['stock_name']}({x['stock_id']})\n"
+                         f"目前價格：{fmt_now(float(x['close']))}\n"
+                         f"外資持股：{x['qfii_now']:.1f}%（高點 {x['qfii_peak']:.1f}%）\n"
+                         f"法人動態：{x['lt_light']} {x['lt_text']}")
 
     n_sell = 0
     parts.append(f"\n\n【我的持股】{len(holdings)} 檔")
@@ -2051,7 +2143,21 @@ def run(send_mail=True, collect_only=False):
         save_picks(radar, data_date)
     except Exception as e:
         print(f"存推薦紀錄失敗（不影響寄信）：{e}")
-    body, n_buy, n_watch, n_sell = build_simple_email(radar, data_date, holdings)
+    try:
+        track = build_longtrack(radar)
+        if not track.empty:
+            track.to_csv(os.path.join(OUTPUT_DIR, f"longtrack_{data_date}.csv"), index=False, encoding="utf-8-sig")
+            rb = longtrack_buys(radar, track)
+            if not rb.empty:
+                with db() as conn:
+                    conn.executemany("INSERT OR REPLACE INTO picks (date, stock_id, stock_name, grp, close, note) "
+                                     "VALUES (?,?,?,?,?,?)",
+                                     [(data_date, x["stock_id"], x["stock_name"], "C回補", float(x["close"]), "")
+                                      for _, x in rb.iterrows()])
+    except Exception as e:
+        print(f"長線追蹤失敗（不影響寄信）：{e}")
+        track = None
+    body, n_buy, n_watch, n_sell = build_simple_email(radar, data_date, holdings, track)
     print("\n===== 信件內容 =====\n" + body)
     if send_mail:
         md = f"{int(data_date[5:7])}/{data_date[8:]}"
