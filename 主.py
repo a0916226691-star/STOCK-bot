@@ -823,6 +823,9 @@ def make_price_features(full):
     df["chg_1d"] = (close / prev_close - 1) * 100
     low60 = close.groupby(key).rolling(60, min_periods=20).min().reset_index(level=0, drop=True)
     df["runup60"] = (close / low60 - 1) * 100                              # 離 60 日最低點已經漲了幾 %
+    hi_s = pd.to_numeric(df["high"], errors="coerce").fillna(close) if "high" in df.columns else close
+    df["res30"] = hi_s.groupby(key).rolling(30, min_periods=10).max().reset_index(level=0, drop=True)   # 近 30 日最高點＝上方壓力
+    df["room_pct"] = (df["res30"] / close - 1) * 100                       # 離壓力還有幾 %
 
     # 前 20 日（不含今天）的高低點：用來判斷盤整與突破
     df["prev_high20"] = grp_roll(prev_close, key, 20, "max")
@@ -920,7 +923,7 @@ INST_COST_MIN_DAYS = 2     # 至少要有幾天買超才算得出成本
 def make_inst_cost(inst, prices):
     """法人（投信＋外資）近 INST_COST_DAYS 天的平均買進成本。
     只算「當天土洋合計是買超」的日子，用當天均價（(高+低+收)/3，沒有高低價就用收盤）乘買超張數做加權平均。"""
-    cols = ["stock_id", "inst_cost", "inst_cost_days", "inst_1d", "inst_3d", "inst_sell_streak"]
+    cols = ["stock_id", "inst_cost", "inst_cost_days", "inst_1d", "inst_3d", "inst_sell_streak", "inst_20d", "inst_buydays10"]
     if inst is None or inst.empty or prices is None or prices.empty:
         return pd.DataFrame(columns=cols)
     i = inst.drop_duplicates(["date", "stock_id"], keep="last").copy()
@@ -951,6 +954,12 @@ def make_inst_cost(inst, prices):
         return n
     flow = recent.groupby("stock_id")["net"].agg(inst_1d="last", inst_3d="sum",
                                                  inst_sell_streak=lambda x: streak(list(x))).reset_index()
+    w20 = i[i.groupby("stock_id").cumcount(ascending=False) < 20]
+    w10 = i[i.groupby("stock_id").cumcount(ascending=False) < 10]
+    longer = (w20.groupby("stock_id")["net"].sum().rename("inst_20d").to_frame()
+              .join(w10.assign(b=(w10["net"] > 0).astype(int)).groupby("stock_id")["b"].sum().rename("inst_buydays10"))
+              .reset_index())
+    flow = flow.merge(longer, on="stock_id", how="left")
     g = flow.merge(g, on="stock_id", how="left")
     print(f"法人成本：{int(g['inst_cost'].notna().sum())} 檔算得出來（近 {INST_COST_DAYS} 個交易日）")
     return g[cols]
@@ -1129,7 +1138,8 @@ def build_radar(price_feat, inst_feat, holder_feat=None, margin_feat=None):
     df["rank"] = df["signal_key"].map(SIGNAL_RANK)
     df["tech"] = df.apply(tech_text, axis=1)
     for c in ("rel_strength", "ma20_slope5", "k9", "k9_prev", "box_top", "box_bottom", "box_pos", "prev_high60",
-              "inst_cost", "inst_1d", "inst_3d", "inst_sell_streak"):
+              "inst_cost", "inst_1d", "inst_3d", "inst_sell_streak", "inst_20d", "inst_buydays10",
+              "room_pct", "res30"):
         if c not in df.columns:
             df[c] = np.nan
     for c in ("is_box", "new_high20", "new_high60"):
@@ -1579,6 +1589,9 @@ WATCH_MAX_N = 8            # 觀察最多列幾檔
 TARGET_MIN_PCT = 8.0       # 目標價至少 +8%
 TARGET_MAX_PCT = 10.0      # 目標價最多 +10%
 MAX_RUNUP_PCT = 20.0       # 可買：離 60 日最低點最多漲了此 %（漲太多＝肉不多了）
+MIN_ROOM_PCT = 5.0         # 可買：離近 30 日最高點（壓力）至少還有此 % 空間；太近改列觀察「站上再買」
+INST20_MIN_BUY = 0         # 可買：法人近 20 日累計要是買超（不能只看 5 天）
+INST10_MIN_DAYS = 6        # 可買：法人近 10 天至少幾天買超（穩定在買，不是買賣交錯）
 MIN_RUNUP_PCT = 5.0        # 可買：離 60 日最低點至少彈上來此 %（確認已經離開低點，不是還在破底）
 SETUP_ORDER = {"ACCUM": 0, "PULLBACK": 1, "BREAKOUT": 2}   # 可買排序：佈局最前（最早上車）
 INST_COST_MAX_GAP = 5.0    # 現價離法人成本超過此 % → 不列可買，改列觀察「等拉回法人成本」
@@ -1653,6 +1666,10 @@ def pick_buys(radar):
     b = b[b.apply(lambda r: inst_light(r).startswith("🟢"), axis=1)] if not b.empty else b   # 可買一定要法人🟢買進
     if not b.empty and "runup60" in b.columns:
         b = b[~(b["runup60"] > MAX_RUNUP_PCT) & ~(b["runup60"] < MIN_RUNUP_PCT)]   # 離低點 +5%～+20% 才列可買
+    if not b.empty:
+        b = b[~(b["inst_20d"] <= INST20_MIN_BUY) & ~(b["inst_buydays10"] < INST10_MIN_DAYS)]   # 法人真的在回補
+        near = (b["setup"] != "BREAKOUT") & (b["room_pct"] < MIN_ROOM_PCT)                   # 壓力太近（突破型已站上，不算）
+        b = b[~near]
     if b.empty:
         return b
     b["_force"] = (b["trust_5d"] + b["foreign_5d"]) / b["avg_vol_5d"].where(b["avg_vol_5d"] > 0)
@@ -1674,6 +1691,9 @@ def pick_watches(radar, buy_ids):
     box = radar[(radar["setup"] == "BOX") & (radar["box_pos"] <= 30)].sort_values("box_pos")
     for _, r in box.iterrows():
         out.append((r, f"整理中，帶量站上 {fmt_p(to_tick(float(r['box_top']), True))} 再買"))
+    near = radar[radar["setup"].isin(["ACCUM", "PULLBACK"]) & (radar["room_pct"] < MIN_ROOM_PCT)]
+    for _, r in near.iterrows():
+        out.insert(0, (r, f"壓力 {fmt_p(to_tick(float(r['res30']), True))} 太近，站上再買"))
     out = [x for x in out if not inst_light(x[0]).startswith("🔴")]      # 法人在賣的不列觀察
     return [x for x in out if x[0]["stock_id"] not in buy_ids][:WATCH_MAX_N]
 
