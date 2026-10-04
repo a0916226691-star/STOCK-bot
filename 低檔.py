@@ -5,7 +5,7 @@ import importlib, os, sys, argparse
 import numpy as np, pandas as pd
 R = importlib.import_module("主")
 
-MIN_LOT_PRICE = float(os.getenv("LOW_MIN_PRICE", 300))   # 一張30萬以上
+MIN_LOT_PRICE = float(os.getenv("LOW_MIN_PRICE", 100))   # 一張10萬以上（股價≥100）
 MIN_DROP   = float(os.getenv("LOW_MIN_DROP", 0.35))      # 高點到最低點至少跌 35%
 NEAR_LOW   = float(os.getenv("LOW_NEAR", 0.10))          # 現價在最低點上方 12% 內
 MIN_AGE    = int(os.getenv('LOW_MIN_AGE', 0))               # 最低點可以是今天（像金像電 705 當天就長下影線反彈）
@@ -87,7 +87,7 @@ def run(send_mail=True):
     else:
         df = df.sort_values("above").head(TOP_N)
         df.to_csv(os.path.join(R.OUTPUT_DIR, f"lowzone_{data_date}.csv"), index=False, encoding="utf-8-sig")
-        body = (f"低檔止跌掃描｜資料日 {data_date}\n曾經大跌、現在剛好在最近 6 個月（約 120 個交易日）最低點附近的股票：共 {len(df)} 檔（一張30萬以上，離最低點越近越前面）\n\n━━━━━━━━━━━━\n"
+        body = (f"低檔止跌掃描｜資料日 {data_date}\n曾經大跌、現在剛好在最近 6 個月（約 120 個交易日）最低點附近的股票：共 {len(df)} 檔（一張10萬以上，離最低點越近越前面）\n\n━━━━━━━━━━━━\n"
                 + "\n\n".join(fmt(x) for _, x in df.iterrows())
                 + "\n\n━━━━━━━━━━━━\n【怎麼看】\n條件：最近 120 個交易日的最低點之前的高點到最低點跌了 35% 以上；現在價格在最低點上方 10% 內（最低點可以是今天或剛過幾天）。\n"
                   "法人只是參考，沒有拿來篩選：看外資、投信近 20 日累計買賣超占成交量的 %，和前 20 日比是變多（↗）還是變少（↘）；以及自最低點以來累計買賣超幾張。\n"
