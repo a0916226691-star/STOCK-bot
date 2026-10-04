@@ -144,19 +144,61 @@ def step_day(conn, d, closes, matches, dates):
 
 def pct(a, b): return (a / b - 1) * 100
 
-def build_body(conn, data_date, new_today, ndays):
+NEAR_HIGH = 0.05     # 離前高 5% 內＝接近前高
+LEAVE_PCT = 2.0      # 近5日法人淨賣超占成交量 2% 以上＝資金撤離
+def inst_flow(inst, px, ids):
+    """每檔：近5日法人（外資＋投信）淨買賣超、連續淨賣超天數、占近5日成交量%"""
+    out = {}
+    if inst is None or inst.empty: return out
+    inst = inst.copy(); inst["date"] = inst["date"].astype(str)
+    inst["net"] = inst["foreign_net"].fillna(0) + inst["trust_net"].fillna(0)
+    vol = px.set_index(["stock_id", "date"])["volume"]
+    for sid, g in inst[inst["stock_id"].isin(ids)].groupby("stock_id"):
+        g = g.sort_values("date").tail(5)
+        if len(g) < 3: continue
+        v = float(sum(vol.get((sid, d), 0) or 0 for d in g["date"]))
+        net = g["net"].to_numpy(float)
+        streak = 0
+        for x in net[::-1]:
+            if x < 0: streak += 1
+            else: break
+        out[sid] = dict(net5=float(net.sum()), streak=streak, pct=(net.sum() / v * 100) if v else 0.0, n=len(g))
+    return out
+
+def light(last, L1, H1, flow):
+    """回傳 (燈號, 原因)"""
+    leave = bool(flow) and flow["net5"] < 0 and (flow["streak"] >= 3 or flow["pct"] <= -LEAVE_PCT)
+    if last < L1 * 0.995 or (leave and last <= L1 * 1.08):
+        why = "收盤已跌到支撐下方，要小心是假支撐" if last < L1 * 0.995 else "在支撐區但法人在賣，可能是假支撐"
+        return "🔴", why
+    if leave:
+        return "🔴", "法人在賣，上漲可能沒有資金撐（假突破風險）"
+    if last >= H1 * (1 - NEAR_HIGH):
+        return "🟡", "接近前高，法人沒有撤離，有機會突破" if flow else "接近前高（法人資料不足）"
+    if last <= L1 * 1.08:
+        return "🟢", "在低點位置盤整，法人沒有撤離" if flow else "在低點位置盤整（法人資料不足）"
+    return "⚪", "在支撐與前高中間，沒有明確訊號"
+
+def build_body(conn, data_date, new_today, ndays, flows):
     tr = pd.read_sql("SELECT * FROM sr_track", conn)
     opn = tr[tr.status == "追蹤中"].sort_values("first_date", ascending=False)
     done = tr[tr.status != "追蹤中"]
+    for df_ in (opn,):
+        df_["lt"] = [light(r.last_px, r.support, r.resist, flows.get(r.stock_id)) for r in df_.itertuples()]
+    order = {"🟢": 0, "🟡": 1, "⚪": 2, "🔴": 3}
+    opn = opn.assign(_o=[order[a] for a, _ in opn["lt"]]).sort_values(["_o", "first_date"], ascending=[True, False])
+    cnt = {k: sum(1 for a, _ in opn["lt"] if a == k) for k in order}
     def line_open(x):
-        return (f"{x['stock_name']}({x['stock_id']})｜進榜 {x['first_date'][5:]} 價 {x['entry_px']:g} → 現價 {x['last_px']:g}（{pct(x['last_px'], x['entry_px']):+.1f}%，第 {x['days']} 天）\n"
-                f"   支撐區 {x['support']:g}（再跌破 {x['support']*(1-BREAK_LO):.4g} 收盤＝失敗）｜前高壓力區 {x['resist']:g}（還差 {pct(x['resist'], x['last_px']):.0f}%）")
+        return (f"{x['lt'][0]} {x['stock_name']}({x['stock_id']})｜進榜 {x['first_date'][5:]} 價 {x['entry_px']:g} → 現價 {x['last_px']:g}（{pct(x['last_px'], x['entry_px']):+.1f}%，第 {x['days']} 天）\n"
+                f"   {x['lt'][1]}\n"
+                f"   支撐區 {x['support']:g}（收盤跌破 {x['support']*(1-BREAK_LO):.4g}＝失敗）｜前高壓力區 {x['resist']:g}（還差 {pct(x['resist'], x['last_px']):.0f}%）")
     def line_done(x):
         icon = {"成功": "✅", "失敗": "❌", "逾期": "⏱"}[x["status"]]
         return (f"{icon}{x['stock_name']}({x['stock_id']})｜{x['first_date'][5:]} 進榜價 {x['entry_px']:g} → {x['end_date'][5:]} {x['end_px']:g}"
                 f"（{pct(x['end_px'], x['entry_px']):+.1f}%，{x['status']}，{x['days']} 天）")
     def fmt_new(x):
-        return (f"{x['name']}({x['stock_id']})｜收盤 {x['close']:g}\n"
+        lt = light(x['close'], x['L1'], x['H1'], flows.get(x['stock_id']))
+        return (f"{lt[0]} {x['name']}({x['stock_id']})｜收盤 {x['close']:g}\n   {lt[1]}\n"
                 f"   支撐區 {x['L1']:g}（{x['l1d']}前一次波段低點）｜這次回檔低點 {x['L2']:g}（{x['l2d']}）\n"
                 f"   前高壓力區 {x['H1']:g}（{x['h1d']}）｜還差 {pct(x['H1'], x['close']):.0f}%｜近5日震幅 {x['rng5']*100:.1f}%")
     recent = done[done.end_date >= str(sorted(tr["last_date"].unique())[-6] if tr["last_date"].nunique() > 6 else "")].sort_values("end_date", ascending=False)
@@ -170,12 +212,12 @@ def build_body(conn, data_date, new_today, ndays):
     else:
         score = "還沒有結案的股票（要等股價突破前高或跌破支撐才算結案）"
     sep = "\n\n━━━━━━━━━━━━\n"
-    return (f"支撐回檔掃描｜資料日 {data_date}（{ndays} 個交易日）\n追蹤中 {len(opn)} 檔｜今天新進 {len(new_today)} 檔｜一張30萬以上"
+    return (f"支撐回檔掃描｜資料日 {data_date}（{ndays} 個交易日）\n追蹤中 {len(opn)} 檔（🟢{cnt['🟢']} 🟡{cnt['🟡']} ⚪{cnt['⚪']} 🔴{cnt['🔴']}）｜今天新進 {len(new_today)} 檔｜一張30萬以上"
             + sep + f"🆕 今天新進榜 {len(new_today)} 檔（回到前低、止跌盤整）\n\n" + ("\n\n".join(fmt_new(x) for x in sorted(new_today, key=lambda r: r['close']/r['L1'])) or "（今天沒有新進）")
             + sep + f"📍 追蹤中 {len(opn)} 檔（尚未突破前高、也沒跌破支撐）\n\n" + ("\n\n".join(line_open(x) for _, x in opn.iterrows()) or "（沒有）")
             + sep + "🏁 最近結案\n\n" + ("\n".join(line_done(x) for _, x in recent.iterrows()) or "（最近沒有）")
             + sep + "📊 成績\n" + score
-            + sep + "【怎麼看】\n支撐區＝前一次波段低點；壓力區＝前一次波段高點。\n"
+            + sep + "【燈號】\n🟢 在低點位置（前低上方8%內）盤整，法人沒有撤離＝可留意買進\n🟡 接近前高（5%內），法人沒有撤離＝有機會突破前高\n🔴 資金撤離（近5日法人合計淨賣超，且連3天賣或賣超占成交量2%以上），或收盤跌到支撐下方＝可能假支撐／假突破，不要碰或要走\n⚪ 在支撐與前高中間，沒有明確訊號\n法人＝外資＋投信（上櫃股票的法人資料累積天數還少，不足時只看價格）。\n\n【怎麼看】\n支撐區＝前一次波段低點；壓力區＝前一次波段高點。\n"
               "進榜：前低→漲15%以上到前高→回到前低上方5%內→低點後築底3天以上→近5日震幅7%以內→離前高還有8%以上空間。\n"
               "結案：收盤站上前高＝成功；收盤跌破前低3%＝失敗；追蹤超過40個交易日沒結果＝逾期。\n"
               "第一次執行時，會用資料庫裡的歷史資料倒推模擬，所以成績一開始就有；之後每天自動追蹤。\n"
@@ -208,7 +250,9 @@ def run(send_mail=True, replay=None, reset=False):
             if d == data_date: new_today = new
             conn.execute("INSERT OR REPLACE INTO sr_meta VALUES ('last', ?)", (d,))
             conn.commit()
-        body = build_body(conn, data_date, new_today, len(dates))
+        ids = set(pd.read_sql("SELECT stock_id FROM sr_track WHERE status='追蹤中'", conn)["stock_id"]) | {r["stock_id"] for r in new_today}
+        flows = inst_flow(R.load_table("institutional", 20), px, ids)
+        body = build_body(conn, data_date, new_today, len(dates), flows)
         pd.read_sql("SELECT * FROM sr_track ORDER BY first_date DESC", conn).to_csv(
             os.path.join(R.OUTPUT_DIR, "support_track.csv"), index=False, encoding="utf-8-sig")
     print(body)
