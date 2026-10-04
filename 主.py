@@ -110,6 +110,7 @@ BIG_HOLDER_LEVEL = 15      # 持股分級 15 ＝ 1,000,001 股（1000 張）以�
 BIG_BUY_MIN_DELTA = 0.0    # 買進：千張大戶持股比例本週增減（百分點）要大於此；資料還不夠算增減時不擋
 BIG_SELL_DELTA = -0.5      # 賣出／放棄：千張大戶持股比例本週減少達此百分點（例如 -0.5 ＝ 減少 0.5 個百分點）
 HOLDER_COLS = ["date", "stock_id", "big_ratio", "big_people"]
+QFII_COLS = ["date", "stock_id", "qfii_ratio", "qfii_shares"]     # 外資及陸資持股比率（%）、持有股數
 
 QUOTE_COLS = ["date", "stock_id", "stock_name", "market", "close", "volume", "turnover", "high", "low"]
 INST_COLS = ["date", "stock_id", "foreign_net", "trust_net", "dealer_prop", "dealer_hedge", "dealer_total", "market"]
@@ -313,6 +314,8 @@ def init_db():
         conn.execute("CREATE TABLE IF NOT EXISTS picks (date TEXT, stock_id TEXT, stock_name TEXT, grp TEXT, "
                      "close REAL, note TEXT, PRIMARY KEY(date, stock_id, grp))")
         # 集保千張大戶持股（每週一筆）
+        conn.execute("CREATE TABLE IF NOT EXISTS foreign_hold (date TEXT, stock_id TEXT, qfii_ratio REAL, "
+                     "qfii_shares REAL, PRIMARY KEY(date, stock_id))")
         conn.execute("CREATE TABLE IF NOT EXISTS holders (date TEXT, stock_id TEXT, big_ratio REAL, "
                      "big_people INTEGER, PRIMARY KEY(date, stock_id))")
 
@@ -716,6 +719,79 @@ def make_holder_features(h):
     n_delta = int(last["big_delta"].notna().sum())
     print(f"千張大戶特徵：{len(last)} 檔｜可算週增減 {n_delta} 檔（資料日 {last['big_date'].max()}）")
     return last[cols]
+
+
+# ───────────────────────── 抓資料：外資持股比例（長線追蹤用） ─────────────────────────
+def fetch_twse_qfii(d):
+    """上市「外資及陸資投資持股統計」（指定日期 d=YYYYMMDD）。休市日回傳空表。"""
+    empty = pd.DataFrame(columns=QFII_COLS)
+    j = get_json("https://www.twse.com.tw/rwd/zh/fund/MI_QFIIS",
+                 {"response": "json", "date": d, "selectType": "ALLBUT0999"}, timeout=30)
+    if j.get("stat") != "OK":
+        return empty
+    fields, raw = find_table(j, ["證券代號"])
+    if not fields:
+        print("MI_QFIIS 找不到資料表，API 格式可能改了；回應欄位：", list(j.keys()))
+        return empty
+    c_ratio = next((f for f in fields if "持股比率" in f and "上限" not in f and "尚可" not in f), None)
+    c_shares = next((f for f in fields if "持有股數" in f), None)
+    if not c_ratio:
+        print("MI_QFIIS 找不到外資持股比率欄位；欄位：", fields)
+        return empty
+    date, rows = fmt_date(d), []
+    for r in raw:
+        it = dict(zip(fields, r))
+        sid = normalize_stock_id(it.get("證券代號", ""))
+        ratio = safe_float(it.get(c_ratio))
+        if is_stock_id(sid) and not pd.isna(ratio):
+            rows.append({"date": date, "stock_id": sid, "qfii_ratio": ratio,
+                         "qfii_shares": safe_float(it.get(c_shares)) if c_shares else np.nan})
+    return pd.DataFrame(rows, columns=QFII_COLS)
+
+
+def collect_qfii(max_days=6):
+    """每天補最近還沒存過的外資持股（最多 max_days 個交易日）。"""
+    got = 0
+    try:
+        with db() as conn:
+            have = {r[0] for r in conn.execute("SELECT DISTINCT date FROM foreign_hold")}
+        for d in recent_trading_days(10):
+            if got >= max_days:
+                break
+            if fmt_date(d) in have:
+                continue
+            q = fetch_twse_qfii(d)
+            if not q.empty:
+                upsert("foreign_hold", q, QFII_COLS)
+                got += 1
+            time.sleep(1.5)
+        print(f"外資持股：新增 {got} 天")
+    except Exception as e:
+        print(f"外資持股失敗：{e}")
+
+
+def backfill_qfii(days):
+    """回補外資持股比例：只補資料庫裡有上市行情、但還沒有外資持股的交易日。"""
+    cutoff = (now_tw() - timedelta(days=days)).strftime("%Y-%m-%d")
+    with db() as conn:
+        trade = [r[0] for r in conn.execute("SELECT DISTINCT date FROM prices WHERE market='TWSE' AND date >= ? "
+                                            "ORDER BY date DESC", (cutoff,))]
+        have = {r[0] for r in conn.execute("SELECT DISTINCT date FROM foreign_hold")}
+    todo = [d for d in trade if d not in have]
+    print(f"外資持股回補：{len(todo)} 個交易日要補")
+    fails = 0
+    for iso in todo:
+        try:
+            n = upsert("foreign_hold", fetch_twse_qfii(iso.replace("-", "")), QFII_COLS)
+            print(f"回補外資持股 {iso}：{n} 檔")
+            fails = 0
+        except Exception as e:
+            fails += 1
+            print(f"回補外資持股 {iso} 失敗：{e}")
+            if fails >= 5:
+                print("連續失敗 5 次，先停止（可能被擋），下次再補")
+                break
+        time.sleep(2.5)
 
 
 def collect_inst():
@@ -1937,6 +2013,7 @@ def run(send_mail=True, collect_only=False):
     margin = collect_margin()
     if not margin.empty:
         upsert("margin", margin, MARGIN_COLS)
+    collect_qfii()
     if collect_only:
         print("=== 只收資料完成（舊版訊號與信件已略過）===")
         return
@@ -1987,6 +2064,7 @@ def main():
     ap = argparse.ArgumentParser(description="台股雷達 v9.2")
     ap.add_argument("--backfill", type=int, default=0, metavar="N", help="先回補最近 N 個日曆天的上市行情與法人")
     ap.add_argument("--backfill-prices", type=int, default=0, metavar="N", help="只回補最近 N 個日曆天的上市股價（含高低價），不補法人與融資")
+    ap.add_argument("--backfill-qfii", type=int, default=0, metavar="N", help="回補最近 N 個日曆天的外資持股比例（長線追蹤用）")
     ap.add_argument("--no-email", action="store_true", help="不寄信")
     ap.add_argument("--collect-only", action="store_true", help="只收資料進資料庫，不跑舊版訊號與信件")
     args = ap.parse_args()
@@ -1996,6 +2074,9 @@ def main():
     if args.backfill_prices:
         init_db()
         backfill(args.backfill_prices, prices_only=True)
+    if args.backfill_qfii:
+        init_db()
+        backfill_qfii(args.backfill_qfii)
     run(send_mail=not args.no_email, collect_only=args.collect_only)
 
 
