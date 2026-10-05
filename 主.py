@@ -1863,7 +1863,8 @@ def fmt_now(c):
     return t
 
 
-SETUP_SHORT = {"BREAKOUT": "突破", "PULLBACK": "低接", "ACCUM": "佈局", "REBOUND": "回補"}
+SETUP_SHORT = {"BREAKOUT": "突破", "PULLBACK": "低接", "ACCUM": "佈局", "REBOUND": "回補",
+               "LT_ACCUM": "佈局（法人在底部一直買，先買一半）", "LT_BREAK": "噴出（帶量長紅；還沒買可以買，已佈局就加碼）"}
 
 
 def stock_block(r, sid=None, target=False, kind=False):
@@ -1956,6 +1957,8 @@ LT_BLACK_FADE_ATR = 2.0    # 大黑棒：或是「開高走低」，盤中最高
 LT_BLACK_VOL = 1.0         # 大黑棒：成交量不低於前 5 日均量（有人在倒，不是沒量的小跌）
 LT_MIN_DAYS = 80           # 至少要有幾天股價資料才判斷
 LT_MAX_N = 15              # 信裡最多列幾檔
+LT_ACCUM_DAYS = 7          # 🟢 佈局：法人近 10 天至少幾天買超（在底部一直買）
+LT_WATCH_DAYS = 5          # 🟡 法人開始買：近 10 天至少幾天買超
 
 
 def _swing(hi, lo, cl, atr):
@@ -2030,7 +2033,10 @@ def build_longtrack(radar):
         net = i5["net"].to_numpy() if i5 is not None else np.array([])
         inst_today = len(net) > 0 and net[-1] > 0
         inst3 = len(net) >= 3 and net[-3:].sum() > 0
-        inst10 = len(net) >= 10 and net[-10:].sum() > 0 and int((net[-10:] > 0).sum()) >= 6
+        bd10 = int((net[-10:] > 0).sum()) if len(net) >= 10 else 0
+        sum10 = float(net[-10:].sum()) if len(net) >= 10 else 0.0
+        accum = sum10 > 0 and bd10 >= LT_ACCUM_DAYS                # 法人在底部一直買
+        inst10 = sum10 > 0 and bd10 >= LT_WATCH_DAYS               # 法人開始買
         quiet = not inst_light(r).startswith("🔴")              # 沒有爆量上影、法人倒貨
         rebound = strong and d <= LT_REBOUND_DAYS               # 低點立即反彈
         breakout = strong and d > LT_REBOUND_DAYS and pd.notna(cons_high) and c > cons_high   # 整理後噴出
@@ -2038,11 +2044,13 @@ def build_longtrack(radar):
             continue                                            # 已經彈回一半以上、又不是「昨天還在低檔、今天噴出」：不是低檔了
         if (rebound or breakout) and room >= LT_MIN_ROOM and inst_today and inst3 and quiet:
             light, order = "🟢", 0
-            text = "低點立即反彈，可以買" if rebound else "整理後噴出一根，可以買"
+            text = "低點立即反彈，可以買" if rebound else "整理後噴出一根，可以買（已佈局就加碼）"
         elif (rebound or breakout) and room < LT_MIN_ROOM:
             light, text, order = "🔴", f"出長紅了但上面 {fmt_now(nearest)} 有壓力，空間不夠", 2
+        elif d >= 3 and accum and room >= LT_MIN_ROOM and quiet and c > L:
+            light, text, order = "🟢", "法人在底部一直買，可以先佈局（買一半）", 0
         elif d >= 3 and inst10 and room >= LT_MIN_ROOM:
-            light, text, order = "🟡", "低點整理、法人有撐，等長紅", 1
+            light, text, order = "🟡", "法人開始買，還不算一直買，再觀察", 1
         elif d >= 3 and inst10:
             light, text, order = "🔴", f"法人有撐但上面 {fmt_now(nearest)} 有壓力，空間不夠", 2
         elif d < 3:
@@ -2069,7 +2077,8 @@ def longtrack_buys(radar, track):
     ids = set(track.loc[track["lt_light"] == "🟢", "stock_id"])
     b = radar[radar["stock_id"].isin(ids)].drop_duplicates("stock_id").copy()
     b = b[b.apply(lambda r: inst_light(r).startswith("🟢"), axis=1)] if not b.empty else b
-    b["setup"] = "REBOUND"
+    kind = track.set_index("stock_id")["lt_text"].to_dict()
+    b["setup"] = b["stock_id"].map(lambda s: "LT_ACCUM" if "佈局" in kind.get(s, "") else "LT_BREAK")
     return b
 
 
@@ -2080,7 +2089,7 @@ def build_simple_email(radar, data_date, holdings, track=None):
     buys = longtrack_buys(radar, track)
     parts = ["法人動態：🟢 買進　🟡 持有／等待　🔴 賣出／繼續等"]
 
-    parts.append(f"\n【可買】{len(buys)} 檔（從高點下來、低點出現第一根帶量長紅、上面有空間、法人在買）")
+    parts.append(f"\n【可買】{len(buys)} 檔（從高點下來、低點整理，法人一直買或出現第一根長紅，上面有空間）")
     if buys.empty:
         parts.append("今天沒有，耐心等")
     for _, r in buys.iterrows():
