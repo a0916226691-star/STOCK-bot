@@ -1951,7 +1951,9 @@ LT_CANDLE_ATR = 1.0        # 🟢 長紅：今天漲幅至少 1 倍 ATR，而且
 LT_CANDLE_POS = 0.6        # 長紅收盤位置：0＝最低、1＝最高
 LT_BREAK_VOL = 1.5         # 🟢 長紅要帶量：成交量至少是前 5 日均量的此倍數
 LT_MIN_ROOM = 8.0          # 🟢 上面空間：離前高、離最近的大黑棒至少此 %
-LT_BLACK_ATR = 1.5         # 大黑棒：單日跌幅至少 1.5 倍 ATR、而且帶量
+LT_BLACK_ATR = 1.2         # 大黑棒：單日跌幅（收盤對收盤）至少 1.2 倍 ATR
+LT_BLACK_FADE_ATR = 2.0    # 大黑棒：或是「開高走低」，盤中最高到收盤跌了 2 倍 ATR 以上
+LT_BLACK_VOL = 1.0         # 大黑棒：成交量不低於前 5 日均量（有人在倒，不是沒量的小跌）
 LT_MIN_DAYS = 80           # 至少要有幾天股價資料才判斷
 LT_MAX_N = 15              # 信裡最多列幾檔
 
@@ -2010,8 +2012,10 @@ def build_longtrack(radar):
         d = n - 1 - k                                           # 低點是幾天前
         # 頭上的壓力：前高、以及下跌途中「大黑棒」的收盤價（套牢區）
         res = [H]
-        for j in range(h + 1, n - 1):
-            if (cl[j] - cl[j - 1]) <= -LT_BLACK_ATR * atr and vol[j] >= 1.5 * np.nanmean(vol[max(0, j - 5):j]):
+        for j in range(max(1, h - 3), n - 1):                   # 高點附近（含高點前幾天）到昨天的大黑棒
+            big_drop = (cl[j] - cl[j - 1]) <= -LT_BLACK_ATR * atr
+            fade = (hi[j] - cl[j]) >= LT_BLACK_FADE_ATR * atr and cl[j] < cl[j - 1]
+            if (big_drop or fade) and vol[j] >= LT_BLACK_VOL * np.nanmean(vol[max(0, j - 5):j]):
                 res.append(float(cl[j - 1]))                    # 大黑棒的上緣（前一天收盤）＝套牢的人成本
                 res.append(float(cl[j]))
         above = [x for x in res if x > c]
