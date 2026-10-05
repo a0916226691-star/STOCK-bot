@@ -2007,7 +2007,8 @@ def build_longtrack(radar):
         net5, buy5 = float(last5.sum()), int((last5 > 0).sum())
         hi = pd.to_numeric(p["high"], errors="coerce").fillna(pd.to_numeric(p["close"], errors="coerce")).to_numpy()
         lo = pd.to_numeric(p["low"], errors="coerce").fillna(pd.to_numeric(p["close"], errors="coerce")).to_numpy()
-        bottom, bottom_age = float(lw[kk]), age                                 # 底部＝半年新低、幾天前出現
+        bottom_age = age                                                        # 半年新低是幾天前出現的
+        bottom = float(np.nanmin(lo[-LT_BASE_DAYS:]))                           # 底部價格＝最近這一波築底的低點（近 20 天最低）
         base_high = float(np.nanmax(hi[-LT_BASE_DAYS - 1:-1]))                  # 近 20 天（不含今天）最高價
         lastw = i5["net"].tail(LT_BUY_WINDOW) if i5 is not None else pd.Series(dtype=float)
         q_up = len(q) > LT_BUY_WINDOW and now > float(q[-LT_BUY_WINDOW - 1])     # 外資持股比 10 天前高
