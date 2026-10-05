@@ -1952,7 +1952,7 @@ LT_BUY_WINDOW = 10         # 🟡 法人一直買：看最近幾天
 LT_BACK_BUYDAYS = 7        # 🟡 法人一直買：近 10 天至少幾天買超（不賣了不算，買賣交錯也不算）
 LT_BOTTOM_DAYS = 60        # 底部＝近 60 個交易日的最低價
 LT_BOTTOM_HOLD = 10        # 🟡 底部守住：最低點至少是此天數以前出現的，而且之後沒再跌破
-LT_BASE_DAYS = 20          # 🟢 噴出：收盤站上近 20 天（不含今天）的最高價
+LT_BASE_DAYS = 20          # 底部價格＝近 20 天最低；🟢 噴出：收盤站上「谷底之後整個築底區」的最高價
 LT_BREAK_VOL = 1.5         # 🟢 噴出：成交量至少是前 5 日均量的此倍數
 
 
@@ -2009,7 +2009,8 @@ def build_longtrack(radar):
         lo = pd.to_numeric(p["low"], errors="coerce").fillna(pd.to_numeric(p["close"], errors="coerce")).to_numpy()
         bottom_age = age                                                        # 半年新低是幾天前出現的
         bottom = float(np.nanmin(lo[-LT_BASE_DAYS:]))                           # 底部價格＝最近這一波築底的低點（近 20 天最低）
-        base_high = float(np.nanmax(hi[-LT_BASE_DAYS - 1:-1]))                  # 近 20 天（不含今天）最高價
+        since = hi_all[-LT_LOW_WINDOW:][kk + 1:-1]                              # 谷底之後到昨天
+        base_high = float(np.nanmax(since)) if len(since) else float(np.nanmax(hi[-LT_BASE_DAYS - 1:-1]))   # 噴出價格＝整個築底區的天花板
         lastw = i5["net"].tail(LT_BUY_WINDOW) if i5 is not None else pd.Series(dtype=float)
         q_up = len(q) > LT_BUY_WINDOW and now > float(q[-LT_BUY_WINDOW - 1])     # 外資持股比 10 天前高
         buying = (len(lastw) >= LT_BUY_WINDOW and int((lastw > 0).sum()) >= LT_BACK_BUYDAYS
