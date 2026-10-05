@@ -2006,8 +2006,7 @@ def build_longtrack(radar):
         if H <= L:
             continue
         retr = (c - L) / (H - L)
-        if retr > LT_MAX_RETRACE:
-            continue                                            # 已經彈回一半以上：不是低檔了
+        retr_prev = (cl[-2] - L) / (H - L)                      # 昨天還在不在低檔
         d = n - 1 - k                                           # 低點是幾天前
         # 頭上的壓力：前高、以及下跌途中「大黑棒」的收盤價（套牢區）
         res = [H]
@@ -2022,7 +2021,7 @@ def build_longtrack(radar):
         rng = hi[-1] - lo[-1]
         strong = (cl[-1] - cl[-2] >= LT_CANDLE_ATR * atr and rng > 0 and (cl[-1] - lo[-1]) / rng >= LT_CANDLE_POS
                   and vol[-1] >= LT_BREAK_VOL * np.nanmean(vol[-6:-1]))
-        cons_high = float(np.nanmax(hi[k + 1:-1])) if d >= 2 else np.nan   # 低點之後的整理區高點（不含今天）
+        cons_high = float(np.nanmax(cl[k + 1:-1])) if d >= 2 else np.nan   # 噴出價格＝低點之後整理區的最高收盤（不含今天；上影線不算站穩）
         i5 = ig.get(sid)
         net = i5["net"].to_numpy() if i5 is not None else np.array([])
         inst_today = len(net) > 0 and net[-1] > 0
@@ -2031,6 +2030,8 @@ def build_longtrack(radar):
         quiet = not inst_light(r).startswith("🔴")              # 沒有爆量上影、法人倒貨
         rebound = strong and d <= LT_REBOUND_DAYS               # 低點立即反彈
         breakout = strong and d > LT_REBOUND_DAYS and pd.notna(cons_high) and c > cons_high   # 整理後噴出
+        if retr > LT_MAX_RETRACE and not ((rebound or breakout) and retr_prev <= LT_MAX_RETRACE):
+            continue                                            # 已經彈回一半以上、又不是「昨天還在低檔、今天噴出」：不是低檔了
         if (rebound or breakout) and room >= LT_MIN_ROOM and inst_today and inst3 and quiet:
             light, order = "🟢", 0
             text = "低點立即反彈，可以買" if rebound else "整理後噴出一根，可以買"
