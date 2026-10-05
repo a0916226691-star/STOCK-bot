@@ -1942,107 +1942,117 @@ def plan_text(r):
 
 
 # ───────────────────────── 長線追蹤：法人賣到快沒貨 → 等法人回來 ─────────────────────────
-LT_LOW_WINDOW = 120        # 一路下跌：股價跌到近 120 個交易日（約半年）的新低
-LT_LOW_RECENT = 60         # 這個新低要是最近 60 個交易日內出現的（正在這一輪）
-LT_MAX_RETRACE = 0.5       # 還在低檔：從谷底彈回的幅度，不超過「下跌幅度」的一半（跟著每檔自己的跌幅算，不設固定 %）
-LT_PRE_BOUNCE = 20         # 還沒跑掉：股價還沒漲回「低點之前 20 天」的最高點（下跌途中最後一波反彈高點）
-LT_MIN_DAYS = 120          # 至少要有幾天股價資料才判斷
+LT_PIVOT_WIN = 10          # 波段高點：前後 10 天內最高的那一天
+LT_PEAK_RECENT = 60        # 這個高點要是最近 60 個交易日內的（這一輪剛下來）
+LT_MIN_ATR_DROP = 4.0      # 從高點下來的幅度至少是平常日波動（ATR）的此倍數，才算真的「下來」（跟著每檔自己的波動算）
+LT_MAX_RETRACE = 0.5       # 還在低檔：從低點彈回不超過「這一輪跌幅」的一半
+LT_REBOUND_DAYS = 5        # 🟢 低點立即反彈：低點出現後幾天內的長紅
+LT_CANDLE_ATR = 1.0        # 🟢 長紅：今天漲幅至少 1 倍 ATR，而且收在當天高低區間的上段
+LT_CANDLE_POS = 0.6        # 長紅收盤位置：0＝最低、1＝最高
+LT_BREAK_VOL = 1.5         # 🟢 長紅要帶量：成交量至少是前 5 日均量的此倍數
+LT_MIN_ROOM = 8.0          # 🟢 上面空間：離前高、離最近的大黑棒至少此 %
+LT_BLACK_ATR = 1.5         # 大黑棒：單日跌幅至少 1.5 倍 ATR、而且帶量
+LT_MIN_DAYS = 80           # 至少要有幾天股價資料才判斷
 LT_MAX_N = 15              # 信裡最多列幾檔
-LT_BUY_WINDOW = 10         # 🟡 法人一直買：看最近幾天
-LT_BACK_BUYDAYS = 7        # 🟡 法人一直買：近 10 天至少幾天買超（不賣了不算，買賣交錯也不算）
-LT_BOTTOM_DAYS = 60        # 底部＝近 60 個交易日的最低價
-LT_BOTTOM_HOLD = 10        # 🟡 底部守住：最低點至少是此天數以前出現的，而且之後沒再跌破
-LT_BASE_DAYS = 20          # 底部價格＝近 20 天最低；🟢 噴出：收盤站上「谷底之後整個築底區」的最高價
-LT_BREAK_VOL = 1.5         # 🟢 噴出：成交量至少是前 5 日均量的此倍數
+
+
+def _swing(hi, lo, cl, atr):
+    """找最近一個「從高點下來」的波段：回傳 (高點索引, 高點, 低點索引, 低點)，找不到回傳 None。"""
+    n = len(hi)
+    for h in range(n - 2, max(LT_PIVOT_WIN, n - LT_PEAK_RECENT) - 1, -1):
+        if hi[h] < np.nanmax(hi[max(0, h - LT_PIVOT_WIN):min(n, h + LT_PIVOT_WIN + 1)]):
+            continue                                            # 不是波段高點
+        k = h + int(np.nanargmin(lo[h:]))
+        if hi[h] - lo[k] >= LT_MIN_ATR_DROP * atr:
+            return h, float(hi[h]), k, float(lo[k])
+    return None
 
 
 def build_longtrack(radar):
-    """回傳長線追蹤名單 DataFrame：stock_id, stock_name, close, qfii_now, qfii_peak, lt_light, lt_text, ...。"""
+    """從高點下來的股票：🔴 正在下來 → 🟡 低點整理、法人有撐 → 🟢 起漲第一根（立即反彈或整理後噴出），上面要有空間。"""
     cols = ["stock_id", "stock_name", "close", "qfii_now", "qfii_peak", "lt_light", "lt_text", "lt_order", "drop_rel",
-            "bottom", "base_high"]
-    fh = load_table("foreign_hold", 400)
-    if fh.empty:
-        print("長線追蹤：還沒有外資持股資料（需要先回補）")
-        return pd.DataFrame(columns=cols)
-    fh = fh.sort_values(["stock_id", "date"])
-    px = load_table("prices", 400)
+            "bottom", "base_high", "peak", "room"]
+    px = load_table("prices", 200)
     px = px[px["market"] == "TWSE"].sort_values(["stock_id", "date"])
+    if px.empty:
+        return pd.DataFrame(columns=cols)
     inst = load_table("institutional", 45)
     inst["net"] = pd.to_numeric(inst["foreign_net"], errors="coerce").fillna(0) + pd.to_numeric(inst["trust_net"], errors="coerce").fillna(0)
-    inst = inst.sort_values(["stock_id", "date"])
-    trust_all = load_table("institutional", 400)
-    trust_cum = trust_all.groupby("stock_id")["trust_net"].sum() if not trust_all.empty else pd.Series(dtype=float)
+    ig = {k: g.sort_values("date") for k, g in inst.groupby("stock_id")}
+    fh = load_table("foreign_hold", 400)
+    fq = {k: g.sort_values("date")["qfii_ratio"].astype(float).to_numpy() for k, g in fh.groupby("stock_id")} if not fh.empty else {}
     rows = radar.drop_duplicates("stock_id").set_index("stock_id")
-    pg = {k: g for k, g in px.groupby("stock_id")}
-    ig = {k: g for k, g in inst.groupby("stock_id")}
     out = []
-    for sid, g in fh.groupby("stock_id"):
-        if sid not in rows.index or sid in EXCLUDE_TOOL_STOCKS or sid.startswith("00") or len(g) < LT_MIN_DAYS:
+    for sid, p in px.groupby("stock_id"):
+        if sid not in rows.index or sid in EXCLUDE_TOOL_STOCKS or sid.startswith("00") or len(p) < LT_MIN_DAYS:
             continue
         r = rows.loc[sid]
         c = float(r["close"])
         if c < MIN_PRICE or not r.get("turnover", 0) >= MIN_DAILY_TURNOVER:
             continue
-        q = g["qfii_ratio"].astype(float).tail(250).to_numpy()
-        peak, now = float(np.nanmax(q)), float(q[-1])
-        p = pg.get(sid)
-        if p is None or len(p) < LT_MIN_DAYS:
+        cl = pd.to_numeric(p["close"], errors="coerce").to_numpy()
+        hi = pd.to_numeric(p["high"], errors="coerce").fillna(pd.Series(cl, index=p.index)).to_numpy()
+        lo = pd.to_numeric(p["low"], errors="coerce").fillna(pd.Series(cl, index=p.index)).to_numpy()
+        vol = pd.to_numeric(p["volume"], errors="coerce").to_numpy()
+        n = len(cl)
+        tr = np.maximum(hi[1:], cl[:-1]) - np.minimum(lo[1:], cl[:-1])
+        atr = float(np.nanmean(tr[-20:]))
+        if not atr > 0:
             continue
-        hi_all = pd.to_numeric(p["high"], errors="coerce").fillna(pd.to_numeric(p["close"], errors="coerce")).to_numpy()
-        lo_all = pd.to_numeric(p["low"], errors="coerce").fillna(pd.to_numeric(p["close"], errors="coerce")).to_numpy()
-        lw = lo_all[-LT_LOW_WINDOW:]
-        kk = int(np.nanargmin(lw))
-        age = len(lw) - 1 - kk
-        if age >= LT_LOW_RECENT:
-            continue                                            # 半年新低是很久以前的事，不是這一輪在跌
-        pre = hi_all[-LT_LOW_WINDOW:][max(0, kk - LT_PRE_BOUNCE):kk]
-        pre_high = float(np.nanmax(pre)) if len(pre) else np.nan
-        top = float(np.nanmax(hi_all[-LT_LOW_WINDOW:][:kk + 1]))               # 這一輪下跌的起點（低點之前的最高點）
-        bot = float(lw[kk])
-        if top > bot and (c - bot) / (top - bot) > LT_MAX_RETRACE:
-            continue                                            # 已經彈回下跌幅度的一半以上：離開低檔了
-        chg5 = now - (float(q[-6]) if len(q) >= 6 else now)
+        sw = _swing(hi, lo, cl, atr)
+        if sw is None:
+            continue
+        h, H, k, L = sw
+        if H <= L:
+            continue
+        retr = (c - L) / (H - L)
+        if retr > LT_MAX_RETRACE:
+            continue                                            # 已經彈回一半以上：不是低檔了
+        d = n - 1 - k                                           # 低點是幾天前
+        # 頭上的壓力：前高、以及下跌途中「大黑棒」的收盤價（套牢區）
+        res = [H]
+        for j in range(h + 1, n - 1):
+            if (cl[j] - cl[j - 1]) <= -LT_BLACK_ATR * atr and vol[j] >= 1.5 * np.nanmean(vol[max(0, j - 5):j]):
+                res.append(float(cl[j - 1]))                    # 大黑棒的上緣（前一天收盤）＝套牢的人成本
+                res.append(float(cl[j]))
+        above = [x for x in res if x > c]
+        nearest = min(above) if above else H
+        room = (nearest / c - 1) * 100
+        # 今天是不是「長紅」：帶量、漲幅夠、收在上段
+        rng = hi[-1] - lo[-1]
+        strong = (cl[-1] - cl[-2] >= LT_CANDLE_ATR * atr and rng > 0 and (cl[-1] - lo[-1]) / rng >= LT_CANDLE_POS
+                  and vol[-1] >= LT_BREAK_VOL * np.nanmean(vol[-6:-1]))
+        cons_high = float(np.nanmax(hi[k + 1:-1])) if d >= 2 else np.nan   # 低點之後的整理區高點（不含今天）
         i5 = ig.get(sid)
-        last5 = i5["net"].tail(5) if i5 is not None else pd.Series(dtype=float)
-        net5, buy5 = float(last5.sum()), int((last5 > 0).sum())
-        hi = pd.to_numeric(p["high"], errors="coerce").fillna(pd.to_numeric(p["close"], errors="coerce")).to_numpy()
-        lo = pd.to_numeric(p["low"], errors="coerce").fillna(pd.to_numeric(p["close"], errors="coerce")).to_numpy()
-        bottom_age = age                                                        # 半年新低是幾天前出現的
-        bottom = float(np.nanmin(lo[-LT_BASE_DAYS:]))                           # 底部價格＝最近這一波築底的低點（近 20 天最低）
-        since = hi_all[-LT_LOW_WINDOW:][kk + 1:-1]                              # 谷底之後到昨天
-        base_high = float(np.nanmax(since)) if len(since) else float(np.nanmax(hi[-LT_BASE_DAYS - 1:-1]))   # 噴出價格＝整個築底區的天花板
-        lastw = i5["net"].tail(LT_BUY_WINDOW) if i5 is not None else pd.Series(dtype=float)
-        q_up = len(q) > LT_BUY_WINDOW and now > float(q[-LT_BUY_WINDOW - 1])     # 外資持股比 10 天前高
-        buying = (len(lastw) >= LT_BUY_WINDOW and int((lastw > 0).sum()) >= LT_BACK_BUYDAYS
-                  and float(lastw.sum()) > 0 and net5 > 0 and q_up)              # 法人一直買
-        holds = bottom_age >= LT_BOTTOM_HOLD and c > bottom                     # 底部守住（最近 10 天沒破底）
-        vr = r.get("vol_ratio_5d", np.nan)
-        breakout = c > base_high and pd.notna(vr) and vr >= LT_BREAK_VOL        # 帶量站上整理區高點＝噴出
-        if pd.notna(pre_high) and base_high > pre_high:
-            continue                                            # 整理區已經在反彈高點之上＝不是低檔築底，是一路漲上來了
-        if not breakout and pd.notna(pre_high) and c > pre_high:
-            continue                                            # 已經漲回下跌途中的反彈高點：這一輪噴完了
-        if buying and holds and breakout and not inst_light(r).startswith("🟢"):
-            light, text, order = "🟡", "噴出了但當天有賣壓，先觀察", 1
-        elif buying and holds and breakout:
-            light, text, order = "🟢", "噴出了，可以買", 0
-        elif buying and holds:
-            light, text, order = "🟡", "法人開始買、底部守住，等噴出", 1
-        elif bottom_age < LT_BOTTOM_HOLD:
-            light, text, order = "🔴", "還在破底", 2
-        elif net5 < 0 or chg5 < -0.1:
-            light, text, order = "🔴", "法人還在賣", 2
-        elif net5 > 0:
-            light, text, order = "🔴", "法人買賣交錯，還不算一直買", 2
+        net = i5["net"].to_numpy() if i5 is not None else np.array([])
+        inst_today = len(net) > 0 and net[-1] > 0
+        inst3 = len(net) >= 3 and net[-3:].sum() > 0
+        inst10 = len(net) >= 10 and net[-10:].sum() > 0 and int((net[-10:] > 0).sum()) >= 6
+        quiet = not inst_light(r).startswith("🔴")              # 沒有爆量上影、法人倒貨
+        rebound = strong and d <= LT_REBOUND_DAYS               # 低點立即反彈
+        breakout = strong and d > LT_REBOUND_DAYS and pd.notna(cons_high) and c > cons_high   # 整理後噴出
+        if (rebound or breakout) and room >= LT_MIN_ROOM and inst_today and inst3 and quiet:
+            light, order = "🟢", 0
+            text = "低點立即反彈，可以買" if rebound else "整理後噴出一根，可以買"
+        elif (rebound or breakout) and room < LT_MIN_ROOM:
+            light, text, order = "🔴", f"出長紅了但上面 {fmt_now(nearest)} 有壓力，空間不夠", 2
+        elif d >= 3 and inst10 and room >= LT_MIN_ROOM:
+            light, text, order = "🟡", "低點整理、法人有撐，等長紅", 1
+        elif d >= 3 and inst10:
+            light, text, order = "🔴", f"法人有撐但上面 {fmt_now(nearest)} 有壓力，空間不夠", 2
+        elif d < 3:
+            light, text, order = "🔴", "正在下來", 2
         else:
-            light, text, order = "🔴", "法人不賣了，但還沒開始買", 2
-        f5 = float((i5["net"].tail(LT_BUY_WINDOW)).sum()) if i5 is not None else 0.0
-        out.append({"stock_id": sid, "stock_name": r["stock_name"], "close": c, "qfii_now": now, "qfii_peak": peak,
-                    "lt_light": light, "lt_text": text, "lt_order": order, "drop_rel": f5,
-                    "bottom": bottom, "base_high": base_high})
+            light, text, order = "🔴", "低點整理，法人還沒撐", 2
+        q = fq.get(sid, np.array([]))
+        out.append({"stock_id": sid, "stock_name": r["stock_name"], "close": c,
+                    "qfii_now": float(q[-1]) if len(q) else np.nan, "qfii_peak": float(np.nanmax(q[-250:])) if len(q) else np.nan,
+                    "lt_light": light, "lt_text": text, "lt_order": order,
+                    "drop_rel": float(net[-10:].sum()) if len(net) else 0.0,
+                    "bottom": L, "base_high": cons_high if pd.notna(cons_high) else c, "peak": H, "room": room})
     df = pd.DataFrame(out, columns=cols)
     if not df.empty:
-        df = df.sort_values(["lt_order", "drop_rel"], ascending=[True, False]).reset_index(drop=True)   # 同燈號：法人近10天買越多越前面
+        df = df.sort_values(["lt_order", "drop_rel"], ascending=[True, False]).reset_index(drop=True)
     print(f"長線追蹤：{len(df)} 檔｜" + str(df["lt_light"].value_counts().to_dict() if not df.empty else {}))
     return df
 
@@ -2065,7 +2075,7 @@ def build_simple_email(radar, data_date, holdings, track=None):
     buys = longtrack_buys(radar, track)
     parts = ["法人動態：🟢 買進　🟡 持有／等待　🔴 賣出／繼續等"]
 
-    parts.append(f"\n【可買】{len(buys)} 檔（長線追蹤裡法人一直買、底部守住、帶量噴出）")
+    parts.append(f"\n【可買】{len(buys)} 檔（從高點下來、低點出現第一根帶量長紅、上面有空間、法人在買）")
     if buys.empty:
         parts.append("今天沒有，耐心等")
     for _, r in buys.iterrows():
@@ -2075,17 +2085,16 @@ def build_simple_email(radar, data_date, holdings, track=None):
     if track is not None and not track.empty:
         t = track.head(LT_MAX_N)
         n_y = int((track["lt_light"] == "🟡").sum())
-        parts.append(f"\n\n【長線追蹤】{len(track)} 檔（🟡 {n_y} 檔等噴出，其他繼續等）")
+        parts.append(f"\n\n【追蹤：從高點下來】{len(track)} 檔（🟡 {n_y} 檔低點整理等長紅，列前 {len(t)} 檔）")
         for _, x in t.iterrows():
             parts.append(f"\n股票代號：{x['stock_name']}({x['stock_id']})\n"
                          f"目前價格：{fmt_now(float(x['close']))}\n"
-                         f"外資持股：{x['qfii_now']:.1f}%（高點 {x['qfii_peak']:.1f}%）\n"
-                         + (f"底部價格：{fmt_now(float(x['bottom']))}（跌破就重新觀察）\n" if x["lt_light"] != "🔴" else "")
-                         + (f"噴出價格：{fmt_now(float(x['base_high']))}（帶量站上就買）\n" if x["lt_light"] == "🟡" else "")
+                         f"前高／低點：{fmt_now(float(x['peak']))}／{fmt_now(float(x['bottom']))}（跌破低點就重新觀察）\n"
+                         + (f"噴出價格：{fmt_now(float(x['base_high']))}（帶量長紅站上就買）\n" if x["lt_light"] == "🟡" else "")
                          + f"法人動態：{x['lt_light']} {x['lt_text']}")
         watches = list(track.loc[track["lt_light"] == "🟡", "stock_id"])
     else:
-        parts.append("\n\n【長線追蹤】今天沒有資料")
+        parts.append("\n\n【追蹤：從高點下來】今天沒有資料")
 
     n_sell = 0
     parts.append(f"\n\n【我的持股】{len(holdings)} 檔")
