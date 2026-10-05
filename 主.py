@@ -112,14 +112,14 @@ BIG_SELL_DELTA = -0.5      # 賣出／放棄：千張大戶持股比例本週減
 HOLDER_COLS = ["date", "stock_id", "big_ratio", "big_people"]
 QFII_COLS = ["date", "stock_id", "qfii_ratio", "qfii_shares"]     # 外資及陸資持股比率（%）、持有股數
 
-QUOTE_COLS = ["date", "stock_id", "stock_name", "market", "close", "volume", "turnover", "high", "low"]
+QUOTE_COLS = ["date", "stock_id", "stock_name", "market", "close", "volume", "turnover", "high", "low", "open"]
 INST_COLS = ["date", "stock_id", "foreign_net", "trust_net", "dealer_prop", "dealer_hedge", "dealer_total", "market"]
 SIGNAL_COLS = ["signal_date", "stock_id", "stock_name", "market", "signal", "reason", "score",
                "close_at_signal", "trust_5d_net", "foreign_5d_net", "ma5", "ma10", "ma20", "tech"]
 _SIG_TYPES = {"score": "INTEGER", "close_at_signal": "REAL", "trust_5d_net": "INTEGER",
               "foreign_5d_net": "INTEGER", "ma5": "REAL", "ma10": "REAL", "ma20": "REAL"}
 EXPECTED_COLUMNS = {   # 表 → {欄位: 型別}，用來把舊資料庫補齊
-    "prices": {c: ("REAL" if c in ("close", "turnover", "high", "low") else "INTEGER" if c == "volume" else "TEXT")
+    "prices": {c: ("REAL" if c in ("close", "turnover", "high", "low", "open") else "INTEGER" if c == "volume" else "TEXT")
                for c in QUOTE_COLS},
     "institutional": {c: ("TEXT" if c in ("date", "stock_id", "market") else "INTEGER") for c in INST_COLS},
     "signals": {c: _SIG_TYPES.get(c, "TEXT") for c in SIGNAL_COLS},
@@ -381,7 +381,8 @@ def fetch_twse_quotes(d):
         rows.append({"date": date, "stock_id": sid, "stock_name": str(it.get("證券名稱", "")).strip(),
                      "market": "TWSE", "close": close, "volume": safe_float(it.get("成交股數")),
                      "turnover": safe_float(it.get("成交金額")),
-                     "high": safe_float(it.get("最高價")), "low": safe_float(it.get("最低價"))})
+                     "high": safe_float(it.get("最高價")), "low": safe_float(it.get("最低價")),
+                     "open": safe_float(it.get("開盤價"))})
     return pd.DataFrame(rows, columns=QUOTE_COLS)
 
 
@@ -400,7 +401,8 @@ def fetch_twse_openapi():
         rows.append({"date": date, "stock_id": sid, "stock_name": str(it.get("Name", "")).strip(),
                      "market": "TWSE", "close": close, "volume": safe_float(it.get("TradeVolume")),
                      "turnover": safe_float(it.get("TradeValue")),
-                     "high": safe_float(it.get("HighestPrice")), "low": safe_float(it.get("LowestPrice"))})
+                     "high": safe_float(it.get("HighestPrice")), "low": safe_float(it.get("LowestPrice")),
+                     "open": safe_float(it.get("OpeningPrice"))})
     return pd.DataFrame(rows, columns=QUOTE_COLS)
 
 
@@ -419,6 +421,7 @@ def fetch_tpex_quotes():
                      "close": close,
                      "volume": safe_float(pick(it, "TradingShares", "TradeVolume", "Volume")),
                      "turnover": safe_float(pick(it, "TransactionAmount", "TradeValue", "Amount")),
+                     "open": safe_float(pick(it, "Open", "OpeningPrice")),
                      "high": safe_float(pick(it, "High", "HighestPrice")),
                      "low": safe_float(pick(it, "Low", "LowestPrice"))})
     df = pd.DataFrame(rows, columns=QUOTE_COLS)
@@ -821,7 +824,8 @@ def backfill(days, prices_only=False):
     """回補上市（TWSE）歷史行情與法人。TPEx 的歷史資料沒有穩定的公開 API，只能每天累積。"""
     with db() as conn:
         # 已有最高/最低價的日期才算「已補過」（舊資料沒有高低價，會重抓一次補上）
-        have_p = {r[0] for r in conn.execute("SELECT DISTINCT date FROM prices WHERE market='TWSE' AND high IS NOT NULL")}
+        have_p = {r[0] for r in conn.execute("SELECT DISTINCT date FROM prices WHERE market='TWSE' AND high IS NOT NULL "
+                                             "AND open IS NOT NULL")}
         have_i = {r[0] for r in conn.execute("SELECT DISTINCT date FROM institutional WHERE market='TWSE'")}
         have_m = {r[0] for r in conn.execute("SELECT DISTINCT date FROM margin WHERE market='TWSE'")}
     for d in weekdays_back(days):
