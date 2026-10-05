@@ -1942,10 +1942,11 @@ def plan_text(r):
 
 
 # ───────────────────────── 長線追蹤：法人賣到快沒貨 → 等法人回來 ─────────────────────────
-LT_MIN_PEAK = 5.0          # 外資持股高點至少此 %（本來就沒什麼外資的股票不算）
-LT_MIN_DROP = 0.5          # 外資持股從高點減少至少此比例（0.5＝賣掉一半以上）
-LT_MIN_PRICE_DD = 30.0     # 股價離一年高點至少跌了此 %
-LT_MIN_DAYS = 120          # 至少要有幾天外資持股資料才判斷
+LT_LOW_WINDOW = 120        # 一路下跌：股價跌到近 120 個交易日（約半年）的新低
+LT_LOW_RECENT = 60         # 這個新低要是最近 60 個交易日內出現的（正在這一輪）
+LT_MAX_RETRACE = 0.5       # 還在低檔：從谷底彈回的幅度，不超過「下跌幅度」的一半（跟著每檔自己的跌幅算，不設固定 %）
+LT_PRE_BOUNCE = 20         # 還沒跑掉：股價還沒漲回「低點之前 20 天」的最高點（下跌途中最後一波反彈高點）
+LT_MIN_DAYS = 120          # 至少要有幾天股價資料才判斷
 LT_MAX_N = 15              # 信裡最多列幾檔
 LT_BUY_WINDOW = 10         # 🟡 法人一直買：看最近幾天
 LT_BACK_BUYDAYS = 7        # 🟡 法人一直買：近 10 天至少幾天買超（不賣了不算，買賣交錯也不算）
@@ -1984,25 +1985,29 @@ def build_longtrack(radar):
             continue
         q = g["qfii_ratio"].astype(float).tail(250).to_numpy()
         peak, now = float(np.nanmax(q)), float(q[-1])
-        if peak < LT_MIN_PEAK or now > peak * (1 - LT_MIN_DROP):
-            continue                                            # 外資沒賣掉一半以上
         p = pg.get(sid)
-        if p is None or len(p) < 60:
+        if p is None or len(p) < LT_MIN_DAYS:
             continue
-        cl = pd.to_numeric(p["close"], errors="coerce").tail(250).to_numpy()
-        if c > np.nanmax(cl) * (1 - LT_MIN_PRICE_DD / 100):
-            continue                                            # 股價沒跌一大段
-        if sid in trust_cum.index and trust_cum[sid] > 0:
-            continue                                            # 投信不是在賣
+        hi_all = pd.to_numeric(p["high"], errors="coerce").fillna(pd.to_numeric(p["close"], errors="coerce")).to_numpy()
+        lo_all = pd.to_numeric(p["low"], errors="coerce").fillna(pd.to_numeric(p["close"], errors="coerce")).to_numpy()
+        lw = lo_all[-LT_LOW_WINDOW:]
+        kk = int(np.nanargmin(lw))
+        age = len(lw) - 1 - kk
+        if age >= LT_LOW_RECENT:
+            continue                                            # 半年新低是很久以前的事，不是這一輪在跌
+        pre = hi_all[-LT_LOW_WINDOW:][max(0, kk - LT_PRE_BOUNCE):kk]
+        pre_high = float(np.nanmax(pre)) if len(pre) else np.nan
+        top = float(np.nanmax(hi_all[-LT_LOW_WINDOW:][:kk + 1]))               # 這一輪下跌的起點（低點之前的最高點）
+        bot = float(lw[kk])
+        if top > bot and (c - bot) / (top - bot) > LT_MAX_RETRACE:
+            continue                                            # 已經彈回下跌幅度的一半以上：離開低檔了
         chg5 = now - (float(q[-6]) if len(q) >= 6 else now)
         i5 = ig.get(sid)
         last5 = i5["net"].tail(5) if i5 is not None else pd.Series(dtype=float)
         net5, buy5 = float(last5.sum()), int((last5 > 0).sum())
         hi = pd.to_numeric(p["high"], errors="coerce").fillna(pd.to_numeric(p["close"], errors="coerce")).to_numpy()
         lo = pd.to_numeric(p["low"], errors="coerce").fillna(pd.to_numeric(p["close"], errors="coerce")).to_numpy()
-        lows = lo[-LT_BOTTOM_DAYS:]
-        k = int(np.nanargmin(lows))
-        bottom, bottom_age = float(lows[k]), len(lows) - 1 - k                # 底部價格、幾天前出現
+        bottom, bottom_age = float(lw[kk]), age                                 # 底部＝半年新低、幾天前出現
         base_high = float(np.nanmax(hi[-LT_BASE_DAYS - 1:-1]))                  # 近 20 天（不含今天）最高價
         lastw = i5["net"].tail(LT_BUY_WINDOW) if i5 is not None else pd.Series(dtype=float)
         q_up = len(q) > LT_BUY_WINDOW and now > float(q[-LT_BUY_WINDOW - 1])     # 外資持股比 10 天前高
@@ -2011,7 +2016,13 @@ def build_longtrack(radar):
         holds = bottom_age >= LT_BOTTOM_HOLD and c > bottom                     # 底部守住（最近 10 天沒破底）
         vr = r.get("vol_ratio_5d", np.nan)
         breakout = c > base_high and pd.notna(vr) and vr >= LT_BREAK_VOL        # 帶量站上整理區高點＝噴出
-        if buying and holds and breakout:
+        if pd.notna(pre_high) and base_high > pre_high:
+            continue                                            # 整理區已經在反彈高點之上＝不是低檔築底，是一路漲上來了
+        if not breakout and pd.notna(pre_high) and c > pre_high:
+            continue                                            # 已經漲回下跌途中的反彈高點：這一輪噴完了
+        if buying and holds and breakout and not inst_light(r).startswith("🟢"):
+            light, text, order = "🟡", "噴出了但當天有賣壓，先觀察", 1
+        elif buying and holds and breakout:
             light, text, order = "🟢", "噴出了，可以買", 0
         elif buying and holds:
             light, text, order = "🟡", "法人開始買、底部守住，等噴出", 1
@@ -2023,12 +2034,13 @@ def build_longtrack(radar):
             light, text, order = "🔴", "法人買賣交錯，還不算一直買", 2
         else:
             light, text, order = "🔴", "法人不賣了，但還沒開始買", 2
+        f5 = float((i5["net"].tail(LT_BUY_WINDOW)).sum()) if i5 is not None else 0.0
         out.append({"stock_id": sid, "stock_name": r["stock_name"], "close": c, "qfii_now": now, "qfii_peak": peak,
-                    "lt_light": light, "lt_text": text, "lt_order": order, "drop_rel": 1 - now / peak,
+                    "lt_light": light, "lt_text": text, "lt_order": order, "drop_rel": f5,
                     "bottom": bottom, "base_high": base_high})
     df = pd.DataFrame(out, columns=cols)
     if not df.empty:
-        df = df.sort_values(["lt_order", "drop_rel"], ascending=[True, False]).reset_index(drop=True)
+        df = df.sort_values(["lt_order", "drop_rel"], ascending=[True, False]).reset_index(drop=True)   # 同燈號：法人近10天買越多越前面
     print(f"長線追蹤：{len(df)} 檔｜" + str(df["lt_light"].value_counts().to_dict() if not df.empty else {}))
     return df
 
