@@ -2090,6 +2090,7 @@ LT_BLACK_BODY_ATR = 1.0    # 大黑棒（有開盤價時）：實體（開盤－
 LT_WICK_ATR = 1.0          # 長上影線：最高價到實體上緣至少 1 倍 ATR
 LT_TOP_BEFORE = 5          # 頭部範圍：高點前幾天
 LT_TOP_AFTER = 10          # 頭部範圍：高點後幾天
+LT_TOP_BAND = 0.25         # 頭部套牢區只算價位在這一波最上面 25% 的 K 棒（下跌途中的不算）
 LT_ZONE_NEAR = 5.0         # 🔴 現價卡在頭部套牢區裡，或離套牢區底部不到此 %：一噴就撞到黑 K／上影線被壓回
 LT_MIN_DAYS = 80           # 至少要有幾天股價資料才判斷
 LT_MAX_N = 15              # 信裡最多列幾檔
@@ -2114,7 +2115,7 @@ def build_longtrack(radar):
     cols = ["stock_id", "stock_name", "close", "qfii_now", "qfii_peak", "lt_light", "lt_text", "lt_order", "drop_rel",
             "bottom", "base_high", "peak", "room"]
     px = load_table("prices", 200)
-    px = px[px["market"] == "TWSE"].sort_values(["stock_id", "date"])
+    px = px.sort_values(["stock_id", "date"])                 # 上市、上櫃都看
     if px.empty:
         return pd.DataFrame(columns=cols)
     inst = load_table("institutional", 45)
@@ -2149,35 +2150,37 @@ def build_longtrack(radar):
         retr = (c - L) / (H - L)
         retr_prev = (cl[-2] - L) / (H - L)                      # 昨天還在不在低檔
         d = n - 1 - k                                           # 低點是幾天前
-        # 頭上的壓力：前高、以及「頭部那一段」（高點前 5 天到高點後 10 天）的黑 K 和長上影線——那裡就是套牢區
+        # 頭上的壓力：「頭部那一段」（高點前 5 天到後 10 天、而且價位在這一波上段）的黑 K 和長上影線＝套牢區
+        # 下跌途中的黑 K 不算頭（例：鈊象 8/21）
         op = pd.to_numeric(p["open"], errors="coerce").to_numpy() if "open" in p.columns else np.full(n, np.nan)
-        zones, inside = [], False
+        top_line = H - LT_TOP_BAND * (H - L)
+        zones = []                                                         # (套牢區下緣, 上緣)
         for j in range(max(1, h - LT_TOP_BEFORE), min(n - 1, h + LT_TOP_AFTER + 1)):
+            if hi[j] < top_line:
+                continue
             o = op[j] if pd.notna(op[j]) else cl[j - 1]                   # 舊資料沒開盤價：用前一天收盤代替
             body_top, body_bot = max(o, cl[j]), min(o, cl[j])
             black = (o - cl[j]) >= LT_BLACK_BODY_ATR * atr                 # 開高收低的黑 K
             wick = (hi[j] - body_top) >= LT_WICK_ATR * atr                 # 長上影線：盤中拉高被賣下來
             if black or wick:
-                zone_top, zone_bot = float(hi[j]), float(body_bot if black else body_top)
-                zones.append(zone_bot)
-                if zone_bot <= c < zone_top:
-                    inside = True                                          # 現價卡在套牢區裡面＝馬上有賣壓
-        above = [x for x in zones if x > c]
-        zone_room = (min(above) / c - 1) * 100 if above else np.inf
-        if inside:
-            nearest, room = c, 0.0
-            press = f"已經卡在頭部大黑棒／上影線的套牢區（前高 {fmt_now(H)}），一噴就會被壓回"
-        elif zone_room < LT_ZONE_NEAR:
-            nearest, room = min(above), zone_room                          # 套牢區就在頭上
-            press = f"上面 {fmt_now(nearest)} 就是頭部大黑棒／上影線，一噴就會被壓回"
-        else:
-            nearest, room = H, (H / c - 1) * 100                           # 套牢區還遠：看離前高的空間
-            press = f"上面 {fmt_now(nearest)} 有壓力，空間不夠"
+                zones.append((float(body_bot if black else body_top), float(hi[j])))
+
+        def headroom(x):
+            """從價格 x 往上看：回傳 (空間 %, 壓力價, 說明)。"""
+            if any(zb <= x < zt for zb, zt in zones):
+                return 0.0, x, f"已經卡在頭部大黑棒／上影線的套牢區（前高 {fmt_now(H)}），一噴就會被壓回"
+            above = [zb for zb, _ in zones if zb > x]
+            if above and (min(above) / x - 1) * 100 < LT_ZONE_NEAR:
+                return (min(above) / x - 1) * 100, min(above), f"上面 {fmt_now(min(above))} 就是頭部大黑棒／上影線，一噴就會被壓回"
+            return (H / x - 1) * 100, H, f"上面前高 {fmt_now(H)} 空間不夠"
         # 今天是不是「長紅」：帶量、漲幅夠、收在上段
         rng = hi[-1] - lo[-1]
         strong = (cl[-1] - cl[-2] >= LT_CANDLE_ATR * atr and rng > 0 and (cl[-1] - lo[-1]) / rng >= LT_CANDLE_POS
                   and vol[-1] >= LT_BREAK_VOL * np.nanmean(vol[-6:-1]))
         cons_high = float(np.nanmax(cl[k + 1:-1])) if d >= 2 else np.nan   # 噴出價格＝低點之後整理區的最高收盤（不含今天；上影線不算站穩）
+        room, nearest, press = headroom(c)                                # 現在買：從現價往上算
+        wait_px = max(c, cons_high) if pd.notna(cons_high) else c
+        room_w, nearest_w, press_w = headroom(wait_px)                    # 等噴出：從噴出價往上算（盤中站上噴出價就買）
         i5 = ig.get(sid)
         net = i5["net"].to_numpy() if i5 is not None else np.array([])
         inst_today = len(net) > 0 and net[-1] > 0
@@ -2198,10 +2201,10 @@ def build_longtrack(radar):
             light, text, order = "🔴", f"出長紅了，但{press}", 2
         elif d >= 3 and accum and room >= LT_MIN_ROOM and quiet and c > L:
             light, text, order = "🟢", "法人在底部一直買，可以先佈局（買一半）", 0
-        elif d >= 3 and inst10 and room >= LT_MIN_ROOM:
-            light, text, order = "🟡", "法人開始買，還不算一直買，再觀察", 1
+        elif d >= 3 and inst10 and room_w >= LT_MIN_ROOM:
+            light, text, order = "🟡", "法人開始買，等帶量站上噴出價格", 1
         elif d >= 3 and inst10:
-            light, text, order = "🔴", f"法人有撐，但{press}", 2
+            light, text, order = "🔴", f"法人有撐，但{press_w}", 2
         elif d < 3:
             light, text, order = "🔴", "正在下來", 2
         else:
@@ -2211,7 +2214,8 @@ def build_longtrack(radar):
                     "qfii_now": float(q[-1]) if len(q) else np.nan, "qfii_peak": float(np.nanmax(q[-250:])) if len(q) else np.nan,
                     "lt_light": light, "lt_text": text, "lt_order": order,
                     "drop_rel": float(net[-10:].sum()) if len(net) else 0.0,
-                    "bottom": L, "base_high": cons_high if pd.notna(cons_high) else c, "peak": H, "room": room})
+                    "bottom": L, "base_high": cons_high if pd.notna(cons_high) else c, "peak": H,
+                    "room": room_w if light == "🟡" else room})
     df = pd.DataFrame(out, columns=cols)
     if not df.empty:
         df = df.sort_values(["lt_order", "drop_rel"], ascending=[True, False]).reset_index(drop=True)
@@ -2227,7 +2231,7 @@ def longtrack_buys(radar, track):
     b = radar[radar["stock_id"].isin(ids)].drop_duplicates("stock_id").copy()
     b = b[b.apply(lambda r: inst_light(r).startswith("🟢"), axis=1)] if not b.empty else b
     kind = track.set_index("stock_id")["lt_text"].to_dict()
-    b["setup"] = b["stock_id"].map(lambda s: "LT_ACCUM" if "佈局" in kind.get(s, "") else "LT_BREAK")
+    b["setup"] = b["stock_id"].map(lambda s: "LT_ACCUM" if "先佈局" in kind.get(s, "") else "LT_BREAK")
     return b
 
 
