@@ -1958,7 +1958,11 @@ LT_BREAK_VOL = 1.5         # 🟢 長紅要帶量：成交量至少是前 5 日�
 LT_MIN_ROOM = 8.0          # 🟢 上面空間：離前高、離最近的大黑棒至少此 %
 LT_BLACK_ATR = 1.2         # 大黑棒：單日跌幅（收盤對收盤）至少 1.2 倍 ATR
 LT_BLACK_FADE_ATR = 2.0    # 大黑棒：或是「開高走低」，盤中最高到收盤跌了 2 倍 ATR 以上
-LT_BLACK_VOL = 1.0         # 大黑棒：成交量不低於前 5 日均量（有人在倒，不是沒量的小跌）
+LT_BLACK_BODY_ATR = 1.0    # 大黑棒（有開盤價時）：實體（開盤－收盤）至少 1 倍 ATR，不管量大量小
+LT_WICK_ATR = 1.0          # 長上影線：最高價到實體上緣至少 1 倍 ATR
+LT_TOP_BEFORE = 5          # 頭部範圍：高點前幾天
+LT_TOP_AFTER = 10          # 頭部範圍：高點後幾天
+LT_ZONE_NEAR = 5.0         # 🔴 現價卡在頭部套牢區裡，或離套牢區底部不到此 %：一噴就撞到黑 K／上影線被壓回
 LT_MIN_DAYS = 80           # 至少要有幾天股價資料才判斷
 LT_MAX_N = 15              # 信裡最多列幾檔
 LT_ACCUM_DAYS = 7          # 🟢 佈局：法人近 10 天至少幾天買超（在底部一直買）
@@ -2017,17 +2021,30 @@ def build_longtrack(radar):
         retr = (c - L) / (H - L)
         retr_prev = (cl[-2] - L) / (H - L)                      # 昨天還在不在低檔
         d = n - 1 - k                                           # 低點是幾天前
-        # 頭上的壓力：前高、以及下跌途中「大黑棒」的收盤價（套牢區）
-        res = [H]
-        for j in range(max(1, h - 3), n - 1):                   # 高點附近（含高點前幾天）到昨天的大黑棒
-            big_drop = (cl[j] - cl[j - 1]) <= -LT_BLACK_ATR * atr
-            fade = (hi[j] - cl[j]) >= LT_BLACK_FADE_ATR * atr and cl[j] < cl[j - 1]
-            if (big_drop or fade) and vol[j] >= LT_BLACK_VOL * np.nanmean(vol[max(0, j - 5):j]):
-                res.append(float(cl[j - 1]))                    # 大黑棒的上緣（前一天收盤）＝套牢的人成本
-                res.append(float(cl[j]))
-        above = [x for x in res if x > c]
-        nearest = min(above) if above else H
-        room = (nearest / c - 1) * 100
+        # 頭上的壓力：前高、以及「頭部那一段」（高點前 5 天到高點後 10 天）的黑 K 和長上影線——那裡就是套牢區
+        op = pd.to_numeric(p["open"], errors="coerce").to_numpy() if "open" in p.columns else np.full(n, np.nan)
+        zones, inside = [], False
+        for j in range(max(1, h - LT_TOP_BEFORE), min(n - 1, h + LT_TOP_AFTER + 1)):
+            o = op[j] if pd.notna(op[j]) else cl[j - 1]                   # 舊資料沒開盤價：用前一天收盤代替
+            body_top, body_bot = max(o, cl[j]), min(o, cl[j])
+            black = (o - cl[j]) >= LT_BLACK_BODY_ATR * atr                 # 開高收低的黑 K
+            wick = (hi[j] - body_top) >= LT_WICK_ATR * atr                 # 長上影線：盤中拉高被賣下來
+            if black or wick:
+                zone_top, zone_bot = float(hi[j]), float(body_bot if black else body_top)
+                zones.append(zone_bot)
+                if zone_bot <= c < zone_top:
+                    inside = True                                          # 現價卡在套牢區裡面＝馬上有賣壓
+        above = [x for x in zones if x > c]
+        zone_room = (min(above) / c - 1) * 100 if above else np.inf
+        if inside:
+            nearest, room = c, 0.0
+            press = f"已經卡在頭部大黑棒／上影線的套牢區（前高 {fmt_now(H)}），一噴就會被壓回"
+        elif zone_room < LT_ZONE_NEAR:
+            nearest, room = min(above), zone_room                          # 套牢區就在頭上
+            press = f"上面 {fmt_now(nearest)} 就是頭部大黑棒／上影線，一噴就會被壓回"
+        else:
+            nearest, room = H, (H / c - 1) * 100                           # 套牢區還遠：看離前高的空間
+            press = f"上面 {fmt_now(nearest)} 有壓力，空間不夠"
         # 今天是不是「長紅」：帶量、漲幅夠、收在上段
         rng = hi[-1] - lo[-1]
         strong = (cl[-1] - cl[-2] >= LT_CANDLE_ATR * atr and rng > 0 and (cl[-1] - lo[-1]) / rng >= LT_CANDLE_POS
@@ -2050,13 +2067,13 @@ def build_longtrack(radar):
             light, order = "🟢", 0
             text = "低點立即反彈，可以買" if rebound else "整理後噴出一根，可以買（已佈局就加碼）"
         elif (rebound or breakout) and room < LT_MIN_ROOM:
-            light, text, order = "🔴", f"出長紅了但上面 {fmt_now(nearest)} 有壓力，空間不夠", 2
+            light, text, order = "🔴", f"出長紅了，但{press}", 2
         elif d >= 3 and accum and room >= LT_MIN_ROOM and quiet and c > L:
             light, text, order = "🟢", "法人在底部一直買，可以先佈局（買一半）", 0
         elif d >= 3 and inst10 and room >= LT_MIN_ROOM:
             light, text, order = "🟡", "法人開始買，還不算一直買，再觀察", 1
         elif d >= 3 and inst10:
-            light, text, order = "🔴", f"法人有撐但上面 {fmt_now(nearest)} 有壓力，空間不夠", 2
+            light, text, order = "🔴", f"法人有撐，但{press}", 2
         elif d < 3:
             light, text, order = "🔴", "正在下來", 2
         else:
