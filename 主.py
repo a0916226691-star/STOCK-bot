@@ -855,6 +855,134 @@ def backfill(days, prices_only=False):
             time.sleep(2)
 
 
+# ── 上櫃（TPEx）歷史資料：openapi 只有最新一天，回補要用櫃買網站的查詢頁 ──
+TPEX_NEW = "https://www.tpex.org.tw/www/zh-tw"
+TPEX_OLD = "https://www.tpex.org.tw/web/stock"
+
+
+def _tpex_table(j):
+    """櫃買回應可能是新版 {tables:[{fields,data}]} 或舊版 {aaData:[...]}，回傳 (fields 或 None, rows)。"""
+    for t in (j.get("tables") or []):
+        if t.get("data"):
+            return t.get("fields") or None, t["data"]
+    if j.get("aaData"):
+        return j.get("fields") or None, j["aaData"]
+    return None, []
+
+
+def _tpex_get(new_path, new_params, old_path, old_params):
+    """先試新版網站，失敗再試舊版。回傳 (fields, rows, 來源)。"""
+    for url, params, tag in ((f"{TPEX_NEW}/{new_path}", new_params, "新版"), (f"{TPEX_OLD}/{old_path}", old_params, "舊版")):
+        try:
+            j = get_json(url, params, timeout=30, retries=2)
+            fields, rows = _tpex_table(j)
+            if rows:
+                return fields, rows, tag
+        except Exception as e:
+            print(f"  TPEx {tag} {new_path if tag == '新版' else old_path} 失敗：{e}")
+    return None, [], ""
+
+
+def _roc(d):
+    return f"{int(d[:4]) - 1911}/{d[4:6]}/{d[6:]}"
+
+
+_TPEX_FIELDS_SHOWN = set()
+
+
+def _show_fields(kind, fields, row):
+    if kind not in _TPEX_FIELDS_SHOWN:
+        _TPEX_FIELDS_SHOWN.add(kind)
+        print(f"  TPEx {kind} 欄位：{fields}")
+        print(f"  TPEx {kind} 第一筆：{row}")
+
+
+def fetch_tpex_quotes_hist(d):
+    """上櫃指定日期的收盤行情（d=YYYYMMDD）。"""
+    fields, raw, tag = _tpex_get("afterTrading/otcQuotes", {"date": f"{d[:4]}/{d[4:6]}/{d[6:]}", "type": "EW", "response": "json"},
+                                 "aftertrading/otc_quotes_no1430/stk_wn1430_result.php",
+                                 {"l": "zh-tw", "d": _roc(d), "se": "EW", "o": "json"})
+    if not raw:
+        return pd.DataFrame(columns=QUOTE_COLS)
+    _show_fields("行情", fields, raw[0])
+
+    def idx(*keys, default=None):
+        if fields:
+            for i, f in enumerate(fields):
+                if any(f.strip().startswith(k) for k in keys):
+                    return i
+        return default
+    # 沒有欄位名稱時用舊版固定位置：代號,名稱,收盤,漲跌,開盤,最高,最低,(均價),成交股數,成交金額
+    i_c, i_o, i_h, i_l = idx("收盤", default=2), idx("開盤", default=4), idx("最高", default=5), idx("最低", default=6)
+    i_v, i_t = idx("成交股數", default=7), idx("成交金額", default=8)
+    date = fmt_date(d)
+    rows = []
+    for r in raw:
+        sid = normalize_stock_id(str(r[0]))
+        close = safe_float(r[i_c])
+        if not is_stock_id(sid) or pd.isna(close) or close <= 0:
+            continue
+        rows.append({"date": date, "stock_id": sid, "stock_name": str(r[1]).strip(), "market": "TPEx",
+                     "close": close, "volume": safe_float(r[i_v]), "turnover": safe_float(r[i_t]),
+                     "open": safe_float(r[i_o]), "high": safe_float(r[i_h]), "low": safe_float(r[i_l])})
+    return pd.DataFrame(rows, columns=QUOTE_COLS)
+
+
+def fetch_tpex_inst_hist(d):
+    """上櫃指定日期的三大法人買賣超（股）。表格固定 24 欄：
+    代號,名稱, 外資不含自營(買,賣,超), 外資自營(買,賣,超), 外資合計(買,賣,超), 投信(買,賣,超),
+    自營自行(買,賣,超), 自營避險(買,賣,超), 自營合計(買,賣,超), 三大法人合計"""
+    fields, raw, tag = _tpex_get("insti/dailyTrade", {"type": "Daily", "sect": "EW", "date": f"{d[:4]}/{d[4:6]}/{d[6:]}", "response": "json"},
+                                 "3insti/daily_trade/3itrade_hedge_result.php",
+                                 {"l": "zh-tw", "se": "EW", "t": "D", "d": _roc(d), "o": "json"})
+    if not raw:
+        return pd.DataFrame(columns=INST_COLS)
+    _show_fields("法人", fields, raw[0])
+    if len(raw[0]) < 23:
+        print(f"⚠ TPEx 法人表只有 {len(raw[0])} 欄，格式跟預期不同，這天略過")
+        return pd.DataFrame(columns=INST_COLS)
+    date = fmt_date(d)
+    rows = []
+    for r in raw:
+        sid = normalize_stock_id(str(r[0]))
+        if not is_stock_id(sid):
+            continue
+        rows.append({"date": date, "stock_id": sid, "foreign_net": safe_int(r[4]), "trust_net": safe_int(r[13]),
+                     "dealer_prop": safe_int(r[16]), "dealer_hedge": safe_int(r[19]),
+                     "dealer_total": safe_int(r[22]), "market": "TPEx"})
+    return pd.DataFrame(rows, columns=INST_COLS)
+
+
+def backfill_tpex(days):
+    """回補上櫃歷史股價（含開高低）與法人。"""
+    with db() as conn:
+        have_p = {r[0] for r in conn.execute("SELECT DISTINCT date FROM prices WHERE market='TPEx' AND open IS NOT NULL")}
+        have_i = {r[0] for r in conn.execute("SELECT DISTINCT date FROM institutional WHERE market='TPEx'")}
+    inst_from = "2026-06-08"                      # 上市法人也是從這天開始，太早的用不到
+    fail = 0
+    for d in weekdays_back(days):
+        iso = fmt_date(d)
+        if iso not in have_p:
+            try:
+                n = upsert("prices", fetch_tpex_quotes_hist(d), QUOTE_COLS)
+                print(f"回補上櫃行情 {iso}：{n} 檔" if n else f"{iso} 上櫃無行情（休市？）")
+                fail = 0 if n else fail
+            except Exception as e:
+                print(f"回補上櫃行情 {iso} 失敗：{e}")
+                fail += 1
+            time.sleep(2)
+        if iso >= inst_from and iso not in have_i:
+            try:
+                n = upsert("institutional", fetch_tpex_inst_hist(d), INST_COLS)
+                print(f"回補上櫃法人 {iso}：{n} 檔" if n else f"{iso} 上櫃無法人資料")
+            except Exception as e:
+                print(f"回補上櫃法人 {iso} 失敗：{e}")
+            time.sleep(2)
+        if fail >= 5:
+            print("⚠ 連續 5 天抓不到上櫃資料，可能被擋，先停")
+            break
+
+
 # ───────────────────────── 特徵計算 ─────────────────────────
 def grp_roll(s, key, n, fn):
     """依 key 分組做 rolling，結果對齊回 s 的 index。"""
@@ -2255,6 +2383,7 @@ def main():
     ap.add_argument("--backfill", type=int, default=0, metavar="N", help="先回補最近 N 個日曆天的上市行情與法人")
     ap.add_argument("--backfill-prices", type=int, default=0, metavar="N", help="只回補最近 N 個日曆天的上市股價（含高低價），不補法人與融資")
     ap.add_argument("--backfill-qfii", type=int, default=0, metavar="N", help="回補最近 N 個日曆天的外資持股比例（長線追蹤用）")
+    ap.add_argument("--backfill-tpex", type=int, default=0, metavar="N", help="回補最近 N 個日曆天的上櫃股價與法人")
     ap.add_argument("--no-email", action="store_true", help="不寄信")
     ap.add_argument("--collect-only", action="store_true", help="只收資料進資料庫，不跑舊版訊號與信件")
     args = ap.parse_args()
@@ -2267,6 +2396,9 @@ def main():
     if args.backfill_qfii:
         init_db()
         backfill_qfii(args.backfill_qfii)
+    if args.backfill_tpex:
+        init_db()
+        backfill_tpex(args.backfill_tpex)
     run(send_mail=not args.no_email, collect_only=args.collect_only)
 
 
