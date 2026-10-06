@@ -2091,6 +2091,7 @@ LT_WICK_ATR = 1.0          # 長上影線：最高價到實體上緣至少 1 倍
 LT_TOP_BEFORE = 5          # 頭部範圍：高點前幾天
 LT_TOP_AFTER = 10          # 頭部範圍：高點後幾天
 LT_TOP_BAND = 0.25         # 頭部套牢區只算價位在這一波最上面 25% 的 K 棒（下跌途中的不算）
+LT_CRASH_ATR = 2.0         # 下跌途中單日（收盤對收盤，含跳空）跌超過 2 倍 ATR＝大黑棒，也算套牢區（鈊象 8/21 只有 1.5 倍，不算）
 LT_ZONE_NEAR = 5.0         # 🔴 現價卡在頭部套牢區裡，或離套牢區底部不到此 %：一噴就撞到黑 K／上影線被壓回
 LT_CHOP_WAVE = 0.10        # 亂不亂：把一年走勢切成漲跌超過 10% 的波段
 LT_CHOP_DAYS = 10.0        # 每段波段中位數不到 10 天＝上下太快（例：士電 9.5 天），整檔不追；好例子鈊象 49、佳必琪 20、富邦媒 15.5、晶技 13
@@ -2187,14 +2188,20 @@ def build_longtrack(radar):
             wick = (hi[j] - body_top) >= LT_WICK_ATR * atr                 # 長上影線：盤中拉高被賣下來
             if black or wick:
                 zones.append((float(body_bot if black else body_top), float(hi[j])))
+        # 下跌途中的「大跌黑棒」（含跳空）：前一天收盤到當天收盤跌超過 2 倍 ATR，前一天收盤以下到當天收盤都是套牢區（例：胡連 9/3 跳空殺 7%）
+        tr_all = np.r_[np.nan, np.maximum(hi[1:], cl[:-1]) - np.minimum(lo[1:], cl[:-1])]
+        atr_then = pd.Series(tr_all).rolling(20, min_periods=10).mean().shift(1).to_numpy()   # 那一天之前的平常波動
+        for j in range(h + 1, k + 1):
+            if pd.notna(atr_then[j]) and cl[j - 1] - cl[j] >= LT_CRASH_ATR * atr_then[j]:
+                zones.append((float(cl[j]), float(max(cl[j - 1], hi[j]))))
 
         def headroom(x):
             """從價格 x 往上看：回傳 (空間 %, 壓力價, 說明)。"""
             if any(zb <= x < zt for zb, zt in zones):
-                return 0.0, x, f"已經卡在頭部大黑棒／上影線的套牢區（前高 {fmt_now(H)}），一噴就會被壓回"
+                return 0.0, x, f"已經卡在大黑棒／上影線的套牢區（前高 {fmt_now(H)}），一噴就會被壓回"
             above = [zb for zb, _ in zones if zb > x]
             if above and (min(above) / x - 1) * 100 < LT_ZONE_NEAR:
-                return (min(above) / x - 1) * 100, min(above), f"上面 {fmt_now(min(above))} 就是頭部大黑棒／上影線，一噴就會被壓回"
+                return (min(above) / x - 1) * 100, min(above), f"上面 {fmt_now(min(above))} 就是大黑棒／上影線的套牢區，一噴就會被壓回"
             return (H / x - 1) * 100, H, f"上面前高 {fmt_now(H)} 空間不夠"
         # 今天是不是「長紅」：帶量、漲幅夠、收在上段
         rng = hi[-1] - lo[-1]
