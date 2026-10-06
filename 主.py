@@ -2092,6 +2092,8 @@ LT_TOP_BEFORE = 5          # 頭部範圍：高點前幾天
 LT_TOP_AFTER = 10          # 頭部範圍：高點後幾天
 LT_TOP_BAND = 0.25         # 頭部套牢區只算價位在這一波最上面 25% 的 K 棒（下跌途中的不算）
 LT_ZONE_NEAR = 5.0         # 🔴 現價卡在頭部套牢區裡，或離套牢區底部不到此 %：一噴就撞到黑 K／上影線被壓回
+LT_CHOP_WAVE = 0.10        # 亂不亂：把一年走勢切成漲跌超過 10% 的波段
+LT_CHOP_DAYS = 10.0        # 每段波段中位數不到 10 天＝上下太快（例：士電 9.5 天），整檔不追；好例子鈊象 49、佳必琪 20、富邦媒 15.5、晶技 13
 LT_MIN_DAYS = 80           # 至少要有幾天股價資料才判斷
 LT_MAX_N = 15              # 信裡最多列幾檔
 LT_ACCUM_DAYS = 7          # 🟢 佈局：法人近 10 天至少幾天買超（在底部一直買）
@@ -2110,11 +2112,30 @@ def _swing(hi, lo, cl, atr):
     return None
 
 
+def _wave_days(cl, th=LT_CHOP_WAVE):
+    """把一年的收盤切成「漲或跌超過 th」的波段，回傳每段的中位天數；波段太少回傳無限大。"""
+    cl = cl[~np.isnan(cl)]
+    if len(cl) < 2:
+        return np.inf
+    hi_i = lo_i = 0
+    dirn, piv = 0, []
+    for i in range(1, len(cl)):
+        if cl[i] > cl[hi_i]:
+            hi_i = i
+        if cl[i] < cl[lo_i]:
+            lo_i = i
+        if dirn >= 0 and cl[i] <= cl[hi_i] * (1 - th):
+            piv.append(hi_i); dirn, lo_i = -1, i
+        elif dirn <= 0 and cl[i] >= cl[lo_i] * (1 + th):
+            piv.append(lo_i); dirn, hi_i = 1, i
+    return float(np.median(np.diff(piv))) if len(piv) >= 3 else np.inf
+
+
 def build_longtrack(radar):
     """從高點下來的股票：🔴 正在下來 → 🟡 低點整理、法人有撐 → 🟢 起漲第一根（立即反彈或整理後噴出），上面要有空間。"""
     cols = ["stock_id", "stock_name", "close", "qfii_now", "qfii_peak", "lt_light", "lt_text", "lt_order", "drop_rel",
-            "bottom", "base_high", "peak", "room"]
-    px = load_table("prices", 200)
+            "bottom", "base_high", "peak", "room", "base_days"]
+    px = load_table("prices", 365)
     px = px.sort_values(["stock_id", "date"])                 # 上市、上櫃都看
     if px.empty:
         return pd.DataFrame(columns=cols)
@@ -2133,6 +2154,8 @@ def build_longtrack(radar):
         if c < MIN_PRICE or not r.get("turnover", 0) >= MIN_DAILY_TURNOVER:
             continue
         cl = pd.to_numeric(p["close"], errors="coerce").to_numpy()
+        if _wave_days(cl[-240:]) < LT_CHOP_DAYS:
+            continue                                            # 一年來上下太快、很亂（士電型）：來不及跑也來不及追，不追
         hi = pd.to_numeric(p["high"], errors="coerce").fillna(pd.Series(cl, index=p.index)).to_numpy()
         lo = pd.to_numeric(p["low"], errors="coerce").fillna(pd.Series(cl, index=p.index)).to_numpy()
         vol = pd.to_numeric(p["volume"], errors="coerce").to_numpy()
@@ -2215,10 +2238,10 @@ def build_longtrack(radar):
                     "lt_light": light, "lt_text": text, "lt_order": order,
                     "drop_rel": float(net[-10:].sum()) if len(net) else 0.0,
                     "bottom": L, "base_high": cons_high if pd.notna(cons_high) else c, "peak": H,
-                    "room": room_w if light == "🟡" else room})
+                    "room": room_w if light == "🟡" else room, "base_days": d})
     df = pd.DataFrame(out, columns=cols)
     if not df.empty:
-        df = df.sort_values(["lt_order", "drop_rel"], ascending=[True, False]).reset_index(drop=True)
+        df = df.sort_values(["lt_order", "base_days", "drop_rel"], ascending=[True, True, False]).reset_index(drop=True)  # 整理越短排越前面
     print(f"長線追蹤：{len(df)} 檔｜" + str(df["lt_light"].value_counts().to_dict() if not df.empty else {}))
     return df
 
