@@ -2,7 +2,7 @@ name: Intraday 10am Check
 
 on:
   schedule:
-    - cron: "57 1 * * 1-5"  # 台灣時間週一至週五 09:57 啟動（GitHub 常延遲幾分鐘，信大約 10:00～10:15 到）
+    - cron: "27 3 * * 1-5"  # 台灣時間週一至週五 11:27 啟動（GitHub 常延遲幾分鐘，信大約 11:30～11:45 到）
   workflow_dispatch:        # 手動觸發按鈕（盤中才有報價）
 
 jobs:

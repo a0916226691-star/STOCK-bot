@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""10:00 盤中信：檢查今天「可買」的股票還能不能買、你的持股盤中有沒有要跑。
+"""11:30 盤中信：檢查今天「可買」的股票還能不能買、你的持股盤中有沒有要跑。
 
 資料：證交所盤中即時報價（mis.twse.com.tw）。法人資料要收盤後才公布，所以盤中只看股價和成交量。
 用法：python 盤中.py            # 抓即時報價 → 寄信
@@ -209,6 +209,6 @@ def run(send_mail=True, now=None, quotes=None):
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="10:00 盤中信")
+    ap = argparse.ArgumentParser(description="11:30 盤中信")
     ap.add_argument("--no-email", action="store_true")
     run(send_mail=not ap.parse_args().no_email)
