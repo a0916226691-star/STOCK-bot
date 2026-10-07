@@ -2098,6 +2098,7 @@ LT_CHOP_WAVE = 0.10        # 亂不亂：把一年走勢切成漲跌超過 10% �
 LT_CHOP_DAYS = 10.0        # 每段波段中位數不到 10 天＝上下太快（例：士電 9.5 天），整檔不追；好例子鈊象 49、佳必琪 20、富邦媒 15.5、晶技 13
 LT_TURN_MIN_D = 2          # 🟢 轉強：低點 2～10 天前（低點後盤整幾天）
 LT_TURN_MAX_D = 10
+LT_TURN_MIN_GAP = 2.0      # 🟢 轉強：收盤離月線至少 2%（太近一碰月線就被壓回；回測 0～2% 勝率 52%，2% 以上 65～78%）
 LT_INTRADAY_N = 40         # 盤中信最多盯幾檔 🟡
 LT_MIN_DAYS = 80           # 至少要有幾天股價資料才判斷
 LT_MAX_N = 15              # 信裡最多列幾檔
@@ -2241,7 +2242,10 @@ def build_longtrack(radar):
             continue                                            # 已經站上月線：不管轉強還是噴出都太晚了，不列（已經買的看「我的持股」）
         room_w, nearest_w, press_w = headroom(max(c, turn_px) if pd.notna(turn_px) else c)   # 🟡：從轉強價格往上算空間
         inst5 = len(net) >= 5 and net[-5:].sum() > 0              # 法人 5 日買超（回測：有買超勝率 66%，賣超只有 52%）
-        if turn and room >= LT_MIN_ROOM and not shadow and inst5 and quiet:
+        gap20 = (m20[-1] / c - 1) * 100                          # 離月線還有幾 %
+        if turn and gap20 < LT_TURN_MIN_GAP:
+            light, text, order = "🟡", f"站上 5 日、10 日線了，但離月線只剩 {gap20:.1f}%，太近容易被壓回", 1
+        elif turn and room >= LT_MIN_ROOM and not shadow and inst5 and quiet:
             light, text, order = "🟢", "站上 5 日、10 日線（還在月線下），法人也在買，可以買", 0
         elif turn and room >= LT_MIN_ROOM and not shadow:
             light, text, order = "🟡", "站上 5 日、10 日線了，但法人還在賣，等法人回來", 1
@@ -2292,6 +2296,34 @@ def longtrack_buys(radar, track):
     return b
 
 
+def add_points(sids):
+    """持股的「加碼點」：法人 5 日買超＋今天帶量長紅、從月線下貫穿月線（回測：轉強後出現貫穿，加碼那筆平均 +10%）。"""
+    out = {}
+    if not sids:
+        return out
+    px = load_table("prices", 90)
+    px = px[px["stock_id"].isin(sids)].sort_values(["stock_id", "date"])
+    inst = load_table("institutional", 20)
+    inst = inst[inst["stock_id"].isin(sids)].sort_values("date")
+    for sid, p in px.groupby("stock_id"):
+        cl = pd.to_numeric(p["close"], errors="coerce").to_numpy()
+        if len(cl) < 26:
+            continue
+        hi = pd.to_numeric(p["high"], errors="coerce").fillna(pd.Series(cl, index=p.index)).to_numpy()
+        lo = pd.to_numeric(p["low"], errors="coerce").fillna(pd.Series(cl, index=p.index)).to_numpy()
+        vol = pd.to_numeric(p["volume"], errors="coerce").to_numpy()
+        m20 = pd.Series(cl).rolling(20).mean().to_numpy()
+        tr = np.maximum(hi[1:], cl[:-1]) - np.minimum(lo[1:], cl[:-1])
+        atr = float(np.nanmean(tr[-21:-1]))
+        g = inst[inst["stock_id"] == sid]
+        n5 = float((pd.to_numeric(g["foreign_net"], errors="coerce").fillna(0)
+                    + pd.to_numeric(g["trust_net"], errors="coerce").fillna(0)).tail(5).sum())
+        if (cl[-1] > m20[-1] and cl[-2] <= m20[-2] and vol[-1] >= LT_BREAK_VOL * np.nanmean(vol[-6:-1])
+                and cl[-1] - cl[-2] >= LT_CANDLE_ATR * atr and n5 > 0):
+            out[sid] = f"🟢 加碼點：法人買超＋帶量長紅貫穿月線 {fmt_now(float(m20[-1]))}"
+    return out
+
+
 def build_simple_email(radar, data_date, holdings, track=None):
     """信件只放「長線追蹤」這套：法人賣到底 → 一直買、底部守住 → 帶量噴出才買。
     舊的佈局／突破／低接還是會算、存進紀錄（之後比較勝率用），但不寫進信裡。"""
@@ -2329,6 +2361,7 @@ def build_simple_email(radar, data_date, holdings, track=None):
     if not holdings:
         parts.append("（股票追蹤清單是空的）")
     multi = len({g for _, g in holdings.values()}) > 1
+    adds = add_points(list(holdings))
     cur = None
     for sid, (cost, group) in holdings.items():
         if multi and group != cur:
@@ -2339,7 +2372,7 @@ def build_simple_email(radar, data_date, holdings, track=None):
             continue
         r = rows.loc[sid]
         n_sell += inst_light(r).startswith("🔴")
-        parts.append("\n" + stock_block(r, sid, target=True))
+        parts.append("\n" + stock_block(r, sid, target=True) + (f"\n{adds[sid]}" if sid in adds else ""))
     return "\n".join(parts) + "\n", len(buys), len(watches), n_sell
 
 

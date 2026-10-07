@@ -94,7 +94,23 @@ def load_context():
     names = px.groupby("stock_id")["stock_name"].last().to_dict()
     cost = R.make_inst_cost(R.load_table("institutional", 30), R.load_table("prices", 30))
     cost = cost.set_index("stock_id")["inst_cost"].to_dict() if not cost.empty else {}
-    return last, buys, waits, market, vol5, names, cost
+    # 加碼點要用的：前 19 天收盤合計、昨天的月線、ATR、法人 5 日買賣超
+    ma = {}
+    inst = R.load_table("institutional", 20)
+    for sid, g in px.groupby("stock_id"):
+        cl = pd.to_numeric(g["close"], errors="coerce").to_numpy()
+        if len(cl) < 21:
+            continue
+        hi = pd.to_numeric(g["high"], errors="coerce").fillna(pd.Series(cl, index=g.index)).to_numpy()
+        lo = pd.to_numeric(g["low"], errors="coerce").fillna(pd.Series(cl, index=g.index)).to_numpy()
+        tr = np.maximum(hi[1:], cl[:-1]) - np.minimum(lo[1:], cl[:-1])
+        ma[sid] = dict(s19=float(np.nansum(cl[-19:])), ma20_prev=float(np.nanmean(cl[-20:])), atr=float(np.nanmean(tr[-20:])))
+    if not inst.empty:
+        inst["net"] = pd.to_numeric(inst["foreign_net"], errors="coerce").fillna(0) + pd.to_numeric(inst["trust_net"], errors="coerce").fillna(0)
+        for sid, g in inst.sort_values("date").groupby("stock_id"):
+            if sid in ma:
+                ma[sid]["inst5"] = float(g["net"].tail(5).sum())
+    return last, buys, waits, market, vol5, names, cost, ma
 
 
 def buy_status(q, vol5, frac):
@@ -135,7 +151,7 @@ def block(name, sid, q, chg, status):
 
 def run(send_mail=True, now=None, quotes=None):
     now = now or R.now_tw()
-    last, buys, waits, market, vol5, names, cost = load_context()
+    last, buys, waits, market, vol5, names, cost, ma = load_context()
     holdings = R.load_holdings()
     want = {sid: ("otc" if market.get(sid) == "TPEx" else "tse")
             for sid in list(buys["stock_id"] if not buys.empty else []) + list(waits["stock_id"] if not waits.empty else [])
@@ -200,6 +216,14 @@ def run(send_mail=True, now=None, quotes=None):
             continue
         chg, st = hold_status(q, vol5.get(sid), frac, cost.get(sid, np.nan))
         n_red += st.startswith("🔴")
+        m = ma.get(sid)
+        if m and not st.startswith("🔴"):
+            p, v5 = q["price"], vol5.get(sid)
+            ma20 = (m["s19"] + p) / 20
+            proj = q["vol_lots"] / frac if pd.notna(q["vol_lots"]) else np.nan
+            if (p > ma20 and q["prev"] <= m["ma20_prev"] and p - q["prev"] >= m["atr"] and m.get("inst5", 0) > 0
+                    and pd.notna(proj) and pd.notna(v5) and v5 > 0 and proj >= v5 * 1.5):
+                st += f"\n🟢 加碼點：法人買超＋盤中帶量長紅貫穿月線 {R.fmt_now(ma20)}，收盤還在月線上就加碼"
         parts.append("\n" + block(nm, sid, q, chg, st))
     body = "\n".join(parts) + "\n"
     print(body)
