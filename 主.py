@@ -2098,6 +2098,7 @@ LT_CHOP_WAVE = 0.10        # 亂不亂：把一年走勢切成漲跌超過 10% �
 LT_CHOP_DAYS = 10.0        # 每段波段中位數不到 10 天＝上下太快（例：士電 9.5 天），整檔不追；好例子鈊象 49、佳必琪 20、富邦媒 15.5、晶技 13
 LT_TURN_MIN_D = 2          # 🟢 轉強：低點 2～10 天前（低點後盤整幾天）
 LT_TURN_MAX_D = 10
+LT_INTRADAY_N = 40         # 盤中信最多盯幾檔 🟡
 LT_MIN_DAYS = 80           # 至少要有幾天股價資料才判斷
 LT_MAX_N = 15              # 信裡最多列幾檔
 LT_ACCUM_DAYS = 7          # 🟢 佈局：法人近 10 天至少幾天買超（在底部一直買）
@@ -2138,7 +2139,7 @@ def _wave_days(cl, th=LT_CHOP_WAVE):
 def build_longtrack(radar):
     """從高點下來的股票：🔴 正在下來 → 🟡 低點整理、法人有撐 → 🟢 起漲第一根（立即反彈或整理後噴出），上面要有空間。"""
     cols = ["stock_id", "stock_name", "close", "qfii_now", "qfii_peak", "lt_light", "lt_text", "lt_order", "drop_rel",
-            "bottom", "base_high", "peak", "room", "base_days", "turn_px"]
+            "bottom", "base_high", "peak", "room", "base_days", "turn_px", "s4", "s9", "s19"]
     px = load_table("prices", 365)
     px = px.sort_values(["stock_id", "date"])                 # 上市、上櫃都看
     if px.empty:
@@ -2229,37 +2230,40 @@ def build_longtrack(radar):
         above510 = (cl > m5) & (cl > m10)
         turn = (LT_TURN_MIN_D <= d <= LT_TURN_MAX_D and bool(above510[-1]) and c < m20[-1]
                 and not above510[k + 1:-1].any())
-        turn_px = float(max(m5[-1], m10[-1])) if c < min(m5[-1], m10[-1]) else np.nan
+        turn_px = float(max(m5[-1], m10[-1])) if not above510[-1] else np.nan   # 收盤要站上的價位
         rebound = strong and d <= LT_REBOUND_DAYS               # 低點立即反彈
         breakout = strong and d > LT_REBOUND_DAYS and pd.notna(cons_high) and c > cons_high   # 整理後噴出
         if retr > LT_MAX_RETRACE and not ((rebound or breakout) and retr_prev <= LT_MAX_RETRACE):
             continue                                            # 已經彈回一半以上、又不是「昨天還在低檔、今天噴出」：不是低檔了
-        if turn and room >= LT_MIN_ROOM and not long_upper_shadow(r):   # 轉強在底部，法人常常還在零星賣：不看法人，只排除拉高出貨
+        # 燈號（10/7 版）：🔴 還在破底／跌破低點 → 🟡 止跌、低點盤整（低點不能破）→ 🟢 收盤同時站上 5 日、10 日線、還沒到月線
+        shadow = long_upper_shadow(r)
+        room_w, nearest_w, press_w = headroom(max(c, turn_px) if pd.notna(turn_px) else c)   # 🟡：從轉強價格往上算空間
+        if turn and room >= LT_MIN_ROOM and not shadow:
             light, text, order = "🟢", "站上 5 日、10 日線（還在月線下），可以買", 0
         elif turn and room < LT_MIN_ROOM:
             light, text, order = "🔴", f"站上 5 日、10 日線了，但{press}", 2
         elif (rebound or breakout) and room >= LT_MIN_ROOM and inst_today and inst3 and quiet:
             light, order = "🟢", 0
-            text = "低點立即反彈，可以買" if rebound else "整理後噴出一根，可以買（已佈局就加碼）"
+            text = "低點立即反彈，可以買" if rebound else "整理後噴出一根，可以買（已經買了就加碼）"
         elif (rebound or breakout) and room < LT_MIN_ROOM:
             light, text, order = "🔴", f"出長紅了，但{press}", 2
-        elif d >= 3 and accum and room >= LT_MIN_ROOM and quiet and c > L:
-            light, text, order = "🟢", "法人在底部一直買，可以先佈局（買一半）", 0
-        elif d >= 3 and inst10 and room_w >= LT_MIN_ROOM:
-            light, text, order = "🟡", "法人開始買，等帶量站上噴出價格", 1
-        elif d >= 3 and inst10:
-            light, text, order = "🔴", f"法人有撐，但{press_w}", 2
-        elif d < 3:
-            light, text, order = "🔴", "正在下來", 2
+        elif d < LT_TURN_MIN_D:
+            light, text, order = "🔴", "還在破底，等止跌", 2
+        elif room_w < LT_MIN_ROOM:
+            light, text, order = "🔴", f"止跌了，但{press_w}", 2
+        elif c >= m20[-1]:
+            continue                                            # 已經站上月線：這一波已經走了，不追（已經買的看「我的持股」）
         else:
-            light, text, order = "🔴", "低點整理，法人還沒撐", 2
+            chip = "，法人在底部一直買" if accum else ("，法人開始買" if inst10 else "")
+            light, text, order = "🟡", f"止跌盤整{chip}，等站上 5 日、10 日線（低點不能破）", 1
         q = fq.get(sid, np.array([]))
         out.append({"stock_id": sid, "stock_name": r["stock_name"], "close": c,
                     "qfii_now": float(q[-1]) if len(q) else np.nan, "qfii_peak": float(np.nanmax(q[-250:])) if len(q) else np.nan,
                     "lt_light": light, "lt_text": text, "lt_order": order,
                     "drop_rel": float(net[-10:].sum()) if len(net) else 0.0,
                     "bottom": L, "base_high": cons_high if pd.notna(cons_high) else c, "peak": H,
-                    "room": room_w if light == "🟡" else room, "base_days": d, "turn_px": turn_px})
+                    "room": room_w if light == "🟡" else room, "base_days": d, "turn_px": turn_px,
+                    "s4": float(np.nansum(cl[-4:])), "s9": float(np.nansum(cl[-9:])), "s19": float(np.nansum(cl[-19:]))})
     df = pd.DataFrame(out, columns=cols)
     if not df.empty:
         df = df.sort_values(["lt_order", "base_days", "drop_rel"], ascending=[True, True, False]).reset_index(drop=True)  # 整理越短排越前面
@@ -2306,13 +2310,13 @@ def build_simple_email(radar, data_date, holdings, track=None):
     if track is not None and not track.empty:
         t = track.head(LT_MAX_N)
         n_y = int((track["lt_light"] == "🟡").sum())
-        parts.append(f"\n\n【追蹤：從高點下來】{len(track)} 檔（🟡 {n_y} 檔低點整理等長紅，列前 {len(t)} 檔）")
+        parts.append(f"\n\n【追蹤：從高點下來】{len(track)} 檔（🟡 {n_y} 檔止跌盤整，列前 {len(t)} 檔）")
         for _, x in t.iterrows():
             parts.append(f"\n股票代號：{x['stock_name']}({x['stock_id']})\n"
                          f"目前價格：{fmt_now(float(x['close']))}\n"
-                         f"前高／低點：{fmt_now(float(x['peak']))}／{fmt_now(float(x['bottom']))}（跌破低點就重新觀察）\n"
-                         + (f"轉強價格：{fmt_now(float(x['turn_px']))}（收盤站上 5 日、10 日線就買）\n" if pd.notna(x.get("turn_px")) and x["lt_light"] != "🟢" and float(x["close"]) > float(x["bottom"]) else "")
-                         + (f"噴出價格：{fmt_now(float(x['base_high']))}（帶量長紅站上就買）\n" if x["lt_light"] == "🟡" else "")
+                         f"前高／低點：{fmt_now(float(x['peak']))}／{fmt_now(float(x['bottom']))}（低點跌破就變 🔴）\n"
+                         + (f"轉強價格：{fmt_now(float(x['turn_px']))}（收盤站上 5 日、10 日線就轉 🟢）\n" if pd.notna(x.get("turn_px")) and x["lt_light"] == "🟡" else "")
+
                          + f"法人動態：{x['lt_light']} {x['lt_text']}")
         watches = list(track.loc[track["lt_light"] == "🟡", "stock_id"])
     else:
@@ -2416,10 +2420,10 @@ def run(send_mail=True, collect_only=False):
         if not track.empty:
             track.to_csv(os.path.join(OUTPUT_DIR, f"longtrack_{data_date}.csv"), index=False, encoding="utf-8-sig")
             rb = longtrack_buys(radar, track)
-            yl = track[track["lt_light"] == "🟡"]
+            yl = track[track["lt_light"] == "🟡"].head(LT_INTRADAY_N)
             recs = ([(data_date, x["stock_id"], x["stock_name"], "C回補", float(x["close"]), "") for _, x in rb.iterrows()]
                     + [(data_date, x["stock_id"], x["stock_name"], "C等噴出", float(x["close"]),
-                        f"{x['base_high']}|{x['bottom']}") for _, x in yl.iterrows()])
+                        f"{x['s4']}|{x['s9']}|{x['s19']}|{x['bottom']}") for _, x in yl.iterrows()])
             with db() as conn:
                 conn.execute("DELETE FROM picks WHERE date=? AND grp IN ('C回補','C等噴出')", (data_date,))
                 if recs:
@@ -2432,7 +2436,7 @@ def run(send_mail=True, collect_only=False):
     print("\n===== 信件內容 =====\n" + body)
     if send_mail:
         md = f"{int(data_date[5:7])}/{data_date[8:]}"
-        subject = f"{'🚨' if n_sell else ''}台股雷達 {md}｜可買{n_buy} 等噴出{n_watch}" + (f" 持股賣出{n_sell}" if n_sell else "")
+        subject = f"{'🚨' if n_sell else ''}台股雷達 {md}｜可買{n_buy} 止跌{n_watch}" + (f" 持股賣出{n_sell}" if n_sell else "")
         send_email(subject, body)
     print("=== 完成 ===")
 

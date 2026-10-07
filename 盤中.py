@@ -164,25 +164,29 @@ def run(send_mail=True, now=None, quotes=None):
         parts.append("\n" + block(b["stock_name"], b["stock_id"], q, chg, st))
 
     if not waits.empty:
-        parts.append(f"\n\n【等噴出】{len(waits)} 檔（長線追蹤🟡）")
+        turned, broke = [], []
         for _, w in waits.iterrows():
             q = live.get(w["stock_id"])
             if q is None:
                 continue
-            base_high, bottom = (float(x) for x in str(w["note"]).split("|"))
-            chg = (q["price"] / q["prev"] - 1) * 100
-            proj = q["vol_lots"] / frac if pd.notna(q["vol_lots"]) else np.nan
-            v5 = vol5.get(w["stock_id"])
-            heavy = pd.notna(proj) and pd.notna(v5) and v5 > 0 and proj >= v5 * 1.5
-            if q["price"] < bottom:
-                st = "🔴 跌破底部，重新觀察"
-            elif q["price"] > base_high and heavy:
-                st = f"🟢 盤中帶量站上 {R.fmt_now(base_high)}，噴出了"
-            elif q["price"] > base_high:
-                st = f"🟡 站上 {R.fmt_now(base_high)} 但量還不夠，等收盤確認"
-            else:
-                st = f"🟡 還沒噴（噴出價格 {R.fmt_now(base_high)}）"
-            parts.append("\n" + block(w["stock_name"], w["stock_id"], q, chg, st))
+            try:
+                s4, s9, s19, bottom = (float(x) for x in str(w["note"]).split("|"))
+            except ValueError:
+                continue                                      # 舊格式的紀錄，略過
+            p = q["price"]
+            ma5, ma10, ma20 = (s4 + p) / 5, (s9 + p) / 10, (s19 + p) / 20   # 用目前價格算今天的均線
+            chg = (p / q["prev"] - 1) * 100
+            if p < bottom:
+                broke.append(block(w["stock_name"], w["stock_id"], q, chg, f"🔴 跌破低點 {R.fmt_now(bottom)}，止跌失敗"))
+            elif p > ma5 and p > ma10 and p < ma20:
+                turned.append(block(w["stock_name"], w["stock_id"], q, chg,
+                                    f"🟢 盤中站上 5 日線 {R.fmt_now(ma5)}、10 日線 {R.fmt_now(ma10)}（月線 {R.fmt_now(ma20)}），"
+                                    f"收盤還在上面就是買點｜停損 {R.fmt_now(bottom)}"))
+        parts.append(f"\n\n【止跌股盤中轉強】{len(turned)} 檔（從 {len(waits)} 檔 🟡 裡找）")
+        parts.extend("\n" + x for x in turned)
+        if broke:
+            parts.append(f"\n\n【止跌股跌破低點】{len(broke)} 檔")
+            parts.extend("\n" + x for x in broke)
 
     n_red = 0
     parts.append(f"\n\n【我的持股】{len(holdings)} 檔")
