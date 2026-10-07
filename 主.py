@@ -2237,6 +2237,8 @@ def build_longtrack(radar):
             continue                                            # 已經彈回一半以上、又不是「昨天還在低檔、今天噴出」：不是低檔了
         # 燈號（10/7 版）：🔴 還在破底／跌破低點 → 🟡 止跌、低點盤整（低點不能破）→ 🟢 收盤同時站上 5 日、10 日線、還沒到月線
         shadow = long_upper_shadow(r)
+        if c >= m20[-1]:
+            continue                                            # 已經站上月線：不管轉強還是噴出都太晚了，不列（已經買的看「我的持股」）
         room_w, nearest_w, press_w = headroom(max(c, turn_px) if pd.notna(turn_px) else c)   # 🟡：從轉強價格往上算空間
         inst5 = len(net) >= 5 and net[-5:].sum() > 0              # 法人 5 日買超（回測：有買超勝率 66%，賣超只有 52%）
         if turn and room >= LT_MIN_ROOM and not shadow and inst5 and quiet:
@@ -2254,8 +2256,6 @@ def build_longtrack(radar):
             light, text, order = "🔴", "還在破底，等止跌", 2
         elif room_w < LT_MIN_ROOM:
             light, text, order = "🔴", f"止跌了，但{press_w}", 2
-        elif c >= m20[-1]:
-            continue                                            # 已經站上月線：這一波已經走了，不追（已經買的看「我的持股」）
         else:
             chip = "，法人在底部一直買" if accum else ("，法人開始買" if inst10 else "")
             light, text, order = "🟡", f"止跌盤整{chip}，等站上 5 日、10 日線（低點不能破）", 1
