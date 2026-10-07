@@ -2238,8 +2238,11 @@ def build_longtrack(radar):
         # 燈號（10/7 版）：🔴 還在破底／跌破低點 → 🟡 止跌、低點盤整（低點不能破）→ 🟢 收盤同時站上 5 日、10 日線、還沒到月線
         shadow = long_upper_shadow(r)
         room_w, nearest_w, press_w = headroom(max(c, turn_px) if pd.notna(turn_px) else c)   # 🟡：從轉強價格往上算空間
-        if turn and room >= LT_MIN_ROOM and not shadow:
-            light, text, order = "🟢", "站上 5 日、10 日線（還在月線下），可以買", 0
+        inst5 = len(net) >= 5 and net[-5:].sum() > 0              # 法人 5 日買超（回測：有買超勝率 66%，賣超只有 52%）
+        if turn and room >= LT_MIN_ROOM and not shadow and inst5 and quiet:
+            light, text, order = "🟢", "站上 5 日、10 日線（還在月線下），法人也在買，可以買", 0
+        elif turn and room >= LT_MIN_ROOM and not shadow:
+            light, text, order = "🟡", "站上 5 日、10 日線了，但法人還在賣，等法人回來", 1
         elif turn and room < LT_MIN_ROOM:
             light, text, order = "🔴", f"站上 5 日、10 日線了，但{press}", 2
         elif (rebound or breakout) and room >= LT_MIN_ROOM and inst_today and inst3 and quiet:
@@ -2279,8 +2282,9 @@ def longtrack_buys(radar, track):
     b = radar[radar["stock_id"].isin(ids)].drop_duplicates("stock_id").copy()
     kind = track.set_index("stock_id")["lt_text"].to_dict()
     turn = {s for s, t in kind.items() if "站上 5 日" in t}
-    # 轉強型在底部，法人常常還在零星賣：不看法人（回測加法人條件反而沒比較好）；其他類型要法人 🟢
-    b = b[b.apply(lambda r: r["stock_id"] in turn or inst_light(r).startswith("🟢"), axis=1)] if not b.empty else b
+    # 轉強型（已經要求法人 5 日買超）：法人燈號不能是 🔴；其他類型要法人 🟢
+    b = b[b.apply(lambda r: (not inst_light(r).startswith("🔴")) if r["stock_id"] in turn
+                  else inst_light(r).startswith("🟢"), axis=1)] if not b.empty else b
     b["setup"] = b["stock_id"].map(lambda s: "LT_TURN" if s in turn else ("LT_ACCUM" if "先佈局" in kind.get(s, "") else "LT_BREAK"))
     b["lt_stop"] = b["stock_id"].map(track.set_index("stock_id")["bottom"].to_dict())
     b["_o"] = b["setup"].map({"LT_TURN": 0, "LT_BREAK": 1, "LT_ACCUM": 2})
@@ -2301,8 +2305,6 @@ def build_simple_email(radar, data_date, holdings, track=None):
     for _, r in buys.iterrows():
         stop = r.get("lt_stop")
         blk = stock_block(r, target=True, kind=True)
-        if r.get("setup") == "LT_TURN" and not inst_light(r).startswith("🟢"):
-            blk = blk.replace(f"法人動態：{inst_light(r)}", f"法人動態：{inst_light(r)}（底部法人常還在小賣，轉強型看停損價就好）")
         parts.append("\n" + blk
                      + (f"\n停損價格：{fmt_now(float(stop))}（低點，收盤跌破就賣）" if pd.notna(stop) else ""))
 
