@@ -2236,7 +2236,7 @@ def _wave_days(cl, th=LT_CHOP_WAVE):
 def build_longtrack(radar):
     """從高點下來的股票：🔴 正在下來 → 🟡 低點整理、法人有撐 → 🟢 起漲第一根（立即反彈或整理後噴出），上面要有空間。"""
     cols = ["stock_id", "stock_name", "close", "qfii_now", "qfii_peak", "lt_light", "lt_text", "lt_order", "drop_rel",
-            "bottom", "base_high", "peak", "room", "base_days", "turn_px", "s4", "s9", "s19"]
+            "bottom", "base_high", "peak", "room", "base_days", "turn_px", "mbull", "s4", "s9", "s19"]
     px = load_table("prices", 365)
     px = px.sort_values(["stock_id", "date"])                 # 上市、上櫃都看
     if px.empty:
@@ -2247,6 +2247,12 @@ def build_longtrack(radar):
     fh = load_table("foreign_hold", 400)
     fq = {k: g.sort_values("date")["qfii_ratio"].astype(float).to_numpy() for k, g in fh.groupby("stock_id")} if not fh.empty else {}
     rows = radar.drop_duplicates("stock_id").set_index("stock_id")
+    try:
+        with db() as conn:
+            mon = pd.read_sql("SELECT month, stock_id, close FROM monthly ORDER BY stock_id, month", conn, dtype={"stock_id": str})
+        mcl = {k: g["close"].astype(float).to_numpy() for k, g in mon.groupby("stock_id")}
+    except Exception:
+        mcl = {}
     out = []
     for sid, p in px.groupby("stock_id"):
         if sid not in rows.index or sid in EXCLUDE_TOOL_STOCKS or sid.startswith("00") or len(p) < LT_MIN_DAYS:
@@ -2367,6 +2373,15 @@ def build_longtrack(radar):
         else:
             chip = "，法人在底部一直買" if accum else ("，法人開始買" if inst10 else "")
             light, text, order = "🟡", f"止跌盤整{chip}，等站上 5 日、10 日線（低點不能破）", 1
+        # 月 K 多頭（加分，不是必要條件）：月收盤站上 10 月線、10 月線往上
+        mc = mcl.get(sid, np.array([]))
+        mbull = False
+        if len(mc) >= 11:
+            mc = mc.copy(); mc[-1] = c                                    # 這個月的 K 棒用今天收盤
+            ma10m = pd.Series(mc).rolling(10).mean().to_numpy()
+            mbull = bool(c > ma10m[-1] and ma10m[-1] > ma10m[-2])
+        if mbull and light in ("🟢", "🟡"):
+            text = "⭐ 月K多頭｜" + text
         q = fq.get(sid, np.array([]))
         out.append({"stock_id": sid, "stock_name": r["stock_name"], "close": c,
                     "qfii_now": float(q[-1]) if len(q) else np.nan, "qfii_peak": float(np.nanmax(q[-250:])) if len(q) else np.nan,
@@ -2374,10 +2389,10 @@ def build_longtrack(radar):
                     "drop_rel": float(net[-10:].sum()) if len(net) else 0.0,
                     "bottom": L, "base_high": cons_high if pd.notna(cons_high) else c, "peak": H,
                     "room": room_w if light == "🟡" else room, "base_days": d, "turn_px": turn_px,
-                    "s4": float(np.nansum(cl[-4:])), "s9": float(np.nansum(cl[-9:])), "s19": float(np.nansum(cl[-19:]))})
+                    "mbull": mbull, "s4": float(np.nansum(cl[-4:])), "s9": float(np.nansum(cl[-9:])), "s19": float(np.nansum(cl[-19:]))})
     df = pd.DataFrame(out, columns=cols)
     if not df.empty:
-        df = df.sort_values(["lt_order", "base_days", "drop_rel"], ascending=[True, True, False]).reset_index(drop=True)  # 整理越短排越前面
+        df = df.sort_values(["lt_order", "mbull", "base_days", "drop_rel"], ascending=[True, False, True, False]).reset_index(drop=True)  # 整理越短排越前面
     print(f"長線追蹤：{len(df)} 檔｜" + str(df["lt_light"].value_counts().to_dict() if not df.empty else {}))
     return df
 
@@ -2395,8 +2410,9 @@ def longtrack_buys(radar, track):
                   else inst_light(r).startswith("🟢"), axis=1)] if not b.empty else b
     b["setup"] = b["stock_id"].map(lambda s: "LT_TURN" if s in turn else ("LT_ACCUM" if "先佈局" in kind.get(s, "") else "LT_BREAK"))
     b["lt_stop"] = b["stock_id"].map(track.set_index("stock_id")["bottom"].to_dict())
+    b["mbull"] = b["stock_id"].map(track.set_index("stock_id")["mbull"].to_dict()).fillna(False)
     b["_o"] = b["setup"].map({"LT_TURN": 0, "LT_BREAK": 1, "LT_ACCUM": 2})
-    b = b.sort_values("_o").drop(columns="_o")
+    b = b.sort_values(["mbull", "_o"], ascending=[False, True]).drop(columns="_o")
     return b
 
 
@@ -2441,6 +2457,8 @@ def build_simple_email(radar, data_date, holdings, track=None):
     for _, r in buys.iterrows():
         stop = r.get("lt_stop")
         blk = stock_block(r, target=True, kind=True)
+        if r.get("mbull"):
+            blk += "\n月K：⭐ 多頭（站上 10 月線、10 月線往上）"
         parts.append("\n" + blk
                      + (f"\n停損價格：{fmt_now(float(stop))}（低點，收盤跌破就賣）" if pd.notna(stop) else ""))
 
