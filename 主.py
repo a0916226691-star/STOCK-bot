@@ -2098,6 +2098,7 @@ LT_CHOP_WAVE = 0.10        # 亂不亂：把一年走勢切成漲跌超過 10% �
 LT_CHOP_DAYS = 10.0        # 每段波段中位數不到 10 天＝上下太快（例：士電 9.5 天），整檔不追；好例子鈊象 49、佳必琪 20、富邦媒 15.5、晶技 13
 LT_TURN_MIN_D = 2          # 🟢 轉強：低點 2～10 天前（低點後盤整幾天）
 LT_TURN_MAX_D = 10
+# 長均保護短均：🟡、🟢 都要半年線（120 日）比 20 天前高（回測：半年線往上勝率 73%、+10.5%；往下 64%、+4.3%）
 LT_TURN_MIN_GAP = 2.0      # 🟢 轉強：收盤離月線至少 2%（太近一碰月線就被壓回；回測 0～2% 勝率 52%，2% 以上 65～78%）
 LT_INTRADAY_N = 40         # 盤中信最多盯幾檔 🟡
 LT_MIN_DAYS = 80           # 至少要有幾天股價資料才判斷
@@ -2243,7 +2244,13 @@ def build_longtrack(radar):
         room_w, nearest_w, press_w = headroom(max(c, turn_px) if pd.notna(turn_px) else c)   # 🟡：從轉強價格往上算空間
         inst5 = len(net) >= 5 and net[-5:].sum() > 0              # 法人 5 日買超（回測：有買超勝率 66%，賣超只有 52%）
         gap20 = (m20[-1] / c - 1) * 100                          # 離月線還有幾 %
-        if turn and gap20 < LT_TURN_MIN_GAP:
+        m120 = ser.rolling(120).mean().to_numpy()
+        up120 = len(m120) > 140 and m120[-1] > m120[-21]           # 半年線往上：長均保護短均
+        if not up120:
+            light, order = "🔴", 2
+            text = (f"半年線往下（{fmt_now(float(m120[-1]))}），長期趨勢向下，反彈容易被壓回" if pd.notna(m120[-1])
+                    else "資料不到半年，看不出長期趨勢")
+        elif turn and gap20 < LT_TURN_MIN_GAP:
             light, text, order = "🟡", f"站上 5 日、10 日線了，但離月線只剩 {gap20:.1f}%，太近容易被壓回", 1
         elif turn and room >= LT_MIN_ROOM and not shadow and inst5 and quiet:
             light, text, order = "🟢", "站上 5 日、10 日線（還在月線下），法人也在買，可以買", 0
