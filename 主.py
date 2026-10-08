@@ -1007,7 +1007,7 @@ def _agg_month(df):
     return out[MONTHLY_COLS]
 
 
-def backfill_monthly(market, years=3, max_months=12):
+def backfill_monthly(market, years=3, max_months=40):
     """回補上市（TWSE）或上櫃（TPEx）過去幾年的月 K：一天一天抓，合成月 K 存起來，每日資料不存（省空間）。"""
     fetch = fetch_twse_quotes if market == "TWSE" else fetch_tpex_quotes_hist
     now = now_tw()

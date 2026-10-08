@@ -116,6 +116,7 @@ jobs:
             echo "No CSV changes to save."
           else
             git commit -m "Save stock data"
+            git pull --rebase origin ${{ github.ref_name }}   # 跑的期間有人推了程式修改：先接上最新版再存
             git push origin HEAD:${{ github.ref_name }}
           fi
 
