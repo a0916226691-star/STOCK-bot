@@ -13,6 +13,10 @@ on:
         description: "回補外資持股比例幾個日曆天（長線追蹤用，第一次填 365；平常留 0）"
         required: false
         default: "0"
+      backfill_monthly:
+        description: "回補 3 年月 K：填 TWSE（上市）或 TPEx（上櫃），一次一個；平常留空"
+        required: false
+        default: ""
       backfill_tpex:
         description: "回補上櫃股價和法人幾個日曆天（第一次填 365）；平常留 0"
         required: false
@@ -59,7 +63,12 @@ jobs:
           BACKFILL_PRICES: ${{ github.event.inputs.backfill_prices }}
           BACKFILL_QFII: ${{ github.event.inputs.backfill_qfii }}
           BACKFILL_TPEX: ${{ github.event.inputs.backfill_tpex }}
+          BACKFILL_MONTHLY: ${{ github.event.inputs.backfill_monthly }}
         run: |
+          if [ -n "$BACKFILL_MONTHLY" ]; then
+            python 主.py --collect-only --backfill-monthly "$BACKFILL_MONTHLY"
+            exit 0
+          fi
           if [ -n "$BACKFILL_TPEX" ] && [ "$BACKFILL_TPEX" != "0" ]; then
             python 主.py --collect-only --backfill-tpex "$BACKFILL_TPEX"
             exit 0

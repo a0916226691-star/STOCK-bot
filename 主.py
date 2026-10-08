@@ -283,6 +283,8 @@ def init_db():
     with db() as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS prices (date TEXT, stock_id TEXT, stock_name TEXT, market TEXT, "
                      "close REAL, volume INTEGER, turnover REAL, high REAL, low REAL, PRIMARY KEY(date, stock_id))")
+        conn.execute("CREATE TABLE IF NOT EXISTS monthly (month TEXT, stock_id TEXT, market TEXT, open REAL, high REAL, "
+                     "low REAL, close REAL, volume REAL, PRIMARY KEY(month, stock_id))")
         conn.execute("CREATE TABLE IF NOT EXISTS institutional (date TEXT, stock_id TEXT, foreign_net INTEGER, "
                      "trust_net INTEGER, dealer_prop INTEGER, dealer_hedge INTEGER, dealer_total INTEGER, "
                      "market TEXT, PRIMARY KEY(date, stock_id, market))")
@@ -981,6 +983,95 @@ def backfill_tpex(days):
         if fail >= 5:
             print("⚠ 連續 5 天抓不到上櫃資料，可能被擋，先停")
             break
+
+
+# ───────────────────────── 月 K（長期趨勢）─────────────────────────
+MONTHLY_COLS = ["month", "stock_id", "market", "open", "high", "low", "close", "volume"]
+KEEP_DAILY_DAYS = 380      # 每日股價只留這麼多天（資料庫不能超過 GitHub 100MB 上限）；更早的只留月 K
+
+
+def _agg_month(df):
+    """把同一個月的每日股價合成月 K。"""
+    if df.empty:
+        return pd.DataFrame(columns=MONTHLY_COLS)
+    df = df.sort_values(["stock_id", "date"]).copy()
+    df["month"] = df["date"].str[:7]
+    for c in ("open", "high", "low", "close", "volume"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["open"] = df["open"].fillna(df["close"])
+    df["high"] = df["high"].fillna(df["close"])
+    df["low"] = df["low"].fillna(df["close"])
+    g = df.groupby(["month", "stock_id"])
+    out = pd.DataFrame({"market": g["market"].last(), "open": g["open"].first(), "high": g["high"].max(),
+                        "low": g["low"].min(), "close": g["close"].last(), "volume": g["volume"].sum()}).reset_index()
+    return out[MONTHLY_COLS]
+
+
+def backfill_monthly(market, years=3):
+    """回補上市（TWSE）或上櫃（TPEx）過去幾年的月 K：一天一天抓，合成月 K 存起來，每日資料不存（省空間）。"""
+    fetch = fetch_twse_quotes if market == "TWSE" else fetch_tpex_quotes_hist
+    now = now_tw()
+    first = (now - timedelta(days=int(365 * years))).replace(day=1)
+    months = pd.period_range(first.strftime("%Y-%m"), now.strftime("%Y-%m"), freq="M")[:-1]   # 不含這個月（每天會從每日股價算）
+    with db() as conn:
+        have = {r[0] for r in conn.execute("SELECT month FROM monthly WHERE market=? GROUP BY month HAVING COUNT(*) >= 100", (market,))}
+    empty_run = 0
+    for m in months:
+        ms = str(m)
+        if ms in have:
+            continue
+        days = [d.strftime("%Y%m%d") for d in pd.date_range(m.start_time, m.end_time, freq="B")]
+        frames = []
+        for d in days:
+            try:
+                f = fetch(d)
+                if not f.empty:
+                    frames.append(f)
+            except Exception as e:
+                print(f"  {market} {d} 失敗：{e}")
+            time.sleep(1.5)
+        n = upsert("monthly", _agg_month(pd.concat(frames, ignore_index=True)) if frames else pd.DataFrame(columns=MONTHLY_COLS),
+                   MONTHLY_COLS)
+        print(f"回補月 K {market} {ms}：{len(frames)} 個交易日，{n} 檔")
+        empty_run = 0 if n else empty_run + 1
+        if empty_run >= 3:
+            print("⚠ 連續 3 個月抓不到資料，可能被擋，先停")
+            break
+
+
+def update_monthly_and_prune():
+    """每天：用每日股價更新月 K（只更新資料完整的月份＋這個月），再把太舊的每日資料刪掉、壓縮資料庫。"""
+    px = load_table("prices", KEEP_DAILY_DAYS + 60)
+    if not px.empty:
+        for mk, g in px.groupby("market"):
+            first_month = g["date"].min()[:7]
+            g = g[g["date"].str[:7] > first_month]             # 第一個月可能不完整，留給回補的資料
+            upsert("monthly", _agg_month(g), MONTHLY_COLS)
+    cutoff = (now_tw() - timedelta(days=KEEP_DAILY_DAYS)).strftime("%Y-%m-%d")
+    with db() as conn:
+        n1 = conn.execute("DELETE FROM prices WHERE date < ?", (cutoff,)).rowcount
+        n2 = conn.execute("DELETE FROM foreign_hold WHERE date < ?", (cutoff,)).rowcount
+    if n1 or n2:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("VACUUM")
+        print(f"清掉 {cutoff} 以前的每日股價 {n1} 筆、外資持股 {n2} 筆")
+
+
+def monthly_bull(sids=None):
+    """月 K 多頭：月收盤站上 5 月線、5 月線在 10 月線上面、5 月線往上。回傳 {代號: True/False}（資料不夠的不回傳）。"""
+    with db() as conn:
+        m = pd.read_sql("SELECT month, stock_id, close FROM monthly ORDER BY stock_id, month", conn, dtype={"stock_id": str})
+    out = {}
+    for sid, g in m.groupby("stock_id"):
+        if sids is not None and sid not in sids:
+            continue
+        cl = g["close"].astype(float).to_numpy()
+        if len(cl) < 11:
+            continue
+        ma5 = pd.Series(cl).rolling(5).mean().to_numpy()
+        ma10 = pd.Series(cl).rolling(10).mean().to_numpy()
+        out[sid] = bool(cl[-1] > ma5[-1] and ma5[-1] > ma10[-1] and ma5[-1] > ma5[-2])
+    return out
 
 
 # ───────────────────────── 特徵計算 ─────────────────────────
@@ -2422,6 +2513,10 @@ def run(send_mail=True, collect_only=False):
     if not margin.empty:
         upsert("margin", margin, MARGIN_COLS)
     collect_qfii()
+    try:
+        update_monthly_and_prune()
+    except Exception as e:
+        print(f"月 K 更新／清理失敗（不影響寄信）：{e}")
     if collect_only:
         print("=== 只收資料完成（舊版訊號與信件已略過）===")
         return
@@ -2491,6 +2586,7 @@ def main():
     ap.add_argument("--backfill-prices", type=int, default=0, metavar="N", help="只回補最近 N 個日曆天的上市股價（含高低價），不補法人與融資")
     ap.add_argument("--backfill-qfii", type=int, default=0, metavar="N", help="回補最近 N 個日曆天的外資持股比例（長線追蹤用）")
     ap.add_argument("--backfill-tpex", type=int, default=0, metavar="N", help="回補最近 N 個日曆天的上櫃股價與法人")
+    ap.add_argument("--backfill-monthly", default="", metavar="TWSE|TPEx", help="回補上市或上櫃過去 3 年的月 K")
     ap.add_argument("--no-email", action="store_true", help="不寄信")
     ap.add_argument("--collect-only", action="store_true", help="只收資料進資料庫，不跑舊版訊號與信件")
     args = ap.parse_args()
@@ -2506,6 +2602,9 @@ def main():
     if args.backfill_tpex:
         init_db()
         backfill_tpex(args.backfill_tpex)
+    if args.backfill_monthly:
+        init_db()
+        backfill_monthly(args.backfill_monthly, years=3)
     run(send_mail=not args.no_email, collect_only=args.collect_only)
 
 
