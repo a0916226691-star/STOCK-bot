@@ -2260,6 +2260,8 @@ def build_longtrack(radar):
             light, text, order = "🔴", "還在破底，等止跌", 2
         elif room_w < LT_MIN_ROOM:
             light, text, order = "🔴", f"止跌了，但{press_w}", 2
+        elif sum10 < 0:
+            light, text, order = "🔴", f"止跌了，但法人近 10 天還在賣超 {abs(sum10) / 1000:,.0f} 張（沒有在收貨）", 2
         else:
             chip = "，法人在底部一直買" if accum else ("，法人開始買" if inst10 else "")
             light, text, order = "🟡", f"止跌盤整{chip}，等站上 5 日、10 日線（低點不能破）", 1
