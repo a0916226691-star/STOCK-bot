@@ -1693,6 +1693,9 @@ def build_tracking_text(recs, radar, events, version=None):
 
 
 # ───────────────────────── 我真正買的股票 ─────────────────────────
+HOLDING_STOPS = {}          # 持股停損價（持股檔第三欄）；沒填的用最近 15 天最低點
+
+
 def load_holdings():
     """讀持股檔。每行：股票代號,買進價（買進價可不填）。空行、# 開頭、標題列都會略過。賣掉了就把那一行刪掉。
     用 [區名] 一行把股票分區（例如 [原本持股]、[雷達短線]），信裡會分開列；沒寫區名的歸在「我的持股」。
@@ -1722,6 +1725,9 @@ def load_holdings():
                     continue                           # 標題列或亂打的字
                 price = safe_float(parts[1]) if len(parts) > 1 else np.nan
                 out[sid] = (None if pd.isna(price) or price <= 0 else float(price), group)
+                stop = safe_float(parts[2]) if len(parts) > 2 else np.nan
+                if pd.notna(stop) and stop > 0:
+                    HOLDING_STOPS[sid] = float(stop)
     except Exception as e:
         print(f"讀取 {HOLDINGS_FILE} 失敗：{e}")
     print(f"我的持股：{len(out)} 檔（{HOLDINGS_FILE}）")
@@ -2444,6 +2450,50 @@ def add_points(sids):
     return out
 
 
+HOLD_SELL_PCT = 0.10       # 🔴 法人大賣：5 日賣超達 5 日成交量的 10%（小賣不跑；回測每筆 +6.0%，原本法人一賣就跑只有 +4.3%）
+HOLD_DUMP_VOL = 2.0        # 🔴 爆量出貨：量是前 5 日均量 2 倍以上，而且收黑或留長上影線
+HOLD_STOP_DAYS = 15        # 沒填停損價：用最近幾天的最低點
+
+
+def hold_signals(sids):
+    """持股燈號（雷達短線用）：🔴 跌破停損／法人大賣／爆量出貨；🟡 法人小賣；🟢 續抱。回傳 {代號: (燈號說明, 停損價)}。"""
+    out = {}
+    if not sids:
+        return out
+    px = load_table("prices", 60)
+    px = px[px["stock_id"].isin(sids)].sort_values(["stock_id", "date"])
+    inst = load_table("institutional", 20)
+    inst = inst[inst["stock_id"].isin(sids)].sort_values("date")
+    for sid, p in px.groupby("stock_id"):
+        cl = pd.to_numeric(p["close"], errors="coerce").to_numpy()
+        if len(cl) < 7:
+            continue
+        op = pd.to_numeric(p["open"], errors="coerce").fillna(pd.Series(cl, index=p.index)).to_numpy()
+        hi = pd.to_numeric(p["high"], errors="coerce").fillna(pd.Series(cl, index=p.index)).to_numpy()
+        lo = pd.to_numeric(p["low"], errors="coerce").fillna(pd.Series(cl, index=p.index)).to_numpy()
+        vol = pd.to_numeric(p["volume"], errors="coerce").to_numpy()
+        stop = HOLDING_STOPS.get(sid, float(np.nanmin(lo[-HOLD_STOP_DAYS:])))
+        g = inst[inst["stock_id"] == sid]
+        net = (pd.to_numeric(g["foreign_net"], errors="coerce").fillna(0) + pd.to_numeric(g["trust_net"], errors="coerce").fillna(0)).tail(5)
+        n5, v5sum = float(net.sum()), float(np.nansum(vol[-5:]))
+        pct = (-n5 / v5sum * 100) if (n5 < 0 and v5sum > 0) else 0.0
+        vr = vol[-1] / np.nanmean(vol[-6:-1]) if np.nanmean(vol[-6:-1]) > 0 else 0
+        rng = hi[-1] - lo[-1]
+        dump = cl[-1] < op[-1] or (rng > 0 and hi[-1] - max(cl[-1], op[-1]) >= rng * 0.5)
+        if cl[-1] < stop:
+            txt = f"🔴 跌破停損 {fmt_now(stop)}，賣出"
+        elif pct >= HOLD_SELL_PCT * 100:
+            txt = f"🔴 法人大賣（5 日賣超 {-n5 / 1000:,.0f} 張，占成交量 {pct:.0f}%），賣出"
+        elif vr >= HOLD_DUMP_VOL and dump:
+            txt = f"🔴 爆量出貨（量 {vr:.1f} 倍，收黑或長上影），賣出"
+        elif n5 < 0:
+            txt = f"🟡 法人小賣（占成交量 {pct:.0f}%），還不用跑"
+        else:
+            txt = "🟢 續抱"
+        out[sid] = (txt, stop)
+    return out
+
+
 def build_simple_email(radar, data_date, holdings, track=None):
     """信件只放「長線追蹤」這套：法人賣到底 → 一直買、底部守住 → 帶量噴出才買。
     舊的佈局／突破／低接還是會算、存進紀錄（之後比較勝率用），但不寫進信裡。"""
@@ -2484,6 +2534,7 @@ def build_simple_email(radar, data_date, holdings, track=None):
         parts.append("（股票追蹤清單是空的）")
     multi = len({g for _, g in holdings.values()}) > 1
     adds = add_points(list(holdings))
+    hsig = hold_signals(list(holdings))
     cur = None
     for sid, (cost, group) in holdings.items():
         if multi and group != cur:
@@ -2493,8 +2544,14 @@ def build_simple_email(radar, data_date, holdings, track=None):
             parts.append(f"\n股票代號：{sid}\n目前價格：今天沒有行情資料")
             continue
         r = rows.loc[sid]
-        n_sell += inst_light(r).startswith("🔴")
-        parts.append("\n" + stock_block(r, sid, target=True) + (f"\n{adds[sid]}" if sid in adds else ""))
+        hs = hsig.get(sid)
+        blk = stock_block(r, sid, target=True)
+        if hs:
+            n_sell += hs[0].startswith("🔴")
+            blk = blk.replace(f"法人動態：{inst_light(r)}", f"持股燈號：{hs[0]}") + f"\n停損價格：{fmt_now(hs[1])}"
+        else:
+            n_sell += inst_light(r).startswith("🔴")
+        parts.append("\n" + blk + (f"\n{adds[sid]}" if sid in adds and not (hs and hs[0].startswith("🔴")) else ""))
     return "\n".join(parts) + "\n", len(buys), len(watches), n_sell
 
 

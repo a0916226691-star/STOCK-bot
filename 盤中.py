@@ -104,7 +104,8 @@ def load_context():
         hi = pd.to_numeric(g["high"], errors="coerce").fillna(pd.Series(cl, index=g.index)).to_numpy()
         lo = pd.to_numeric(g["low"], errors="coerce").fillna(pd.Series(cl, index=g.index)).to_numpy()
         tr = np.maximum(hi[1:], cl[:-1]) - np.minimum(lo[1:], cl[:-1])
-        ma[sid] = dict(s19=float(np.nansum(cl[-19:])), ma20_prev=float(np.nanmean(cl[-20:])), atr=float(np.nanmean(tr[-20:])))
+        ma[sid] = dict(s19=float(np.nansum(cl[-19:])), ma20_prev=float(np.nanmean(cl[-20:])), atr=float(np.nanmean(tr[-20:])),
+                       low15=float(np.nanmin(lo[-R.HOLD_STOP_DAYS:])))
     if not inst.empty:
         inst["net"] = pd.to_numeric(inst["foreign_net"], errors="coerce").fillna(0) + pd.to_numeric(inst["trust_net"], errors="coerce").fillna(0)
         for sid, g in inst.sort_values("date").groupby("stock_id"):
@@ -126,18 +127,18 @@ def buy_status(q, vol5, frac):
     return chg, "🟢 還可以買"
 
 
-def hold_status(q, vol5, frac, icost):
+def hold_status(q, vol5, frac, stop):
+    """盤中持股（跟早上信同一套）：跌破停損、爆量出貨（量 2 倍以上，而且盤中走黑或拉高被賣下來）才叫你跑。"""
     p, chg = q["price"], (q["price"] / q["prev"] - 1) * 100
     proj = q["vol_lots"] / frac if pd.notna(q["vol_lots"]) else np.nan
     vr = proj / vol5 if (pd.notna(proj) and pd.notna(vol5) and vol5 > 0) else np.nan
     hi, lo = q["high"], q["low"]
-    if pd.notna(q["open"]) and p < q["open"] and chg <= WEAK_PCT and pd.notna(vr) and vr >= HEAVY_VOL:
-        return chg, "🔴 爆量下殺，快跑"
-    if pd.notna(icost) and p < icost * (1 - BELOW_COST_PCT / 100):
-        return chg, "🔴 跌破法人成本，快跑"
-    if (pd.notna(hi) and pd.notna(lo) and hi > lo and (hi - p) / p * 100 >= SHADOW_PCT
-            and (p - lo) / (hi - lo) <= 0.5 and pd.notna(vr) and vr >= SHADOW_VOL):
-        return chg, "🔴 拉高倒貨，快跑"
+    if pd.notna(stop) and p < stop:
+        return chg, f"🔴 跌破停損 {R.fmt_now(stop)}，收盤還在下面就賣"
+    black = pd.notna(q["open"]) and p < q["open"]
+    shadow = pd.notna(hi) and pd.notna(lo) and hi > lo and (hi - max(p, q["open"] if pd.notna(q["open"]) else p)) >= (hi - lo) * 0.5
+    if pd.notna(vr) and vr >= R.HOLD_DUMP_VOL and (black or shadow):
+        return chg, f"🔴 爆量出貨（量約 {vr:.1f} 倍，{'走黑' if black else '拉高被賣下來'}），快跑"
     if chg <= WEAK_PCT:
         return chg, "🟡 跌比較多，留意"
     return chg, "🟢 正常"
@@ -214,7 +215,8 @@ def run(send_mail=True, now=None, quotes=None):
         if q is None:
             parts.append(f"\n股票代號：{nm}({sid})\n目前價格：抓不到報價")
             continue
-        chg, st = hold_status(q, vol5.get(sid), frac, cost.get(sid, np.nan))
+        stop = R.HOLDING_STOPS.get(sid, ma.get(sid, {}).get("low15", np.nan))
+        chg, st = hold_status(q, vol5.get(sid), frac, stop)
         n_red += st.startswith("🔴")
         m = ma.get(sid)
         if m and not st.startswith("🔴"):
