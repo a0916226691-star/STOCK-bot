@@ -1007,7 +1007,7 @@ def _agg_month(df):
     return out[MONTHLY_COLS]
 
 
-def backfill_monthly(market, years=3):
+def backfill_monthly(market, years=3, max_months=12):
     """回補上市（TWSE）或上櫃（TPEx）過去幾年的月 K：一天一天抓，合成月 K 存起來，每日資料不存（省空間）。"""
     fetch = fetch_twse_quotes if market == "TWSE" else fetch_tpex_quotes_hist
     now = now_tw()
@@ -1020,6 +1020,10 @@ def backfill_monthly(market, years=3):
         ms = str(m)
         if ms in have:
             continue
+        if max_months <= 0:
+            print("這次先補到這裡（避免超過 GitHub 90 分鐘上限），再跑一次會接著補")
+            break
+        max_months -= 1
         days = [d.strftime("%Y%m%d") for d in pd.date_range(m.start_time, m.end_time, freq="B")]
         frames = []
         for d in days:
