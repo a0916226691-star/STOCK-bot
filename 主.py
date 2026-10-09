@@ -2601,9 +2601,7 @@ def send_email(subject, body):
 
 # ───────────────────────── 主流程 ─────────────────────────
 def run(send_mail=True, collect_only=False):
-    if not collect_only and is_market_holiday() and not os.environ.get("FORCE_RUN"):
-        print(f"今天 {now_tw():%Y-%m-%d} 台股休市：只收資料，不寄雷達信（下一個交易日早上會寄）")
-        collect_only = True
+    holiday = is_market_holiday() and not os.environ.get("FORCE_RUN")
     init_db()
     print(f"=== 台股雷達 開始 {now_tw():%Y-%m-%d %H:%M}｜追蹤版本 {VERSIONS}（主要：{VERSION}）===")
     hist_price = load_table("prices", 120)
@@ -2681,10 +2679,23 @@ def run(send_mail=True, collect_only=False):
         track = None
     body, n_buy, n_watch, n_sell = build_simple_email(radar, data_date, holdings, track)
     print("\n===== 信件內容 =====\n" + body)
+    sent_file = os.path.join(OUTPUT_DIR, "last_email_date.txt")
+    try:
+        last_sent = open(sent_file, encoding="utf-8").read().strip()
+    except OSError:
+        last_sent = ""
+    if send_mail and holiday and last_sent == data_date:
+        print(f"今天休市，{data_date} 的資料已經寄過了，不重複寄")
+        send_mail = False
     if send_mail:
         md = f"{int(data_date[5:7])}/{data_date[8:]}"
         subject = f"{'🚨' if n_sell else ''}台股雷達 {md}｜可買{n_buy} 止跌{n_watch}" + (f" 持股賣出{n_sell}" if n_sell else "")
         send_email(subject, body)
+        try:
+            with open(sent_file, "w", encoding="utf-8") as f:
+                f.write(data_date)
+        except OSError as e:
+            print(f"記錄寄信日期失敗：{e}")
     print("=== 完成 ===")
 
 
