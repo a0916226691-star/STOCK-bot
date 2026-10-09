@@ -2690,10 +2690,11 @@ def run(send_mail=True, collect_only=False):
     if send_mail:
         md = f"{int(data_date[5:7])}/{data_date[8:]}"
         subject = f"{'🚨' if n_sell else ''}台股雷達 {md}｜可買{n_buy} 止跌{n_watch}" + (f" 持股賣出{n_sell}" if n_sell else "")
-        send_email(subject, body)
+        ok = send_email(subject, body)
         try:
-            with open(sent_file, "w", encoding="utf-8") as f:
-                f.write(data_date)
+            if ok:
+                with open(sent_file, "w", encoding="utf-8") as f:
+                    f.write(data_date)
         except OSError as e:
             print(f"記錄寄信日期失敗：{e}")
     print("=== 完成 ===")
