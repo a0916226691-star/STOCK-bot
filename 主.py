@@ -2223,6 +2223,7 @@ LT_CRASH_ATR = 2.0         # 下跌途中單日（收盤對收盤，含跳空）
 LT_ZONE_NEAR = 5.0         # 🔴 現價卡在頭部套牢區裡，或離套牢區底部不到此 %：一噴就撞到黑 K／上影線被壓回
 LT_CHOP_WAVE = 0.10        # 亂不亂：把一年走勢切成漲跌超過 10% 的波段
 LT_CHOP_DAYS = 10.0        # 每段波段中位數不到 10 天＝上下太快（例：士電 9.5 天），整檔不追；好例子鈊象 49、佳必琪 20、富邦媒 15.5、晶技 13
+LT_CHOP_ON = False         # 「太亂不追」：10/10 用程式重播 6/22～10/8 回測，這條擋掉的股票勝率 73%，關掉後整體從勝率 56%、+1.8% 變 66%、+5.4%
 LT_TURN_MIN_D = 2          # 🟢 轉強：低點 2～10 天前（低點後盤整幾天）
 LT_TURN_MAX_D = 10
 # 長均保護短均：🟡、🟢 都要半年線（120 日）比 20 天前高（回測：半年線往上勝率 73%、+10.5%；往下 64%、+4.3%）
@@ -2294,8 +2295,8 @@ def build_longtrack(radar):
         if c < MIN_PRICE or not r.get("turnover", 0) >= MIN_DAILY_TURNOVER:
             continue
         cl = pd.to_numeric(p["close"], errors="coerce").to_numpy()
-        if _wave_days(cl[-240:]) < LT_CHOP_DAYS:
-            continue                                            # 一年來上下太快、很亂（士電型）：來不及跑也來不及追，不追
+        if LT_CHOP_ON and _wave_days(cl[-240:]) < LT_CHOP_DAYS:
+            continue                                            # 一年來上下太快、很亂（士電型）：10/10 回測發現誤殺太多好股票，先關掉
         hi = pd.to_numeric(p["high"], errors="coerce").fillna(pd.Series(cl, index=p.index)).to_numpy()
         lo = pd.to_numeric(p["low"], errors="coerce").fillna(pd.Series(cl, index=p.index)).to_numpy()
         vol = pd.to_numeric(p["volume"], errors="coerce").to_numpy()
@@ -2309,6 +2310,13 @@ def build_longtrack(radar):
             continue
         h, H, k, L = sw
         if H <= L:
+            continue
+        # 一定要「真的跌到底」：最近 2～10 天剛創 60 天新低，而且股價在 60 天高低區間的下半部（排除大漲後的半山腰拉回，例：致茂 6/22）
+        lo60, hi60 = float(np.nanmin(lo[-61:])), float(np.nanmax(hi[-61:]))
+        d60 = n - 1 - (n - 61 + int(np.nanargmin(lo[-61:])))
+        if hi60 > lo60 and (c - lo60) / (hi60 - lo60) > 0.5:
+            continue
+        if not (LT_TURN_MIN_D <= d60 <= LT_TURN_MAX_D):
             continue
         retr = (c - L) / (H - L)
         retr_prev = (cl[-2] - L) / (H - L)                      # 昨天還在不在低檔
