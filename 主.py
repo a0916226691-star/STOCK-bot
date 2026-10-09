@@ -159,6 +159,32 @@ GROUP_DANGER = {"EXPLODED", "OVERHEAT", "DOUBLE_SELL", "DOUBLE_SELL_BREAK"}
 
 
 # ───────────────────────── 小工具 ─────────────────────────
+# 台股休市日（證交所公告）。每年底記得補下一年的日期。
+TW_HOLIDAYS = {
+    # 2026（民國 115 年）
+    "2026-01-01",                                              # 開國紀念日
+    "2026-02-12", "2026-02-13",                                # 春節前（只交割、不交易）
+    "2026-02-16", "2026-02-17", "2026-02-18", "2026-02-19", "2026-02-20",   # 春節
+    "2026-02-27",                                              # 和平紀念日補假
+    "2026-04-03", "2026-04-06",                                # 兒童節、清明節補假
+    "2026-05-01",                                              # 勞動節
+    "2026-06-19",                                              # 端午節
+    "2026-09-25",                                              # 中秋節
+    "2026-09-28",                                              # 教師節
+    "2026-10-09",                                              # 國慶日補假
+    "2026-10-26",                                              # 台灣光復暨金門古寧頭大捷紀念日補假
+    "2026-12-25",                                              # 行憲紀念日
+}
+
+
+def is_market_holiday(d=None):
+    """今天台股休市嗎（週末或國定假日）。表裡沒有這一年的資料時會提醒。"""
+    d = d or now_tw()
+    if not any(h.startswith(str(d.year)) for h in TW_HOLIDAYS):
+        print(f"⚠ 休市日表還沒有 {d.year} 年的資料，請補上")
+    return d.weekday() >= 5 or d.strftime("%Y-%m-%d") in TW_HOLIDAYS
+
+
 def now_tw():
     return datetime.now(TZ)
 
@@ -2575,6 +2601,9 @@ def send_email(subject, body):
 
 # ───────────────────────── 主流程 ─────────────────────────
 def run(send_mail=True, collect_only=False):
+    if not collect_only and is_market_holiday() and not os.environ.get("FORCE_RUN"):
+        print(f"今天 {now_tw():%Y-%m-%d} 台股休市：只收資料，不寄雷達信（下一個交易日早上會寄）")
+        collect_only = True
     init_db()
     print(f"=== 台股雷達 開始 {now_tw():%Y-%m-%d %H:%M}｜追蹤版本 {VERSIONS}（主要：{VERSION}）===")
     hist_price = load_table("prices", 120)

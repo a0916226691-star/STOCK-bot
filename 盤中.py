@@ -152,6 +152,9 @@ def block(name, sid, q, chg, status):
 
 def run(send_mail=True, now=None, quotes=None):
     now = now or R.now_tw()
+    if R.is_market_holiday(now):
+        print(f"今天 {now:%Y-%m-%d} 台股休市，不寄盤中信")
+        return
     last, buys, waits, market, vol5, names, cost, ma = load_context()
     holdings = R.load_holdings()
     want = {sid: ("otc" if market.get(sid) == "TPEx" else "tse")
