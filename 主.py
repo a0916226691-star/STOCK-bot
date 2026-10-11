@@ -309,10 +309,6 @@ def init_db():
     with db() as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS prices (date TEXT, stock_id TEXT, stock_name TEXT, market TEXT, "
                      "close REAL, volume INTEGER, turnover REAL, high REAL, low REAL, PRIMARY KEY(date, stock_id))")
-        conn.execute("CREATE TABLE IF NOT EXISTS exdiv (date TEXT, stock_id TEXT, market TEXT, prev_close REAL, "
-                     "ref_price REAL, drop_amt REAL, PRIMARY KEY(date, stock_id))")
-        conn.execute("CREATE TABLE IF NOT EXISTS valuation (date TEXT, stock_id TEXT, market TEXT, pe REAL, pb REAL, "
-                     "dy REAL, PRIMARY KEY(date, stock_id))")
         conn.execute("CREATE TABLE IF NOT EXISTS monthly (month TEXT, stock_id TEXT, market TEXT, open REAL, high REAL, "
                      "low REAL, close REAL, volume REAL, PRIMARY KEY(month, stock_id))")
         conn.execute("CREATE TABLE IF NOT EXISTS institutional (date TEXT, stock_id TEXT, foreign_net INTEGER, "
@@ -1013,110 +1009,6 @@ def backfill_tpex(days):
         if fail >= 5:
             print("⚠ 連續 5 天抓不到上櫃資料，可能被擋，先停")
             break
-
-
-# ───────────────────────── 除權息、本益比／淨值比（回測用）─────────────────────────
-EXDIV_COLS = ["date", "stock_id", "market", "prev_close", "ref_price", "drop_amt"]
-VAL_COLS = ["date", "stock_id", "market", "pe", "pb", "dy"]
-
-
-def _roc_text_date(v):
-    """'115年07月15日'、'115/07/15'、'1150715'、'2026-07-15' → '2026-07-15'。"""
-    t = str(v).strip().replace("年", "/").replace("月", "/").replace("日", "")
-    return parse_date(t)
-
-
-def _col(fields, *keys, exclude=()):
-    for i, f in enumerate(fields or []):
-        if any(k in f for k in keys) and not any(x in f for x in exclude):
-            return i
-    return None
-
-
-def _parse_exdiv(fields, rows, market):
-    i_d, i_s = _col(fields, "日期"), _col(fields, "代號")
-    i_p, i_r = _col(fields, "前收盤"), _col(fields, "參考價", exclude=("減除", "開盤"))
-    if None in (i_d, i_s, i_p, i_r):
-        print(f"⚠ {market} 除權息欄位對不上：{fields}")
-        return pd.DataFrame(columns=EXDIV_COLS)
-    out = []
-    for r in rows:
-        sid = normalize_stock_id(str(r[i_s]))
-        p, ref = safe_float(r[i_p]), safe_float(r[i_r])
-        d = _roc_text_date(r[i_d])
-        if is_stock_id(sid) and d and pd.notna(p) and pd.notna(ref) and p > 0:
-            out.append({"date": d, "stock_id": sid, "market": market, "prev_close": p, "ref_price": ref, "drop_amt": p - ref})
-    return pd.DataFrame(out, columns=EXDIV_COLS)
-
-
-def fetch_exdiv(start, end):
-    """上市＋上櫃 除權息計算結果（start/end＝YYYYMMDD）。"""
-    frames = []
-    try:
-        j = get_json("https://www.twse.com.tw/rwd/zh/exRight/TWT49U", {"startDate": start, "endDate": end, "response": "json"})
-        fields, rows = (j.get("fields"), j.get("data")) if j.get("data") else _tpex_table(j)
-        print(f"  TWSE 除權息欄位：{fields}")
-        frames.append(_parse_exdiv(fields, rows or [], "TWSE"))
-    except Exception as e:
-        print(f"TWSE 除權息失敗：{e}")
-    fields, rows, tag = _tpex_get("exRight/dailyResult", {"startDate": f"{start[:4]}/{start[4:6]}/{start[6:]}", "endDate": f"{end[:4]}/{end[4:6]}/{end[6:]}", "response": "json"},
-                                  "exright/dailyquo/exDailyQ_result.php", {"l": "zh-tw", "d": _roc(start), "ed": _roc(end), "o": "json"})
-    print(f"  TPEx 除權息（{tag}）欄位：{fields}；第一筆：{rows[0] if rows else None}")
-    if rows:
-        frames.append(_parse_exdiv(fields, rows, "TPEx"))
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=EXDIV_COLS)
-
-
-def _parse_val(fields, rows, market, date):
-    i_s, i_pe, i_pb, i_dy = _col(fields, "代號"), _col(fields, "本益比"), _col(fields, "淨值比"), _col(fields, "殖利率")
-    if i_s is None or i_pb is None:
-        print(f"⚠ {market} 淨值比欄位對不上：{fields}")
-        return pd.DataFrame(columns=VAL_COLS)
-    out = []
-    for r in rows:
-        sid = normalize_stock_id(str(r[i_s]))
-        if is_stock_id(sid):
-            out.append({"date": date, "stock_id": sid, "market": market, "pe": safe_float(r[i_pe]) if i_pe is not None else np.nan,
-                        "pb": safe_float(r[i_pb]), "dy": safe_float(r[i_dy]) if i_dy is not None else np.nan})
-    return pd.DataFrame(out, columns=VAL_COLS)
-
-
-def fetch_valuation(d):
-    """某一天上市＋上櫃的本益比、股價淨值比、殖利率（d＝YYYYMMDD）。"""
-    frames, iso = [], fmt_date(d)
-    try:
-        j = get_json("https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d", {"date": d, "selectType": "ALL", "response": "json"})
-        fields, rows = (j.get("fields"), j.get("data")) if j.get("data") else _tpex_table(j)
-        if rows:
-            frames.append(_parse_val(fields, rows, "TWSE", iso))
-    except Exception as e:
-        print(f"TWSE 淨值比 {d} 失敗：{e}")
-    fields, rows, tag = _tpex_get("afterTrading/peQryDate", {"date": f"{d[:4]}/{d[4:6]}/{d[6:]}", "response": "json"},
-                                  "aftertrading/peratio_analysis/pera_result.php", {"l": "zh-tw", "d": _roc(d), "o": "json"})
-    if rows:
-        _show_fields("淨值比", fields, rows[0])
-        frames.append(_parse_val(fields, rows, "TPEx", iso))
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=VAL_COLS)
-
-
-def backfill_extra():
-    """回補今年的除權息，以及 6 月起每週一的本益比／淨值比（回測用）。"""
-    now = now_tw()
-    for a, b in (("0101", "0331"), ("0401", "0630"), ("0701", "0930"), ("1001", "1231")):
-        start, end = f"{now.year}{a}", min(f"{now.year}{b}", now.strftime("%Y%m%d"))
-        if start > end:
-            continue
-        n = upsert("exdiv", fetch_exdiv(start, end), EXDIV_COLS)
-        print(f"除權息 {start}～{end}：{n} 筆")
-        time.sleep(2)
-    for day in pd.date_range("2026-06-15", now.strftime("%Y-%m-%d"), freq="W-MON"):
-        for k in range(5):                                     # 遇到休市就往後找
-            d = (day + pd.Timedelta(days=k)).strftime("%Y%m%d")
-            v = fetch_valuation(d)
-            time.sleep(2)
-            if not v.empty:
-                print(f"淨值比 {d}：{upsert('valuation', v, VAL_COLS)} 筆")
-                break
 
 
 # ───────────────────────── 月 K（長期趨勢）─────────────────────────
@@ -2823,7 +2715,6 @@ def main():
     ap.add_argument("--backfill-qfii", type=int, default=0, metavar="N", help="回補最近 N 個日曆天的外資持股比例（長線追蹤用）")
     ap.add_argument("--backfill-tpex", type=int, default=0, metavar="N", help="回補最近 N 個日曆天的上櫃股價與法人")
     ap.add_argument("--backfill-monthly", default="", metavar="TWSE|TPEx", help="回補上市或上櫃過去 3 年的月 K")
-    ap.add_argument("--backfill-extra", action="store_true", help="回補除權息、本益比／淨值比（回測用）")
     ap.add_argument("--no-email", action="store_true", help="不寄信")
     ap.add_argument("--collect-only", action="store_true", help="只收資料進資料庫，不跑舊版訊號與信件")
     args = ap.parse_args()
@@ -2839,9 +2730,6 @@ def main():
     if args.backfill_tpex:
         init_db()
         backfill_tpex(args.backfill_tpex)
-    if args.backfill_extra:
-        init_db()
-        backfill_extra()
     if args.backfill_monthly:
         init_db()
         backfill_monthly(args.backfill_monthly, years=3)
