@@ -13,6 +13,10 @@ on:
         description: "回補外資持股比例幾個日曆天（長線追蹤用，第一次填 365；平常留 0）"
         required: false
         default: "0"
+      backfill_extra:
+        description: "回補除權息、本益比／淨值比（回測用）：填 1；平常留空"
+        required: false
+        default: ""
       backfill_monthly:
         description: "回補 3 年月 K：填 TWSE（上市）或 TPEx（上櫃），一次一個；平常留空"
         required: false
@@ -64,7 +68,12 @@ jobs:
           BACKFILL_QFII: ${{ github.event.inputs.backfill_qfii }}
           BACKFILL_TPEX: ${{ github.event.inputs.backfill_tpex }}
           BACKFILL_MONTHLY: ${{ github.event.inputs.backfill_monthly }}
+          BACKFILL_EXTRA: ${{ github.event.inputs.backfill_extra }}
         run: |
+          if [ -n "$BACKFILL_EXTRA" ]; then
+            python 主.py --collect-only --backfill-extra
+            exit 0
+          fi
           if [ -n "$BACKFILL_MONTHLY" ]; then
             python 主.py --collect-only --backfill-monthly "$BACKFILL_MONTHLY"
             exit 0
