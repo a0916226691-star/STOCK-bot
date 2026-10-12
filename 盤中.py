@@ -161,13 +161,20 @@ def run(send_mail=True, now=None, quotes=None):
             for sid in list(buys["stock_id"] if not buys.empty else []) + list(waits["stock_id"] if not waits.empty else [])
             + list(holdings)}
     if not want:
-        print("今天沒有可買、等噴出、持股要看，不寄盤中信。")
+        body = (f"盤中 {now:%m/%d %H:%M}：今天沒有要盯的股票。\n\n"
+                "可買 0 檔、🟡 止跌名單 0 檔、我的持股 0 檔。程式有正常在跑，只是目前沒有符合條件的股票。\n")
+        print(body)
+        if send_mail:
+            R.send_email(f"盤中 {now:%m/%d %H:%M}｜今天沒有要盯的股票", body)
         return
     quotes = quotes if quotes is not None else fetch_quotes(want)
     today = now.strftime("%Y%m%d")
     live = {k: v for k, v in quotes.items() if v["date"] == today and pd.notna(v["price"]) and pd.notna(v["prev"])}
     if not live:
-        print(f"今天（{today}）沒有盤中報價：休市，或證交所即時報價抓不到。不寄信。")
+        msg = f"今天（{today}）抓不到盤中即時報價（證交所即時報價沒有回應），這次盤中檢查沒辦法做。"
+        print(msg)
+        if send_mail:
+            R.send_email(f"⚠ 盤中 {now:%m/%d %H:%M}｜抓不到即時報價", msg + "\n明天早上 7:07 的雷達信照常寄。\n")
         return
     frac = day_fraction(now)
     parts = [f"盤中狀況：🟢 正常／可買　🟡 留意　🔴 快跑／別追（{now:%H:%M} 報價）"]
