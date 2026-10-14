@@ -1,6 +1,8 @@
 name: Long-term Growth Radar
 
 on:
+  schedule:
+    - cron: "52 23 * * 5"   # 台灣時間每週六早上 07:52
   workflow_dispatch:
     inputs:
       backfill:

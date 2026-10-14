@@ -167,13 +167,15 @@ def log(msg):
         f.write("\n".join(LOG[-300:]))
 
 
-def backfill(years=3, budget_min=70):
+def backfill(years=3, budget_min=70, refresh_recent=False):
     init_ldb()
     now = R.now_tw()
     t0 = time.time()
     over = lambda: (time.time() - t0) / 60 > budget_min
+    recent = {str(pd.Period(now.strftime("%Y-%m")) - k) for k in (1, 2)} if refresh_recent else set()
     with ldb() as c:
-        have_r = {(a, b) for a, b in c.execute("SELECT month, market FROM revenue GROUP BY month, market HAVING COUNT(*) > 100")}
+        have_r = {(a, b) for a, b in c.execute("SELECT month, market FROM revenue GROUP BY month, market HAVING COUNT(*) > 100")
+                  if a not in recent}
         have_f = {(a, b) for a, b in c.execute("SELECT quarter, market FROM fin GROUP BY quarter, market HAVING COUNT(*) > 100")}
     start = (now - timedelta(days=int(365 * years) + 400)).replace(day=1)        # 多抓一年，才算得出年增率的歷史
     for m in pd.period_range(start.strftime("%Y-%m"), now.strftime("%Y-%m"), freq="M")[:-1]:
@@ -191,7 +193,8 @@ def backfill(years=3, budget_min=70):
             time.sleep(5)
     for y in range(start.year, now.year + 1):
         for s in (1, 2, 3, 4):
-            if (y, s) > (now.year, (now.month - 1) // 3):
+            deadline = {1: f"{y}-05-16", 2: f"{y}-08-15", 3: f"{y}-11-15", 4: f"{y + 1}-04-01"}[s]
+            if now.strftime("%Y-%m-%d") < deadline:                      # 還沒到公布期限
                 break
             for mk in ("sii", "otc"):
                 key = (f"{y}Q{s}", "TWSE" if mk == "sii" else "TPEx")
@@ -210,47 +213,160 @@ def backfill(years=3, budget_min=70):
         log("財報：" + str(c.execute("SELECT market, COUNT(DISTINCT quarter), MIN(quarter), MAX(quarter), COUNT(*) FROM fin GROUP BY market").fetchall()))
 
 
-def probe():
-    """測試資料來源連不連得到，結果寫進 output/lt_probe.txt（帶回來看）。"""
-    lines = []
-    tests = [
-        ("MOPS 月營收 mopsov", "get", "https://mopsov.twse.com.tw/nas/t21/sii/t21sc03_115_8_0.html", None),
-        ("MOPS 月營收 mops", "get", "https://mops.twse.com.tw/nas/t21/sii/t21sc03_115_8_0.html", None),
-        ("MOPS 綜合損益 mopsov", "post", "https://mopsov.twse.com.tw/mops/web/ajax_t163sb04",
-         {"encodeURIComponent": 1, "step": 1, "firstin": 1, "off": 1, "isQuery": "Y", "TYPEK": "sii", "year": 115, "season": "01"}),
-        ("MOPS 新站 月營收", "get", "https://mops.twse.com.tw/mops/api/t05st10_ifrs", None),
-        ("TWSE openapi 月營收", "get", "https://openapi.twse.com.tw/v1/opendata/t187ap05_L", None),
-        ("TPEx openapi 月營收", "get", "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O", None),
-        ("TWSE openapi EPS", "get", "https://openapi.twse.com.tw/v1/opendata/t187ap14_L", None),
-        ("FinMind 月營收", "get", "https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id=2330&start_date=2024-01-01", None),
-        ("FinMind 財報", "get", "https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockFinancialStatements&data_id=2330&start_date=2024-01-01", None),
-    ]
-    for name, m, url, data in tests:
-        try:
-            r = (requests.post if m == "post" else requests.get)(url, data=data, headers=UA, timeout=25)
-            body = r.content[:300].decode("utf-8", "replace").replace("\n", " ")
-            lines.append(f"{name}｜HTTP {r.status_code}｜{len(r.content)} bytes｜{body[:200]}")
-        except Exception as e:
-            lines.append(f"{name}｜失敗：{type(e).__name__} {str(e)[:150]}")
-    os.makedirs(os.path.dirname(LT_DB), exist_ok=True)
-    with open(os.path.join(os.path.dirname(LT_DB), "lt_probe.txt"), "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-    print("\n".join(lines))
+# ───────────── 選股 ─────────────
+TOP_N = 10                 # 每週列幾檔
+YOY3_MIN = 0.20            # 近 3 個月營收年增率平均 > 20%
+MIN_PRICE = 20
+MIN_TURNOVER = 30_000_000  # 近 20 日平均成交金額
+MAX_HOLD_MONTHS = 12       # 回測最多看 12 個月
+
+
+def load_all():
+    with ldb() as c:
+        rev = pd.read_sql("SELECT month, stock_id, name, revenue, rev_ly FROM revenue", c, dtype={"stock_id": str})
+        fin = pd.read_sql("SELECT * FROM fin", c, dtype={"stock_id": str})
+    with sqlite3.connect(R.DB_PATH) as c:
+        mon = pd.read_sql("SELECT month, stock_id, close FROM monthly", c, dtype={"stock_id": str})
+        px = pd.read_sql("SELECT date, stock_id, stock_name, close, turnover FROM prices WHERE date >= ?", c,
+                         params=((R.now_tw() - timedelta(days=45)).strftime("%Y-%m-%d"),), dtype={"stock_id": str})
+    return rev, fin, mon, px
+
+
+def ttm_fin(fin):
+    """每檔最新一季的 近四季 EPS、ROE（年初累計數字換算成單季）。"""
+    f = fin.copy()
+    f["y"] = f["quarter"].str[:4].astype(int)
+    f["q"] = f["quarter"].str[-1].astype(int)
+    f = f.sort_values(["stock_id", "y", "q"])
+    for col in ("eps", "net_income"):
+        f[col + "_q"] = f[col] - f.groupby(["stock_id", "y"])[col].shift(1).fillna(0)
+    f["idx"] = f["y"] * 4 + f["q"]
+    out = {}
+    for sid, g in f.groupby("stock_id"):
+        g = g.set_index("idx")
+        k = g.index.max()
+        if not all(i in g.index for i in range(k - 3, k + 1)):
+            continue
+        eps = float(g.loc[k - 3:k, "eps_q"].sum())
+        ni = float(g.loc[k - 3:k, "net_income_q"].sum())
+        eq = g.loc[k, "equity"]
+        out[sid] = (eps, ni / eq if pd.notna(eq) and eq > 0 else np.nan, g.loc[k, "quarter"])
+    return out
+
+
+def screen():
+    rev, fin, mon, px = load_all()
+    rev["yoy"] = np.where(rev["rev_ly"] > 0, rev["revenue"] / rev["rev_ly"] - 1, np.nan)
+    RV = rev.pivot(index="month", columns="stock_id", values="revenue").sort_index()
+    YY = rev.pivot(index="month", columns="stock_id", values="yoy").sort_index()
+    names = rev.sort_values("month").groupby("stock_id")["name"].last().to_dict()
+    last = RV.index.max()
+    C = mon.pivot(index="month", columns="stock_id", values="close").sort_index()
+    MA = C.rolling(10).mean()
+    fx = ttm_fin(fin)
+    px = px.sort_values("date")
+    close = px.groupby("stock_id")["close"].last()
+    to20 = px.groupby("stock_id")["turnover"].apply(lambda s: pd.to_numeric(s, errors="coerce").tail(20).mean())
+    pnames = px.groupby("stock_id")["stock_name"].last().to_dict()
+    rows = []
+    for sid in RV.columns:
+        if sid.startswith("00") or sid not in close.index or sid not in C.columns:
+            continue
+        c = float(close[sid])
+        if c < MIN_PRICE or not to20.get(sid, 0) >= MIN_TURNOVER:
+            continue
+        r = RV[sid].dropna()
+        if len(r) < 12 or r.index[-1] != last:
+            continue
+        yoy3 = float(YY[sid].loc[r.index[-3:]].mean())
+        revhi = r.iloc[-1] >= r.iloc[-12:-1].max()
+        ma = MA[sid].dropna()
+        trend = len(ma) >= 2 and c > ma.iloc[-1] and ma.iloc[-1] > ma.iloc[-2]
+        eps, roe, q = fx.get(sid, (np.nan, np.nan, ""))
+        yy = YY[sid].dropna()
+        rows.append({"stock_id": sid, "name": pnames.get(sid, names.get(sid, sid)), "close": c, "yoy3": yoy3,
+                     "yoy_last": float(yy.iloc[-1]) if len(yy) else np.nan, "revhi": bool(revhi), "trend": bool(trend),
+                     "eps": eps, "roe": roe, "fin_q": q, "rev_month": last,
+                     "neg2": bool(len(yy) >= 2 and yy.iloc[-1] < 0 and yy.iloc[-2] < 0)})
+    df = pd.DataFrame(rows)
+    ok = df[df["revhi"] & df["trend"] & (df["yoy3"] > YOY3_MIN) & (df["eps"] > 0)]
+    return df, ok.sort_values("roe", ascending=False).head(TOP_N), last
+
+
+def run(send_mail=True):
+    init_ldb()
+    with ldb() as c:
+        c.execute("CREATE TABLE IF NOT EXISTS picks (date TEXT, stock_id TEXT, name TEXT, close REAL, status TEXT, "
+                  "PRIMARY KEY(date, stock_id))")
+    try:
+        backfill(years=3, budget_min=40, refresh_recent=True)              # 補最新的月營收、財報
+    except Exception as e:
+        print(f"更新資料失敗（用現有資料選股）：{e}")
+    today = R.now_tw().strftime("%Y-%m-%d")
+    df, top, last = screen()
+    if df.empty:
+        print("沒有資料，結束")
+        return
+    allx = df.set_index("stock_id")
+    with ldb() as c:
+        held = pd.read_sql("SELECT stock_id, MIN(date) AS since, name, close FROM picks WHERE status='hold' "
+                           "GROUP BY stock_id", c, dtype={"stock_id": str})
+    sells, keeps = [], []
+    for _, h in held.iterrows():
+        x = allx.loc[h.stock_id] if h.stock_id in allx.index else None
+        months = (pd.Period(today[:7]) - pd.Period(h.since[:7])).n
+        if x is None:
+            continue
+        ret = x.close / h.close - 1
+        if x.neg2:
+            sells.append((h, x, ret, "營收連 2 個月年減"))
+        elif months >= MAX_HOLD_MONTHS:
+            sells.append((h, x, ret, f"已經追蹤 {months} 個月，重新評估"))
+        else:
+            keeps.append((h, x, ret))
+    held_ids = set(held.stock_id)
+    new = top[~top.stock_id.isin(held_ids)]
+    with ldb() as c:
+        for h, x, ret, why in sells:
+            c.execute("UPDATE picks SET status='sold' WHERE stock_id=? AND status='hold'", (h.stock_id,))
+        for _, x in new.iterrows():
+            c.execute("INSERT OR REPLACE INTO picks VALUES (?,?,?,?, 'hold')", (today, x.stock_id, x["name"], x.close))
+    pct = lambda v: f"{v * 100:+.0f}%" if pd.notna(v) else "—"
+    parts = [f"長線成長股｜{today}（月營收到 {last}）",
+             "選股：營收創 12 個月新高＋近 3 個月年增 > 20%＋月K站上 10 月線且往上＋EPS 近四季 > 0，挑 ROE 最高的 10 檔。",
+             "賣出：營收連 2 個月年減。"]
+    parts.append(f"\n【本週名單】{len(top)} 檔（🆕＝新進榜）")
+    for _, x in top.iterrows():
+        parts.append(f"\n{'🆕 ' if x.stock_id not in held_ids else ''}{x['name']}({x.stock_id})\n"
+                     f"目前價格：{R.fmt_now(x.close)}\n"
+                     f"營收：近 3 月年增 {pct(x.yoy3)}，{last} 年增 {pct(x.yoy_last)}（創 12 個月新高）\n"
+                     f"EPS 近四季：{x.eps:.2f} 元｜ROE：{pct(x.roe)}（{x.fin_q}）")
+    if sells:
+        parts.append(f"\n\n【🔴 賣出】{len(sells)} 檔")
+        for h, x, ret, why in sells:
+            parts.append(f"\n{h['name']}({h.stock_id})：{why}\n進榜 {h.since} {R.fmt_now(h.close)} → 現在 {R.fmt_now(x.close)}（{pct(ret)}）")
+    if keeps:
+        parts.append(f"\n\n【🟢 續抱】{len(keeps)} 檔（之前進榜、營收還沒轉弱）")
+        for h, x, ret in keeps:
+            parts.append(f"{h['name']}({h.stock_id})：進榜 {h.since} {R.fmt_now(h.close)} → {R.fmt_now(x.close)}（{pct(ret)}）")
+    parts.append("\n回測（2024/8～2026/3 每月選一次）：平均 6 個月 +31%、中位數 +15%、61% 賺錢；"
+                 "抱到營收連 2 月年減才賣，中位數 +25%。只有約 1 年半的資料，僅供參考，不是投資建議。")
+    body = "\n".join(parts) + "\n"
+    print(body)
+    if send_mail:
+        R.send_email(f"長線成長股 {today[5:7]}/{today[8:]}｜新進榜{len(new)} 續抱{len(keeps)}"
+                     + (f" 賣出{len(sells)}" if sells else ""), body)
 
 
 def main():
     ap = argparse.ArgumentParser(description="長線成長股雷達")
     ap.add_argument("--backfill", action="store_true")
-    ap.add_argument("--probe", action="store_true")
     ap.add_argument("--no-email", action="store_true")
     a = ap.parse_args()
-    if a.probe:
-        probe()
-        return
     if a.backfill:
         backfill()
         return
-    print("選股與寄信還在開發中")
+    run(send_mail=not a.no_email)
 
 
 if __name__ == "__main__":
