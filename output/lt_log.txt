@@ -1,6 +1,38 @@
-月營收 2026-08 sii：993 家
-月營收 2026-08 otc：863 家
-月營收 2026-09 sii：984 家
-月營收 2026-09 otc：863 家
+財報 2022Q1 sii：965 家
+財報 2022Q1 otc：781 家
+財報 2022Q2 sii：1024 家
+財報 2022Q2 otc：833 家
+財報 2022Q3 sii：977 家
+財報 2022Q3 otc：788 家
+財報 2022Q4 sii：1061 家
+財報 2022Q4 otc：872 家
+財報 2023Q1 sii 失敗：HTTPSConnectionPool(host='mopsov.twse.com.tw', port=443): Max retries exceeded with url: /mops/web/ajax_t163sb05 (Caused by ConnectTimeoutError(<HTTPSConnection(host='mopsov.twse.com.tw', port=443) at 0x7f163ac62850>, 'Connection to mopsov.twse.com.tw timed out. (connect timeout=30)'))
+財報 2023Q1 otc：801 家
+財報 2023Q2 sii：1046 家
+財報 2023Q2 otc：864 家
+財報 2023Q3 sii：1007 家
+財報 2023Q3 otc：811 家
+財報 2023Q4 sii：1080 家
+財報 2023Q4 otc：885 家
+財報 2024Q1 sii：1025 家
+財報 2024Q1 otc：833 家
+財報 2024Q2 sii：1072 家
+財報 2024Q2 otc：884 家
+財報 2024Q3 sii：1042 家
+財報 2024Q3 otc：847 家
+財報 2024Q4 sii：1084 家
+財報 2024Q4 otc：893 家
+財報 2025Q1 sii：1059 家
+財報 2025Q1 otc：871 家
+財報 2025Q2 sii：1082 家
+財報 2025Q2 otc：893 家
+財報 2025Q3 sii：1079 家
+財報 2025Q3 otc：888 家
+財報 2025Q4 sii：1084 家
+財報 2025Q4 otc：893 家
+財報 2026Q1 sii：1083 家
+財報 2026Q1 otc：893 家
+財報 2026Q2 sii：1084 家
+財報 2026Q2 otc：893 家
 月營收：[('TPEx', 49, '2022-09', '2026-09', 41348), ('TWSE', 49, '2022-09', '2026-09', 47849)]
-財報：[('TPEx', 18, '2022Q1', '2026Q2', 15416), ('TWSE', 18, '2022Q1', '2026Q2', 18843)]
+財報：[('TPEx', 18, '2022Q1', '2026Q2', 15423), ('TWSE', 18, '2022Q1', '2026Q2', 18843)]
