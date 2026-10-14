@@ -194,11 +194,43 @@ def backfill(years=3):
         print("財報：", c.execute("SELECT market, COUNT(DISTINCT quarter), MIN(quarter), MAX(quarter), COUNT(*) FROM fin GROUP BY market").fetchall())
 
 
+def probe():
+    """測試資料來源連不連得到，結果寫進 output/lt_probe.txt（帶回來看）。"""
+    lines = []
+    tests = [
+        ("MOPS 月營收 mopsov", "get", "https://mopsov.twse.com.tw/nas/t21/sii/t21sc03_115_8_0.html", None),
+        ("MOPS 月營收 mops", "get", "https://mops.twse.com.tw/nas/t21/sii/t21sc03_115_8_0.html", None),
+        ("MOPS 綜合損益 mopsov", "post", "https://mopsov.twse.com.tw/mops/web/ajax_t163sb04",
+         {"encodeURIComponent": 1, "step": 1, "firstin": 1, "off": 1, "isQuery": "Y", "TYPEK": "sii", "year": 115, "season": "01"}),
+        ("MOPS 新站 月營收", "get", "https://mops.twse.com.tw/mops/api/t05st10_ifrs", None),
+        ("TWSE openapi 月營收", "get", "https://openapi.twse.com.tw/v1/opendata/t187ap05_L", None),
+        ("TPEx openapi 月營收", "get", "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O", None),
+        ("TWSE openapi EPS", "get", "https://openapi.twse.com.tw/v1/opendata/t187ap14_L", None),
+        ("FinMind 月營收", "get", "https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id=2330&start_date=2024-01-01", None),
+        ("FinMind 財報", "get", "https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockFinancialStatements&data_id=2330&start_date=2024-01-01", None),
+    ]
+    for name, m, url, data in tests:
+        try:
+            r = (requests.post if m == "post" else requests.get)(url, data=data, headers=UA, timeout=25)
+            body = r.content[:300].decode("utf-8", "replace").replace("\n", " ")
+            lines.append(f"{name}｜HTTP {r.status_code}｜{len(r.content)} bytes｜{body[:200]}")
+        except Exception as e:
+            lines.append(f"{name}｜失敗：{type(e).__name__} {str(e)[:150]}")
+    os.makedirs(os.path.dirname(LT_DB), exist_ok=True)
+    with open(os.path.join(os.path.dirname(LT_DB), "lt_probe.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print("\n".join(lines))
+
+
 def main():
     ap = argparse.ArgumentParser(description="長線成長股雷達")
     ap.add_argument("--backfill", action="store_true")
+    ap.add_argument("--probe", action="store_true")
     ap.add_argument("--no-email", action="store_true")
     a = ap.parse_args()
+    if a.probe:
+        probe()
+        return
     if a.backfill:
         backfill()
         return

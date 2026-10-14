@@ -39,7 +39,9 @@ jobs:
           BACKFILL: ${{ github.event.inputs.backfill }}
         run: |
           mkdir -p output
-          if [ -n "$BACKFILL" ]; then
+          if [ "$BACKFILL" = "probe" ]; then
+            python 長線.py --probe
+          elif [ -n "$BACKFILL" ]; then
             python 長線.py --backfill
           else
             python 長線.py
@@ -50,7 +52,8 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "4189282+github-actions[bot]@users.noreply.github.com"
-          git add output/longterm.db
+          git add output/longterm.db output/lt_probe.txt 2>/dev/null || true
+          git add -A output/
           if git diff --cached --quiet; then
             echo "No changes."
           else
