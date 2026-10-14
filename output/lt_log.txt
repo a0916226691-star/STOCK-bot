@@ -1,132 +1,19 @@
-月營收 2022-09 sii：946 家
-月營收 2022-09 otc：807 家
-月營收 2022-10 sii：949 家
-月營收 2022-10 otc：808 家
-月營收 2022-11 sii：951 家
-月營收 2022-11 otc：809 家
-月營收 2022-12 sii：952 家
-月營收 2022-12 otc：809 家
-月營收 2023-01 sii：956 家
-月營收 2023-01 otc：813 家
-月營收 2023-02 sii：956 家
-月營收 2023-02 otc：813 家
-月營收 2023-03 sii：958 家
-月營收 2023-03 otc：814 家
-月營收 2023-04 sii：960 家
-月營收 2023-04 otc：814 家
-月營收 2023-05 sii：959 家
-月營收 2023-05 otc：815 家
-月營收 2023-06 sii：961 家
-月營收 2023-06 otc：818 家
-月營收 2023-07 sii：961 家
-月營收 2023-07 otc：822 家
-月營收 2023-08 sii：963 家
-月營收 2023-08 otc：825 家
-月營收 2023-09 sii：964 家
-月營收 2023-09 otc：830 家
-月營收 2023-10 sii：965 家
-月營收 2023-10 otc：834 家
-月營收 2023-11 sii：965 家
-月營收 2023-11 otc：836 家
-月營收 2023-12 sii：969 家
-月營收 2023-12 otc：839 家
-月營收 2024-01 sii：969 家
-月營收 2024-01 otc：841 家
-月營收 2024-02 sii：969 家
-月營收 2024-02 otc：841 家
-月營收 2024-03 sii：969 家
-月營收 2024-03 otc：841 家
-月營收 2024-04 sii：970 家
-月營收 2024-04 otc：843 家
-月營收 2024-05 sii：971 家
-月營收 2024-05 otc：844 家
-月營收 2024-06 sii：972 家
-月營收 2024-06 otc：845 家
-月營收 2024-07 sii：974 家
-月營收 2024-07 otc：845 家
-月營收 2024-08 sii：977 家
-月營收 2024-08 otc：848 家
-月營收 2024-09 sii：978 家
-月營收 2024-09 otc：849 家
-月營收 2024-10 sii：981 家
-月營收 2024-10 otc：852 家
-月營收 2024-11 sii：985 家
-月營收 2024-11 otc：852 家
-月營收 2024-12 sii：986 家
-月營收 2024-12 otc：856 家
-月營收 2025-01 sii：988 家
-月營收 2025-01 otc：857 家
-月營收 2025-02 sii：988 家
-月營收 2025-02 otc：857 家
-月營收 2025-03 sii：990 家
-月營收 2025-03 otc：859 家
-月營收 2025-04 sii：990 家
-月營收 2025-04 otc：859 家
-月營收 2025-05 sii：990 家
-月營收 2025-05 otc：861 家
-月營收 2025-06 sii：991 家
-月營收 2025-06 otc：861 家
-月營收 2025-07 sii：991 家
-月營收 2025-07 otc：861 家
-月營收 2025-08 sii：992 家
-月營收 2025-08 otc：862 家
-月營收 2025-09 sii：992 家
-月營收 2025-09 otc：862 家
-月營收 2025-10 sii：992 家
-月營收 2025-10 otc：862 家
-月營收 2025-11 sii：992 家
-月營收 2025-11 otc：862 家
-月營收 2025-12 sii：992 家
-月營收 2025-12 otc：862 家
-月營收 2026-01 sii：992 家
-月營收 2026-01 otc：862 家
-月營收 2026-02 sii：992 家
-月營收 2026-02 otc：862 家
-月營收 2026-03 sii：992 家
-月營收 2026-03 otc：862 家
-月營收 2026-04 sii：993 家
-月營收 2026-04 otc：862 家
-月營收 2026-05 sii：993 家
-月營收 2026-05 otc：862 家
-月營收 2026-06 sii：993 家
-月營收 2026-06 otc：862 家
-月營收 2026-07 sii：993 家
-月營收 2026-07 otc：862 家
-月營收 2026-08 sii：993 家
-月營收 2026-08 otc：863 家
-月營收 2026-09 sii：980 家
-月營收 2026-09 otc：863 家
-財報 2022Q1 sii：965 家
-財報 2022Q1 otc：781 家
-財報 2022Q2 sii：1024 家
-財報 2022Q2 otc：833 家
-財報 2022Q3 sii：977 家
-財報 2022Q3 otc：788 家
-財報 2022Q4 sii：1061 家
-財報 2022Q4 otc：872 家
-財報 2023Q1 sii：989 家
-財報 2023Q1 otc：801 家
-財報 2023Q2 sii：1046 家
-財報 2023Q2 otc：864 家
-財報 2023Q3 sii：1007 家
-財報 2023Q3 otc：811 家
-財報 2023Q4 sii：1080 家
-財報 2023Q4 otc：884 家
-財報 2024Q1 sii：1025 家
-財報 2024Q1 otc：833 家
-財報 2024Q2 sii：1072 家
-財報 2024Q2 otc 失敗：HTTPSConnectionPool(host='mopsov.twse.com.tw', port=443): Max retries exceeded with url: /mops/web/ajax_t163sb04 (Caused by ConnectTimeoutError(<HTTPSConnection(host='mopsov.twse.com.tw', port=443) at 0x7fd0db844d50>, 'Connection to mopsov.twse.com.tw timed out. (connect timeout=30)'))
-財報 2024Q3 sii 失敗：HTTPSConnectionPool(host='mopsov.twse.com.tw', port=443): Max retries exceeded with url: /mops/web/ajax_t163sb04 (Caused by NewConnectionError("HTTPSConnection(host='mopsov.twse.com.tw', port=443): Failed to establish a new connection: [Errno 111] Connection refused"))
-財報 2024Q3 otc：847 家
-財報 2024Q4 sii 失敗：HTTPSConnectionPool(host='mopsov.twse.com.tw', port=443): Max retries exceeded with url: /mops/web/ajax_t163sb04 (Caused by ConnectTimeoutError(<HTTPSConnection(host='mopsov.twse.com.tw', port=443) at 0x7fd0dc5b5a10>, 'Connection to mopsov.twse.com.tw timed out. (connect timeout=30)'))
-財報 2024Q4 otc 失敗：HTTPSConnectionPool(host='mopsov.twse.com.tw', port=443): Max retries exceeded with url: /mops/web/ajax_t163sb05 (Caused by ConnectTimeoutError(<HTTPSConnection(host='mopsov.twse.com.tw', port=443) at 0x7fd0dbbdb3d0>, 'Connection to mopsov.twse.com.tw timed out. (connect timeout=30)'))
-財報 2025Q1 sii：1059 家
-時間到，先存檔，下次接著補
-時間到，先存檔，下次接著補
-時間到，先存檔，下次接著補
-時間到，先存檔，下次接著補
-時間到，先存檔，下次接著補
-時間到，先存檔，下次接著補
-時間到，先存檔，下次接著補
+財報 2024Q2 otc：883 家
+財報 2024Q3 sii：1042 家
+財報 2024Q4 sii：1084 家
+財報 2024Q4 otc：892 家
+財報 2025Q1 otc：871 家
+財報 2025Q2 sii：1082 家
+財報 2025Q2 otc：892 家
+財報 2025Q3 sii：1079 家
+財報 2025Q3 otc：888 家
+財報 2025Q4 sii：1084 家
+財報 2025Q4 otc：892 家
+財報 2026Q1 sii：1083 家
+財報 2026Q1 otc：892 家
+財報 2026Q2 sii：1084 家
+財報 2026Q2 otc：892 家
+財報 2026Q3 sii 失敗：`Import beautifulsoup4` failed.  Use pip or conda to install the beautifulsoup4 package.
+財報 2026Q3 otc 失敗：`Import beautifulsoup4` failed.  Use pip or conda to install the beautifulsoup4 package.
 月營收：[('TPEx', 49, '2022-09', '2026-09', 41348), ('TWSE', 49, '2022-09', '2026-09', 47845)]
-財報：[('TPEx', 10, '2022Q1', '2024Q3', 8314), ('TWSE', 11, '2022Q1', '2025Q1', 11305)]
+財報：[('TPEx', 18, '2022Q1', '2026Q2', 15416), ('TWSE', 18, '2022Q1', '2026Q2', 18843)]
