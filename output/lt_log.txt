@@ -1,19 +1,6 @@
-財報 2024Q2 otc：883 家
-財報 2024Q3 sii：1042 家
-財報 2024Q4 sii：1084 家
-財報 2024Q4 otc：892 家
-財報 2025Q1 otc：871 家
-財報 2025Q2 sii：1082 家
-財報 2025Q2 otc：892 家
-財報 2025Q3 sii：1079 家
-財報 2025Q3 otc：888 家
-財報 2025Q4 sii：1084 家
-財報 2025Q4 otc：892 家
-財報 2026Q1 sii：1083 家
-財報 2026Q1 otc：892 家
-財報 2026Q2 sii：1084 家
-財報 2026Q2 otc：892 家
-財報 2026Q3 sii 失敗：`Import beautifulsoup4` failed.  Use pip or conda to install the beautifulsoup4 package.
-財報 2026Q3 otc 失敗：`Import beautifulsoup4` failed.  Use pip or conda to install the beautifulsoup4 package.
-月營收：[('TPEx', 49, '2022-09', '2026-09', 41348), ('TWSE', 49, '2022-09', '2026-09', 47845)]
+月營收 2026-08 sii：993 家
+月營收 2026-08 otc：863 家
+月營收 2026-09 sii：984 家
+月營收 2026-09 otc：863 家
+月營收：[('TPEx', 49, '2022-09', '2026-09', 41348), ('TWSE', 49, '2022-09', '2026-09', 47849)]
 財報：[('TPEx', 18, '2022Q1', '2026Q2', 15416), ('TWSE', 18, '2022Q1', '2026Q2', 18843)]
