@@ -27,7 +27,7 @@ LT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "long
 MOPS_HOSTS = ["https://mopsov.twse.com.tw"]      # mops.twse.com.tw 從 GitHub 連不到
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0"}
 REV_COLS = ["month", "stock_id", "name", "market", "revenue", "rev_ly", "yoy", "mom"]
-FIN_COLS = ["quarter", "stock_id", "market", "eps", "net_income", "equity"]
+FIN_COLS = ["quarter", "stock_id", "market", "eps", "net_income", "equity", "op_revenue", "gross_profit"]
 
 
 @contextmanager
@@ -47,6 +47,10 @@ def init_ldb():
                   "rev_ly REAL, yoy REAL, mom REAL, PRIMARY KEY(month, stock_id))")
         c.execute("CREATE TABLE IF NOT EXISTS fin (quarter TEXT, stock_id TEXT, market TEXT, eps REAL, net_income REAL, "
                   "equity REAL, PRIMARY KEY(quarter, stock_id))")
+        cols = {r[1] for r in c.execute("PRAGMA table_info(fin)")}
+        for col in ("op_revenue", "gross_profit"):                           # 毛利率用（10/14 加）
+            if col not in cols:
+                c.execute(f"ALTER TABLE fin ADD COLUMN {col} REAL")
 
 
 def lupsert(table, df, cols):
@@ -138,10 +142,15 @@ def fetch_fin(year, season, market):
         c_eps = next((c for c in t.columns if "基本每股盈餘" in c), None)
         c_ni = next((c for c in t.columns if "歸屬於母公司業主" in c and "淨利" in c), None) or \
             next((c for c in t.columns if c.startswith("本期淨利") or c.startswith("本期稅後淨利")), None)
+        c_rev = next((c for c in t.columns if c == "營業收入" or c.startswith("營業收入")), None) or \
+            next((c for c in t.columns if c == "收入" or c.startswith("收益")), None)
+        c_gp = next((c for c in t.columns if c.startswith("營業毛利") and "淨額" in c), None) or \
+            next((c for c in t.columns if c.startswith("營業毛利")), None)
         for _, x in t.iterrows():
             sid = str(x["公司代號"]).strip()
             if R.is_stock_id(sid):
-                inc[sid] = (_num(x[c_eps]) if c_eps else np.nan, _num(x[c_ni]) if c_ni else np.nan)
+                inc[sid] = (_num(x[c_eps]) if c_eps else np.nan, _num(x[c_ni]) if c_ni else np.nan,
+                            _num(x[c_rev]) if c_rev else np.nan, _num(x[c_gp]) if c_gp else np.nan)
     time.sleep(3)
     for t in _fin_tables("ajax_t163sb05", market, year, season):          # 資產負債表彙總
         if "公司代號" not in t.columns:
@@ -153,7 +162,7 @@ def fetch_fin(year, season, market):
             if R.is_stock_id(sid) and c_eq:
                 bal[sid] = _num(x[c_eq])
     rows = [{"quarter": q, "stock_id": s, "market": "TWSE" if market == "sii" else "TPEx", "eps": v[0],
-             "net_income": v[1], "equity": bal.get(s, np.nan)} for s, v in inc.items()]
+             "net_income": v[1], "equity": bal.get(s, np.nan), "op_revenue": v[2], "gross_profit": v[3]} for s, v in inc.items()]
     return pd.DataFrame(rows, columns=FIN_COLS)
 
 
@@ -176,7 +185,8 @@ def backfill(years=3, budget_min=70, refresh_recent=False):
     with ldb() as c:
         have_r = {(a, b) for a, b in c.execute("SELECT month, market FROM revenue GROUP BY month, market HAVING COUNT(*) > 100")
                   if a not in recent}
-        have_f = {(a, b) for a, b in c.execute("SELECT quarter, market FROM fin GROUP BY quarter, market HAVING COUNT(*) > 100")}
+        have_f = {(a, b) for a, b in c.execute("SELECT quarter, market FROM fin GROUP BY quarter, market "
+                                                "HAVING SUM(gross_profit IS NOT NULL) > 100")}
     start = (now - timedelta(days=int(365 * years) + 400)).replace(day=1)        # 多抓一年，才算得出年增率的歷史
     for m in pd.period_range(start.strftime("%Y-%m"), now.strftime("%Y-%m"), freq="M")[:-1]:
         for mk in ("sii", "otc"):
