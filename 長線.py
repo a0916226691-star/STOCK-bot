@@ -24,7 +24,7 @@ import requests
 import 主 as R
 
 LT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "longterm.db")
-MOPS_HOSTS = ["https://mopsov.twse.com.tw", "https://mops.twse.com.tw"]
+MOPS_HOSTS = ["https://mopsov.twse.com.tw"]      # mops.twse.com.tw 從 GitHub 連不到
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0"}
 REV_COLS = ["month", "stock_id", "name", "market", "revenue", "rev_ly", "yoy", "mom"]
 FIN_COLS = ["quarter", "stock_id", "market", "eps", "net_income", "equity"]
@@ -80,7 +80,7 @@ def _get(path, method="get", data=None):
     for host in MOPS_HOSTS:
         for i in range(2):
             try:
-                r = (requests.post if method == "post" else requests.get)(host + path, data=data, headers=UA, timeout=40)
+                r = (requests.post if method == "post" else requests.get)(host + path, data=data, headers=UA, timeout=30)
                 r.raise_for_status()
                 if len(r.content) < 500:
                     raise ValueError(f"回應太短：{r.text[:100]}")
@@ -157,9 +157,21 @@ def fetch_fin(year, season, market):
     return pd.DataFrame(rows, columns=FIN_COLS)
 
 
-def backfill(years=3):
+LOG = []
+
+
+def log(msg):
+    print(msg)
+    LOG.append(msg)
+    with open(os.path.join(os.path.dirname(LT_DB), "lt_log.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(LOG[-300:]))
+
+
+def backfill(years=3, budget_min=70):
     init_ldb()
     now = R.now_tw()
+    t0 = time.time()
+    over = lambda: (time.time() - t0) / 60 > budget_min
     with ldb() as c:
         have_r = {(a, b) for a, b in c.execute("SELECT month, market FROM revenue GROUP BY month, market HAVING COUNT(*) > 100")}
         have_f = {(a, b) for a, b in c.execute("SELECT quarter, market FROM fin GROUP BY quarter, market HAVING COUNT(*) > 100")}
@@ -169,12 +181,14 @@ def backfill(years=3):
             key = (str(m), "TWSE" if mk == "sii" else "TPEx")
             if key in have_r:
                 continue
+            if over():
+                log("時間到，先存檔，下次接著補"); break
             try:
                 n = lupsert("revenue", fetch_revenue(m.year, m.month, mk), REV_COLS)
-                print(f"月營收 {m} {mk}：{n} 家")
+                log(f"月營收 {m} {mk}：{n} 家")
             except Exception as e:
-                print(f"月營收 {m} {mk} 失敗：{e}")
-            time.sleep(3)
+                log(f"月營收 {m} {mk} 失敗：{e}")
+            time.sleep(5)
     for y in range(start.year, now.year + 1):
         for s in (1, 2, 3, 4):
             if (y, s) > (now.year, (now.month - 1) // 3):
@@ -183,15 +197,17 @@ def backfill(years=3):
                 key = (f"{y}Q{s}", "TWSE" if mk == "sii" else "TPEx")
                 if key in have_f:
                     continue
+                if over():
+                    log("時間到，先存檔，下次接著補"); break
                 try:
                     n = lupsert("fin", fetch_fin(y, s, mk), FIN_COLS)
-                    print(f"財報 {y}Q{s} {mk}：{n} 家")
+                    log(f"財報 {y}Q{s} {mk}：{n} 家")
                 except Exception as e:
-                    print(f"財報 {y}Q{s} {mk} 失敗：{e}")
+                    log(f"財報 {y}Q{s} {mk} 失敗：{e}")
                 time.sleep(4)
     with ldb() as c:
-        print("月營收：", c.execute("SELECT market, COUNT(DISTINCT month), MIN(month), MAX(month), COUNT(*) FROM revenue GROUP BY market").fetchall())
-        print("財報：", c.execute("SELECT market, COUNT(DISTINCT quarter), MIN(quarter), MAX(quarter), COUNT(*) FROM fin GROUP BY market").fetchall())
+        log("月營收：" + str(c.execute("SELECT market, COUNT(DISTINCT month), MIN(month), MAX(month), COUNT(*) FROM revenue GROUP BY market").fetchall()))
+        log("財報：" + str(c.execute("SELECT market, COUNT(DISTINCT quarter), MIN(quarter), MAX(quarter), COUNT(*) FROM fin GROUP BY market").fetchall()))
 
 
 def probe():
