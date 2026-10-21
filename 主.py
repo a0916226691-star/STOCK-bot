@@ -2229,6 +2229,8 @@ LT_TURN_MAX_D = 10
 # 長均保護短均：🟡、🟢 都要半年線（120 日）比 20 天前高（回測：半年線往上勝率 73%、+10.5%；往下 64%、+4.3%）
 LT_TURN_MIN_GAP = 2.0      # 🟢 轉強：收盤離月線至少 2%（太近一碰月線就被壓回；回測 0～2% 勝率 52%，2% 以上 65～78%）
 LT_INTRADAY_N = 40         # 盤中信最多盯幾檔 🟡
+LT_MIN_PRICE = 10.0        # 短線：股價 10 元以上（10/22 從 20 元放寬；回測 6/22～10/20 多 42 筆、勝率 62%、平均 +3.2%，整體差不多）
+LT_MIN_TURNOVER = 15_000_000   # 短線：成交金額 1,500 萬以上（10/22 從 3,000 萬放寬）
 LT_MIN_DAYS = 80           # 至少要有幾天股價資料才判斷
 LT_MAX_N = 15              # 信裡最多列幾檔
 LT_ACCUM_DAYS = 7          # 🟢 佈局：法人近 10 天至少幾天買超（在底部一直買）
@@ -2292,7 +2294,7 @@ def build_longtrack(radar):
             continue
         r = rows.loc[sid]
         c = float(r["close"])
-        if c < MIN_PRICE or not r.get("turnover", 0) >= MIN_DAILY_TURNOVER:
+        if c < LT_MIN_PRICE or not r.get("turnover", 0) >= LT_MIN_TURNOVER:
             continue
         cl = pd.to_numeric(p["close"], errors="coerce").to_numpy()
         if LT_CHOP_ON and _wave_days(cl[-240:]) < LT_CHOP_DAYS:
