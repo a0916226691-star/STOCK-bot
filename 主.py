@@ -2311,12 +2311,10 @@ def build_longtrack(radar):
         h, H, k, L = sw
         if H <= L:
             continue
-        # 一定要「真的跌到底」：最近 2～10 天剛創 60 天新低，而且股價在 60 天高低區間的下半部（排除大漲後的半山腰拉回，例：致茂 6/22）
+        # 股價要在 60 天高低區間的下半部（排除大漲後的半山腰拉回，例：致茂 6/22）
+        # 10/21 拿掉「最近 2～10 天剛創 60 天新低」：回測 6/22～10/20 訊號 106→174 筆，扣掉 8 月 −0.1%→+0.9%、9 月後 +2.6%→+7.4%
         lo60, hi60 = float(np.nanmin(lo[-61:])), float(np.nanmax(hi[-61:]))
-        d60 = n - 1 - (n - 61 + int(np.nanargmin(lo[-61:])))
         if hi60 > lo60 and (c - lo60) / (hi60 - lo60) > 0.5:
-            continue
-        if not (LT_TURN_MIN_D <= d60 <= LT_TURN_MAX_D):
             continue
         retr = (c - L) / (H - L)
         retr_prev = (cl[-2] - L) / (H - L)                      # 昨天還在不在低檔
