@@ -2528,6 +2528,41 @@ def hold_signals(sids):
     return out
 
 
+NEWS_DAYS = 3                # 信裡附近幾天的新聞
+NEWS_MAX = 3                 # 每檔最多幾則
+NEWS_SKIP = ("盤中速報", "注意交易資訊", "盤後速報")   # 只報股價、制式公告，沒資訊量
+_NEWS_CACHE = {}
+
+
+def news_lines(sid):
+    """鉅亨網個股新聞（新聞＋公告），只附在信裡當參考，不影響選股。抓不到就回空字串。"""
+    if sid in _NEWS_CACHE:
+        return _NEWS_CACHE[sid]
+    out = ""
+    try:
+        r = requests.get("https://ess.api.cnyes.com/ess/api/v1/news/keyword",
+                         params={"q": sid, "limit": 15, "page": 1},
+                         headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0"}, timeout=10)
+        items = r.json().get("data", {}).get("items", [])
+        cut = now_tw() - timedelta(days=NEWS_DAYS)
+        rows = []
+        for it in items:
+            t = str(it.get("title", "")).replace("<mark>", "").replace("</mark>", "").strip()
+            ts = datetime.fromtimestamp(int(it.get("publishAt", 0)), TZ)
+            if not t or ts < cut or any(k in t for k in NEWS_SKIP):
+                continue
+            rows.append(f"・{ts.month}/{ts.day} {t[:45]}{'…' if len(t) > 45 else ''}")
+            if len(rows) >= NEWS_MAX:
+                break
+        if rows:
+            out = f"\n近 {NEWS_DAYS} 天新聞：\n" + "\n".join(rows)
+        time.sleep(0.3)
+    except Exception as e:
+        print(f"新聞抓不到（{sid}）：{e}")
+    _NEWS_CACHE[sid] = out
+    return out
+
+
 def build_simple_email(radar, data_date, holdings, track=None):
     """信件只放「長線追蹤」這套：法人賣到底 → 一直買、底部守住 → 帶量噴出才買。
     舊的佈局／突破／低接還是會算、存進紀錄（之後比較勝率用），但不寫進信裡。"""
@@ -2544,7 +2579,8 @@ def build_simple_email(radar, data_date, holdings, track=None):
         if r.get("mbull"):
             blk += "\n月K：⭐ 多頭（站上 10 月線、10 月線往上）"
         parts.append("\n" + blk
-                     + (f"\n停損價格：{fmt_now(float(stop))}（低點，收盤跌破就賣）" if pd.notna(stop) else ""))
+                     + (f"\n停損價格：{fmt_now(float(stop))}（低點，收盤跌破就賣）" if pd.notna(stop) else "")
+                     + news_lines(r["stock_id"]))
 
     watches = []
     if track is not None and not track.empty:
@@ -2557,7 +2593,8 @@ def build_simple_email(radar, data_date, holdings, track=None):
                          f"前高／低點：{fmt_now(float(x['peak']))}／{fmt_now(float(x['bottom']))}（低點跌破就變 🔴）\n"
                          + (f"轉強價格：{fmt_now(float(x['turn_px']))}（收盤站上 5 日、10 日線就轉 🟢）\n" if pd.notna(x.get("turn_px")) and x["lt_light"] == "🟡" else "")
 
-                         + f"法人動態：{x['lt_light']} {x['lt_text']}")
+                         + f"法人動態：{x['lt_light']} {x['lt_text']}"
+                         + (news_lines(x["stock_id"]) if x["lt_light"] != "🔴" else ""))
         watches = list(track.loc[track["lt_light"] == "🟡", "stock_id"])
     else:
         parts.append("\n\n【追蹤：從高點下來】今天沒有資料")
@@ -2585,7 +2622,8 @@ def build_simple_email(radar, data_date, holdings, track=None):
             blk = blk.replace(f"法人動態：{inst_light(r)}", f"持股燈號：{hs[0]}") + f"\n停損價格：{fmt_now(hs[1])}"
         else:
             n_sell += inst_light(r).startswith("🔴")
-        parts.append("\n" + blk + (f"\n{adds[sid]}" if sid in adds and not (hs and hs[0].startswith("🔴")) else ""))
+        parts.append("\n" + blk + (f"\n{adds[sid]}" if sid in adds and not (hs and hs[0].startswith("🔴")) else "")
+                     + news_lines(sid))
     return "\n".join(parts) + "\n", len(buys), len(watches), n_sell
 
 
