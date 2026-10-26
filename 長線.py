@@ -92,10 +92,10 @@ def _get(path, method="get", data=None):
 
 
 # ───────────── 月營收 ─────────────
-def fetch_revenue(year, month, market):
-    """market：sii（上市）或 otc（上櫃）。回傳該月全部公司營收。"""
+def fetch_revenue(year, month, market, ky=False):
+    """market：sii（上市）或 otc（上櫃）。回傳該月全部公司營收。ky=True 抓外國公司（KY）那張表。"""
     roc = year - 1911
-    r = _get(f"/nas/t21/{market}/t21sc03_{roc}_{month}_0.html")
+    r = _get(f"/nas/t21/{market}/t21sc03_{roc}_{month}_{1 if ky else 0}.html")
     r.encoding = "big5"
     tables = pd.read_html(io.StringIO(r.text))
     rows = []
@@ -191,6 +191,20 @@ def backfill(years=3, budget_min=70, refresh_recent=False):
             except Exception as e:
                 log(f"月營收 {m} {mk} 失敗：{e}")
             time.sleep(5)
+    with ldb() as c:                                                     # KY 公司的營收在另一張表（_1）
+        have_ky = {(a, b) for a, b in c.execute("SELECT month, market FROM revenue WHERE name LIKE '%KY%' GROUP BY month, market")
+                   if a not in recent}
+    for m in pd.period_range(start.strftime("%Y-%m"), now.strftime("%Y-%m"), freq="M")[:-1]:
+        for mk in ("sii", "otc"):
+            key = (str(m), "TWSE" if mk == "sii" else "TPEx")
+            if key in have_ky or over():
+                continue
+            try:
+                n = lupsert("revenue", fetch_revenue(m.year, m.month, mk, ky=True), REV_COLS)
+                log(f"月營收（KY）{m} {mk}：{n} 家")
+            except Exception as e:
+                log(f"月營收（KY）{m} {mk} 失敗：{e}")
+            time.sleep(3)
     for y in range(start.year, now.year + 1):
         for s in (1, 2, 3, 4):
             deadline = {1: f"{y}-05-16", 2: f"{y}-08-15", 3: f"{y}-11-15", 4: f"{y + 1}-04-01"}[s]
@@ -293,6 +307,37 @@ def screen():
     return df, ok.sort_values("roe", ascending=False).head(TOP_N), last
 
 
+def long_hold_alerts(rev, today):
+    """長期持股（股票追蹤〔長期持股〕區）：營收連 2 個月年減才提醒，同一檔同一個營收月份只提醒一次。"""
+    R.LONG_HOLDINGS.clear()
+    R.load_holdings()
+    ids = list(R.LONG_HOLDINGS)
+    if not ids:
+        return []
+    r = rev[rev["stock_id"].isin(ids)].copy()
+    r["yoy"] = np.where(r["rev_ly"] > 0, r["revenue"] / r["rev_ly"] - 1, np.nan)
+    with ldb() as c:
+        c.execute("CREATE TABLE IF NOT EXISTS lh_alert (stock_id TEXT, month TEXT, date TEXT, PRIMARY KEY(stock_id, month))")
+        done = set(map(tuple, c.execute("SELECT stock_id, month FROM lh_alert").fetchall()))
+    last = rev["month"].max()
+    prev = str(pd.Period(last) - 1)
+    out = []
+    for sid, g in r.sort_values("month").groupby("stock_id"):
+        g = g.set_index("month")
+        if last not in g.index or prev not in g.index:
+            continue                                                     # 最新兩個月要都有資料
+        y1, y2 = g.loc[last].copy(), g.loc[prev].copy()
+        y1["month"], y2["month"] = last, prev
+        if pd.isna(y1.yoy) or pd.isna(y2.yoy):
+            continue
+        if y1.yoy < 0 and y2.yoy < 0 and (sid, y1.month) not in done:
+            out.append((sid, y1["name"], y2.month, y2.yoy, y1.month, y1.yoy))
+    with ldb() as c:
+        for a in out:
+            c.execute("INSERT OR IGNORE INTO lh_alert VALUES (?,?,?)", (a[0], a[4], today))
+    return out
+
+
 def run(send_mail=True):
     init_ldb()
     with ldb() as c:
@@ -345,6 +390,15 @@ def run(send_mail=True):
         parts.append(f"\n\n【🔴 賣出】{len(sells)} 檔")
         for h, x, ret, why in sells:
             parts.append(f"\n{h['name']}({h.stock_id})：{why}\n進榜 {h.since} {R.fmt_now(h.close)} → 現在 {R.fmt_now(x.close)}（{pct(ret)}）")
+    try:
+        lh = long_hold_alerts(load_all()[0], today)
+    except Exception as e:
+        print(f"長期持股偵測失敗：{e}")
+        lh = []
+    if lh:
+        parts.append(f"\n\n【⚠️ 長期持股轉弱】{len(lh)} 檔（營收連 2 個月年減，成長可能在轉弱，要不要減碼你自己判斷）")
+        for sid, nm, m2, y2, m1, y1 in lh:
+            parts.append(f"{nm}({sid})：{m2} 年增 {pct(y2)}、{m1} 年增 {pct(y1)}")
     if keeps:
         parts.append(f"\n\n【🟢 續抱】{len(keeps)} 檔（之前進榜、營收還沒轉弱）")
         for h, x, ret in keeps:
@@ -354,8 +408,8 @@ def run(send_mail=True):
     body = "\n".join(parts) + "\n"
     print(body)
     if send_mail:
-        R.send_email(f"長線成長股 {today[5:7]}/{today[8:]}｜新進榜{len(new)} 續抱{len(keeps)}"
-                     + (f" 賣出{len(sells)}" if sells else ""), body)
+        R.send_email(f"{'⚠️' if lh else ''}長線成長股 {today[5:7]}/{today[8:]}｜新進榜{len(new)} 續抱{len(keeps)}"
+                     + (f" 賣出{len(sells)}" if sells else "") + (f" 長期持股轉弱{len(lh)}" if lh else ""), body)
 
 
 def main():

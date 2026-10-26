@@ -1719,6 +1719,8 @@ def build_tracking_text(recs, radar, events, version=None):
 
 
 # ───────────────────────── 我真正買的股票 ─────────────────────────
+LONG_HOLD_GROUP = "長期持股"    # 這一區只給長線週報偵測「營收轉弱」用，每天的信不列
+LONG_HOLDINGS = {}           # {代號: 區名}
 HOLDING_STOPS = {}          # 持股停損價（持股檔第三欄）；沒填的用最近 15 天最低點
 
 
@@ -1749,6 +1751,9 @@ def load_holdings():
                 sid = normalize_stock_id(parts[0])
                 if not is_stock_id(sid):
                     continue                           # 標題列或亂打的字
+                if group == LONG_HOLD_GROUP:
+                    LONG_HOLDINGS[sid] = group
+                    continue
                 price = safe_float(parts[1]) if len(parts) > 1 else np.nan
                 out[sid] = (None if pd.isna(price) or price <= 0 else float(price), group)
                 stop = safe_float(parts[2]) if len(parts) > 2 else np.nan
