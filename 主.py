@@ -2568,6 +2568,93 @@ def news_lines(sid):
     return out
 
 
+def paper_track(buys, data_date):
+    """推薦成績：每一檔 🟢 可買，都假設隔天開盤買進，追到出現賣出訊號（收盤跌破停損、法人 5 天賣超達成交量 10%、
+    爆量 2 倍收黑或長上影線）為止。回傳信裡的文字。"""
+    with db() as c:
+        c.execute("CREATE TABLE IF NOT EXISTS paper (sig_date TEXT, stock_id TEXT, name TEXT, stop REAL, "
+                  "PRIMARY KEY(sig_date, stock_id))")
+        old = pd.read_sql("SELECT * FROM paper", c, dtype={"stock_id": str})
+        seed = os.path.join(OUTPUT_DIR, "paper_seed.csv")                # 10/30 以前已經寄過的推薦（第一次跑時匯入）
+        if old.empty and os.path.exists(seed):
+            sd = pd.read_csv(seed, dtype={"stock_id": str})
+            c.executemany("INSERT OR IGNORE INTO paper VALUES (?,?,?,?)",
+                          sd[["sig_date", "stock_id", "name", "stop"]].itertuples(index=False, name=None))
+            old = sd
+        for _, r in (buys if buys is not None else pd.DataFrame()).iterrows():
+            sid, stop = str(r["stock_id"]), r.get("lt_stop")
+            if pd.isna(stop) or ((old["stock_id"] == sid) & (old["sig_date"] == data_date)).any():
+                continue
+            c.execute("INSERT OR IGNORE INTO paper VALUES (?,?,?,?)", (data_date, sid, str(r["stock_name"]), float(stop)))
+        sig = pd.read_sql("SELECT * FROM paper ORDER BY sig_date", c, dtype={"stock_id": str})
+        if sig.empty:
+            return ""
+        ids = tuple(sig["stock_id"].unique())
+        q = ",".join("?" * len(ids))
+        px = pd.read_sql(f"SELECT stock_id, date, open, high, low, close, volume FROM prices WHERE stock_id IN ({q}) "
+                         f"AND date >= ? ORDER BY stock_id, date", c, params=(*ids, str(pd.Timestamp(sig["sig_date"].min()) - pd.Timedelta(days=20))[:10]),
+                         dtype={"stock_id": str})
+        ins = pd.read_sql(f"SELECT stock_id, date, foreign_net + trust_net AS net FROM institutional WHERE stock_id IN ({q})",
+                          c, params=ids, dtype={"stock_id": str})
+    P = {k: g.reset_index(drop=True) for k, g in px.groupby("stock_id")}
+    I = {k: g.set_index("date")["net"] for k, g in ins.groupby("stock_id")}
+    done, live, wait, until = [], [], [], {}
+    for _, x in sig.iterrows():
+        sid = x["stock_id"]
+        if sid in until and until[sid] >= x["sig_date"]:
+            continue                                         # 還抱著同一檔，不重複算
+        p = P.get(sid)
+        if p is None:
+            continue
+        after = p.index[p["date"] > x["sig_date"]]
+        if len(after) == 0:
+            wait.append(x)
+            until[sid] = "9999"
+            continue
+        k0 = after[0]
+        cl, op, hi, lo, vol = (pd.to_numeric(p[k], errors="coerce").fillna(pd.to_numeric(p["close"])).to_numpy()
+                               for k in ("close", "open", "high", "low", "volume"))
+        net = I.get(sid, pd.Series(dtype=float)).reindex(p["date"]).fillna(0).to_numpy()
+        e, j, why = op[k0], len(cl) - 1, ""
+        for k in range(k0, len(cl)):
+            n5, v5 = net[max(0, k - 4):k + 1].sum(), vol[max(0, k - 4):k + 1].sum()
+            rng = hi[k] - lo[k]
+            dump = cl[k] < op[k] or (rng > 0 and hi[k] - max(cl[k], op[k]) >= rng * 0.5)
+            vr = vol[k] / np.nanmean(vol[max(0, k - 5):k]) if k > 0 else 0
+            if cl[k] < x["stop"]:
+                j, why = k, "跌破停損"; break
+            if n5 < 0 and -n5 >= 0.10 * v5:
+                j, why = k, "法人大賣"; break
+            if k > k0 and vr >= 2 and dump:
+                j, why = k, "爆量出貨"; break
+        rec = dict(sid=sid, name=x["name"], sig=x["sig_date"], in_d=p["date"][k0], e=e, out_d=p["date"][j], x=cl[j],
+                   ret=cl[j] / e - 1, why=why)
+        (done if why else live).append(rec)
+        until[sid] = p["date"][j] if why else "9999"
+    md = lambda d: f"{int(d[5:7])}/{int(d[8:])}"
+    lines = [f"\n\n【推薦成績】（假設每檔 🟢 都在隔天開盤買進，出現賣出訊號才賣）"]
+    if done:
+        t = pd.DataFrame(done)
+        w, l = t.loc[t.ret > 0, "ret"], t.loc[t.ret <= 0, "ret"]
+        pl = f"{w.mean() / abs(l.mean()):.2f}" if len(w) and len(l) else "—"
+        lines.append(f"已出場 {len(t)} 筆：勝率 {(t.ret > 0).mean():.0%}，平均每筆 {t.ret.mean():+.1%}，"
+                     f"賺的平均 {w.mean() if len(w) else 0:+.1%}、賠的平均 {l.mean() if len(l) else 0:+.1%}，盈虧比 {pl}")
+    else:
+        lines.append("已出場：還沒有")
+    if live:
+        lines.append(f"\n持有中 {len(live)} 檔：")
+        for r in sorted(live, key=lambda r: r["sig"]):
+            lines.append(f"{r['name']}({r['sid']})：{md(r['in_d'])} 開盤 {fmt_now(r['e'])} → 現在 {fmt_now(r['x'])}（{r['ret']:+.1%}）")
+    if wait:
+        lines.append("今天開盤才買進：" + "、".join(f"{x['name']}({x['stock_id']})" for x in wait))
+    if done:
+        lines.append("\n最近出場：")
+        for r in sorted(done, key=lambda r: r["out_d"], reverse=True)[:8]:
+            lines.append(f"{r['name']}({r['sid']})：{md(r['in_d'])} 買 {fmt_now(r['e'])} → {md(r['out_d'])} {r['why']} "
+                         f"{fmt_now(r['x'])}（{r['ret']:+.1%}）")
+    return "\n".join(lines)
+
+
 def build_simple_email(radar, data_date, holdings, track=None):
     """信件只放「長線追蹤」這套：法人賣到底 → 一直買、底部守住 → 帶量噴出才買。
     舊的佈局／突破／低接還是會算、存進紀錄（之後比較勝率用），但不寫進信裡。"""
@@ -2629,6 +2716,10 @@ def build_simple_email(radar, data_date, holdings, track=None):
             n_sell += inst_light(r).startswith("🔴")
         parts.append("\n" + blk + (f"\n{adds[sid]}" if sid in adds and not (hs and hs[0].startswith("🔴")) else "")
                      + news_lines(sid))
+    try:
+        parts.append(paper_track(buys, data_date))
+    except Exception as e:
+        print(f"推薦成績計算失敗（不影響寄信）：{e}")
     return "\n".join(parts) + "\n", len(buys), len(watches), n_sell
 
 
