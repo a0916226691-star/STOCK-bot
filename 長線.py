@@ -48,7 +48,7 @@ def init_ldb():
         c.execute("CREATE TABLE IF NOT EXISTS fin (quarter TEXT, stock_id TEXT, market TEXT, eps REAL, net_income REAL, "
                   "equity REAL, PRIMARY KEY(quarter, stock_id))")
         have = {r[1] for r in c.execute("PRAGMA table_info(fin)")}
-        for col in ("op_revenue", "op_income", "ppe"):               # 營業收入、營業利益（年初累計）、不動產廠房及設備（期末）
+        for col in ("op_revenue", "op_income", "ppe"):               # 營業收入、營業利益（年初累計）、非流動資產（期末，擴廠的近似指標）
             if col not in have:
                 c.execute(f"ALTER TABLE fin ADD COLUMN {col} REAL")
 
@@ -155,7 +155,8 @@ def fetch_fin(year, season, market):
             continue
         c_eq = next((c for c in t.columns if "歸屬於母公司業主之權益" in c), None) or \
             next((c for c in t.columns if c.startswith("權益總") or c.startswith("權益合計")), None)
-        c_ppe = next((c for c in t.columns if c.startswith("不動產、廠房及設備")), None)
+        c_ppe = next((c for c in t.columns if c.startswith("不動產、廠房及設備")), None) or \
+            next((c for c in t.columns if c.startswith("非流動資產")), None)   # 彙總表沒有廠房設備，用非流動資產代替
         for _, x in t.iterrows():
             sid = str(x["公司代號"]).strip()
             if R.is_stock_id(sid) and c_eq:
@@ -242,6 +243,7 @@ def backfill(years=3, budget_min=70, refresh_recent=False):
 # ───────────── 選股 ─────────────
 TOP_N = 10                 # 每週列幾檔
 YOY3_MIN = 0.20            # 近 3 個月營收年增率平均 > 20%
+OM_MIN = 0.10              # 近四季營業利益率 ≥ 10%（10/30 回測：抱到營收轉弱才賣，平均 +58%→+67%、中位數 +18%→+27%，前後兩段都有效）
 MIN_PRICE = 20
 MIN_TURNOVER = 30_000_000  # 近 20 日平均成交金額
 MAX_HOLD_MONTHS = 12       # 回測最多看 12 個月
@@ -264,7 +266,9 @@ def ttm_fin(fin):
     f["y"] = f["quarter"].str[:4].astype(int)
     f["q"] = f["quarter"].str[-1].astype(int)
     f = f.sort_values(["stock_id", "y", "q"])
-    for col in ("eps", "net_income"):
+    for col in ("eps", "net_income", "op_revenue", "op_income"):
+        if col not in f.columns:
+            f[col] = np.nan
         f[col + "_q"] = f[col] - f.groupby(["stock_id", "y"])[col].shift(1).fillna(0)
     f["idx"] = f["y"] * 4 + f["q"]
     out = {}
@@ -276,7 +280,9 @@ def ttm_fin(fin):
         eps = float(g.loc[k - 3:k, "eps_q"].sum())
         ni = float(g.loc[k - 3:k, "net_income_q"].sum())
         eq = g.loc[k, "equity"]
-        out[sid] = (eps, ni / eq if pd.notna(eq) and eq > 0 else np.nan, g.loc[k, "quarter"])
+        rv, oi = float(g.loc[k - 3:k, "op_revenue_q"].sum()), float(g.loc[k - 3:k, "op_income_q"].sum())
+        om = oi / rv if rv > 0 and g.loc[k - 3:k, "op_income"].notna().all() else np.nan
+        out[sid] = (eps, ni / eq if pd.notna(eq) and eq > 0 else np.nan, g.loc[k, "quarter"], om)
     return out
 
 
@@ -308,14 +314,14 @@ def screen():
         revhi = r.iloc[-1] >= r.iloc[-12:-1].max()
         ma = MA[sid].dropna()
         trend = len(ma) >= 2 and c > ma.iloc[-1] and ma.iloc[-1] > ma.iloc[-2]
-        eps, roe, q = fx.get(sid, (np.nan, np.nan, ""))
+        eps, roe, q, om = fx.get(sid, (np.nan, np.nan, "", np.nan))
         yy = YY[sid].dropna()
         rows.append({"stock_id": sid, "name": pnames.get(sid, names.get(sid, sid)), "close": c, "yoy3": yoy3,
                      "yoy_last": float(yy.iloc[-1]) if len(yy) else np.nan, "revhi": bool(revhi), "trend": bool(trend),
-                     "eps": eps, "roe": roe, "fin_q": q, "rev_month": last,
+                     "eps": eps, "roe": roe, "om": om, "fin_q": q, "rev_month": last,
                      "neg2": bool(len(yy) >= 2 and yy.iloc[-1] < 0 and yy.iloc[-2] < 0)})
     df = pd.DataFrame(rows)
-    ok = df[df["revhi"] & df["trend"] & (df["yoy3"] > YOY3_MIN) & (df["eps"] > 0)]
+    ok = df[df["revhi"] & df["trend"] & (df["yoy3"] > YOY3_MIN) & (df["eps"] > 0) & (df["om"] >= OM_MIN)]
     return df, ok.sort_values("roe", ascending=False).head(TOP_N), last
 
 
@@ -390,14 +396,14 @@ def run(send_mail=True):
             c.execute("INSERT OR REPLACE INTO picks VALUES (?,?,?,?, 'hold')", (today, x.stock_id, x["name"], x.close))
     pct = lambda v: f"{v * 100:+.0f}%" if pd.notna(v) else "—"
     parts = [f"長線成長股｜{today}（月營收到 {last}）",
-             "選股：營收創 12 個月新高＋近 3 個月年增 > 20%＋月K站上 10 月線且往上＋EPS 近四季 > 0，挑 ROE 最高的 10 檔。",
+             "選股：營收創 12 個月新高＋近 3 個月年增 > 20%＋月K站上 10 月線且往上＋EPS 近四季 > 0＋營業利益率 ≥ 10%，挑 ROE 最高的 10 檔。",
              "賣出：營收連 2 個月年減。"]
     parts.append(f"\n【本週名單】{len(top)} 檔（🆕＝新進榜）")
     for _, x in top.iterrows():
         parts.append(f"\n{'🆕 ' if x.stock_id not in held_ids else ''}{x['name']}({x.stock_id})\n"
                      f"目前價格：{R.fmt_now(x.close)}\n"
                      f"營收：近 3 月年增 {pct(x.yoy3)}，{last} 年增 {pct(x.yoy_last)}（創 12 個月新高）\n"
-                     f"EPS 近四季：{x.eps:.2f} 元｜ROE：{pct(x.roe)}（{x.fin_q}）")
+                     f"EPS 近四季：{x.eps:.2f} 元｜ROE：{pct(x.roe)}｜營業利益率：{pct(x.om)}（{x.fin_q}）")
     if sells:
         parts.append(f"\n\n【🔴 賣出】{len(sells)} 檔")
         for h, x, ret, why in sells:
