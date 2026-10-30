@@ -11,12 +11,12 @@
 財報 2023Q2 sii：1047 家
 財報 2023Q2 otc：867 家
 財報 2023Q3 sii：1008 家
-財報 2023Q3 otc：810 家
+財報 2023Q3 otc 失敗：('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
 財報 2023Q4 sii：1083 家
 財報 2023Q4 otc：888 家
-財報 2024Q1 sii：1026 家
-財報 2024Q1 otc：832 家
-財報 2024Q2 sii：1075 家
+財報 2024Q1 sii 失敗：('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+財報 2024Q1 otc 失敗：('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+財報 2024Q2 sii 失敗：('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
 財報 2024Q2 otc：887 家
 財報 2024Q3 sii：1043 家
 財報 2024Q3 otc：846 家
