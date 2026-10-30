@@ -5,6 +5,7 @@
 用法：python 盤中.py            # 抓即時報價 → 寄信
       python 盤中.py --no-email # 只印出來
 """
+import os
 import argparse
 import importlib
 import time
@@ -154,6 +155,9 @@ def run(send_mail=True, now=None, quotes=None):
     now = now or R.now_tw()
     if R.is_market_holiday(now):
         print(f"今天 {now:%Y-%m-%d} 台股休市，不寄盤中信")
+        return
+    if not (9 * 60 <= now.hour * 60 + now.minute <= 13 * 60 + 30) and not os.environ.get("FORCE_RUN"):
+        print(f"現在 {now:%H:%M} 不在盤中（GitHub 排程延遲），不寄盤中信")
         return
     last, buys, waits, market, vol5, names, cost, ma = load_context()
     holdings = R.load_holdings()
