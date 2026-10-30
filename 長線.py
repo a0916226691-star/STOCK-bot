@@ -189,7 +189,7 @@ def backfill(years=3, budget_min=70, refresh_recent=False):
         have_r = {(a, b) for a, b in c.execute("SELECT month, market FROM revenue GROUP BY month, market HAVING COUNT(*) > 100")
                   if a not in recent}
         have_f = {(a, b) for a, b in c.execute("SELECT quarter, market FROM fin GROUP BY quarter, market "
-                                                 "HAVING COUNT(*) > 100 AND COUNT(op_income) > 100 AND COUNT(ppe) > 100")}
+                                                 "HAVING COUNT(*) > 100 AND COUNT(op_income) > 100")}
     start = (now - timedelta(days=int(365 * years) + 400)).replace(day=1)        # 多抓一年，才算得出年增率的歷史
     for m in pd.period_range(start.strftime("%Y-%m"), now.strftime("%Y-%m"), freq="M")[:-1]:
         for mk in ("sii", "otc"):
