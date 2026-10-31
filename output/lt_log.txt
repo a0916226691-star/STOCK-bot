@@ -1,38 +1,10 @@
-財報 2022Q1 sii：966 家
-財報 2022Q1 otc：780 家
-財報 2022Q2 sii：1025 家
-財報 2022Q2 otc：835 家
-財報 2022Q3 sii：978 家
-財報 2022Q3 otc：787 家
-財報 2022Q4 sii：1063 家
-財報 2022Q4 otc：875 家
-財報 2023Q1 sii：990 家
-財報 2023Q1 otc：800 家
-財報 2023Q2 sii：1047 家
-財報 2023Q2 otc：867 家
-財報 2023Q3 sii：1008 家
-財報 2023Q3 otc 失敗：('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
-財報 2023Q4 sii：1083 家
-財報 2023Q4 otc：888 家
-財報 2024Q1 sii 失敗：('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
-財報 2024Q1 otc 失敗：('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
-財報 2024Q2 sii 失敗：('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
-財報 2024Q2 otc：887 家
-財報 2024Q3 sii：1043 家
-財報 2024Q3 otc：846 家
-財報 2024Q4 sii：1088 家
-財報 2024Q4 otc：896 家
-財報 2025Q1 sii：1060 家
-財報 2025Q1 otc：870 家
-財報 2025Q2 sii：1086 家
-財報 2025Q2 otc：896 家
-財報 2025Q3 sii：1080 家
-財報 2025Q3 otc：887 家
-財報 2025Q4 sii：1088 家
-財報 2025Q4 otc：896 家
-財報 2026Q1 sii：1086 家
-財報 2026Q1 otc：896 家
-財報 2026Q2 sii：1088 家
-財報 2026Q2 otc：896 家
-月營收：[('TPEx', 49, '2022-09', '2026-09', 42804), ('TWSE', 49, '2022-09', '2026-09', 52113)]
+月營收 2026-08 sii：997 家
+月營收 2026-08 otc：867 家
+月營收 2026-09 sii：997 家
+月營收 2026-09 otc：867 家
+月營收（KY）2026-08 sii：93 家
+月營收（KY）2026-08 otc：30 家
+月營收（KY）2026-09 sii：93 家
+月營收（KY）2026-09 otc：30 家
+月營收：[('TPEx', 49, '2022-09', '2026-09', 42806), ('TWSE', 49, '2022-09', '2026-09', 52117)]
 財報：[('TPEx', 18, '2022Q1', '2026Q2', 15444), ('TWSE', 18, '2022Q1', '2026Q2', 18880)]
