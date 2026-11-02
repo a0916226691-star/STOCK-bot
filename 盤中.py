@@ -194,6 +194,11 @@ def run(send_mail=True, now=None, quotes=None):
         chg, st = buy_status(q, vol5.get(b["stock_id"]), frac)
         parts.append("\n" + block(b["stock_name"], b["stock_id"], q, chg, st))
 
+    try:
+        breadth = float(open(os.path.join(R.OUTPUT_DIR, "market_breadth.txt"), encoding="utf-8").read().strip().split(",")[1])
+    except Exception:
+        breadth = np.nan
+    hot = pd.notna(breadth) and breadth >= R.LT_BREADTH_MAX
     if not waits.empty:
         turned, broke = [], []
         for _, w in waits.iterrows():
@@ -209,6 +214,9 @@ def run(send_mail=True, now=None, quotes=None):
             chg = (p / q["prev"] - 1) * 100
             if p < bottom:
                 broke.append(block(w["stock_name"], w["stock_id"], q, chg, f"🔴 跌破低點 {R.fmt_now(bottom)}，止跌失敗"))
+            elif p > ma5 and p > ma10 and p < ma20 and hot:
+                turned.append(block(w["stock_name"], w["stock_id"], q, chg,
+                                    f"🟡 盤中站上 5 日、10 日線，但大盤太熱（{breadth:.0%} 股票在月線上），先不買"))
             elif p > ma5 and p > ma10 and p < ma20:
                 turned.append(block(w["stock_name"], w["stock_id"], q, chg,
                                     f"🟢 盤中站上 5 日線 {R.fmt_now(ma5)}、10 日線 {R.fmt_now(ma10)}（月線 {R.fmt_now(ma20)}），"

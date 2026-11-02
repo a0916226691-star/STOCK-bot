@@ -2236,6 +2236,8 @@ LT_TURN_MIN_GAP = 2.0      # 🟢 轉強：收盤離月線至少 2%（太近一�
 LT_INTRADAY_N = 40         # 盤中信最多盯幾檔 🟡
 LT_MIN_PRICE = 10.0        # 短線：股價 10 元以上（10/22 從 20 元放寬；回測 6/22～10/20 多 42 筆、勝率 62%、平均 +3.2%，整體差不多）
 LT_MIN_TURNOVER = 15_000_000   # 短線：成交金額 1,500 萬以上（10/22 從 3,000 萬放寬）
+LT_BREADTH_MAX = 0.60       # 大盤濾網：站上月線的股票超過 60% 就不給 🟢（11/2 回測：這種時候勝率 27%、平均 −4.0%，其他時候 62%、+3.4%）
+MARKET_BREADTH = None        # 今天站上月線的股票比例（build_longtrack 算）
 LT_MIN_DAYS = 80           # 至少要有幾天股價資料才判斷
 LT_MAX_N = 15              # 信裡最多列幾檔
 LT_ACCUM_DAYS = 7          # 🟢 佈局：法人近 10 天至少幾天買超（在底部一直買）
@@ -2273,6 +2275,17 @@ def _wave_days(cl, th=LT_CHOP_WAVE):
     return float(np.median(np.diff(piv))) if len(piv) >= 3 else np.inf
 
 
+def market_breadth(px):
+    """有成交量的股票（10 元以上、5 日均成交金額 1,500 萬以上）裡，收盤站上月線的比例。"""
+    p = px[px["stock_id"].str.len().eq(4) & ~px["stock_id"].str.startswith("00")]
+    C = p.pivot_table(index="date", columns="stock_id", values="close", aggfunc="last").sort_index().tail(25)
+    T = p.pivot_table(index="date", columns="stock_id", values="turnover", aggfunc="last").sort_index().reindex(C.index)
+    C, T = C.apply(pd.to_numeric, errors="coerce"), T.apply(pd.to_numeric, errors="coerce")
+    liq = (C.iloc[-1] >= LT_MIN_PRICE) & (T.tail(5).mean() >= LT_MIN_TURNOVER)
+    above = C.iloc[-1] > C.tail(20).mean()
+    return float((above & liq).sum() / liq.sum()) if liq.sum() else np.nan
+
+
 def build_longtrack(radar):
     """從高點下來的股票：🔴 正在下來 → 🟡 低點整理、法人有撐 → 🟢 起漲第一根（立即反彈或整理後噴出），上面要有空間。"""
     cols = ["stock_id", "stock_name", "close", "qfii_now", "qfii_peak", "lt_light", "lt_text", "lt_order", "drop_rel",
@@ -2293,6 +2306,19 @@ def build_longtrack(radar):
         mcl = {k: g["close"].astype(float).to_numpy() for k, g in mon.groupby("stock_id")}
     except Exception:
         mcl = {}
+    global MARKET_BREADTH
+    try:
+        MARKET_BREADTH = market_breadth(px)
+    except Exception as e:
+        print(f"大盤濾網計算失敗（當作沒有濾網）：{e}")
+        MARKET_BREADTH = None
+    if MARKET_BREADTH is not None:
+        try:
+            with open(os.path.join(OUTPUT_DIR, "market_breadth.txt"), "w", encoding="utf-8") as f:
+                f.write(f"{px['date'].max()},{MARKET_BREADTH:.4f}\n")
+        except OSError as e:
+            print(f"寫大盤濾網檔失敗：{e}")
+    hot = MARKET_BREADTH is not None and MARKET_BREADTH >= LT_BREADTH_MAX
     out = []
     for sid, p in px.groupby("stock_id"):
         if sid not in rows.index or sid in EXCLUDE_TOOL_STOCKS or sid.startswith("00") or len(p) < LT_MIN_DAYS:
@@ -2425,6 +2451,9 @@ def build_longtrack(radar):
             mc = mc.copy(); mc[-1] = c                                    # 這個月的 K 棒用今天收盤
             ma10m = pd.Series(mc).rolling(10).mean().to_numpy()
             mbull = bool(c > ma10m[-1] and ma10m[-1] > ma10m[-2])
+        if hot and light == "🟢":
+            light, order = "🟡", 1
+            text = f"大盤太熱（{MARKET_BREADTH:.0%} 股票站上月線），先不買｜原本：{text}"
         if mbull and light in ("🟢", "🟡"):
             text = "⭐ 月K多頭｜" + text
         q = fq.get(sid, np.array([]))
@@ -2662,9 +2691,12 @@ def build_simple_email(radar, data_date, holdings, track=None):
     buys = longtrack_buys(radar, track)
     parts = ["法人動態：🟢 買進　🟡 持有／等待　🔴 賣出／繼續等"]
 
+    if MARKET_BREADTH is not None:
+        parts.append(f"大盤：{MARKET_BREADTH:.0%} 的股票站上月線" + ("（超過 60%，大盤太熱，這套策略不給買點）" if MARKET_BREADTH >= LT_BREADTH_MAX else ""))
     parts.append(f"\n【可買】{len(buys)} 檔（從高點下來、低點盤整後轉強或噴出，上面有空間）")
     if buys.empty:
-        parts.append("今天沒有，耐心等")
+        parts.append("今天沒有，耐心等" if not (MARKET_BREADTH is not None and MARKET_BREADTH >= LT_BREADTH_MAX)
+                     else "今天沒有：大盤太熱（回測這種時候勝率只有 27%），等大盤回檔")
     for _, r in buys.iterrows():
         stop = r.get("lt_stop")
         blk = stock_block(r, target=True, kind=True)
