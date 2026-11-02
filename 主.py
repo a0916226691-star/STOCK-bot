@@ -2236,6 +2236,11 @@ LT_TURN_MIN_GAP = 2.0      # 🟢 轉強：收盤離月線至少 2%（太近一�
 LT_INTRADAY_N = 40         # 盤中信最多盯幾檔 🟡
 LT_MIN_PRICE = 10.0        # 短線：股價 10 元以上（10/22 從 20 元放寬；回測 6/22～10/20 多 42 筆、勝率 62%、平均 +3.2%，整體差不多）
 LT_MIN_TURNOVER = 15_000_000   # 短線：成交金額 1,500 萬以上（10/22 從 3,000 萬放寬）
+TRADE_COST = 0.00585       # 來回交易成本：證交稅 0.3%＋手續費 0.1425%×2（推薦成績扣掉這個）
+DECAY_N = 20               # 失效警報：看最近 20 筆已出場的推薦
+DECAY_MIN_WIN = 0.40       # 勝率低於 40%，或扣完成本平均是負的，就暫停給 🟢（推薦還是照樣記錄，成績恢復就自動解除）
+STRATEGY_PAUSED = None     # (是否暫停, 說明文字)
+LT_SHADOW = None           # 暫停期間原本會給 🟢 的股票（只記錄成績，不叫你買）
 LT_BREADTH_MAX = 0.60       # 大盤濾網：站上月線的股票超過 60% 就不給 🟢（11/2 回測：這種時候勝率 27%、平均 −4.0%，其他時候 62%、+3.4%）
 MARKET_BREADTH = None        # 今天站上月線的股票比例（build_longtrack 算）
 LT_MIN_DAYS = 80           # 至少要有幾天股價資料才判斷
@@ -2319,6 +2324,14 @@ def build_longtrack(radar):
         except OSError as e:
             print(f"寫大盤濾網檔失敗：{e}")
     hot = MARKET_BREADTH is not None and MARKET_BREADTH >= LT_BREADTH_MAX
+    global STRATEGY_PAUSED
+    STRATEGY_PAUSED = strategy_decay()
+    paused = STRATEGY_PAUSED[0]
+    try:
+        with open(os.path.join(OUTPUT_DIR, "strategy_paused.txt"), "w", encoding="utf-8") as f:
+            f.write(("1" if paused else "0") + "," + STRATEGY_PAUSED[1] + "\n")
+    except OSError:
+        pass
     out = []
     for sid, p in px.groupby("stock_id"):
         if sid not in rows.index or sid in EXCLUDE_TOOL_STOCKS or sid.startswith("00") or len(p) < LT_MIN_DAYS:
@@ -2451,6 +2464,9 @@ def build_longtrack(radar):
             mc = mc.copy(); mc[-1] = c                                    # 這個月的 K 棒用今天收盤
             ma10m = pd.Series(mc).rolling(10).mean().to_numpy()
             mbull = bool(c > ma10m[-1] and ma10m[-1] > ma10m[-2])
+        if paused and not hot and light == "🟢":
+            light, order = "🟡", 1
+            text = f"⏸ 策略暫停（{STRATEGY_PAUSED[1]}），先不買｜原本：{text}"
         if hot and light == "🟢":
             light, order = "🟡", 1
             text = f"大盤太熱（{MARKET_BREADTH:.0%} 股票站上月線），先不買｜原本：{text}"
@@ -2473,9 +2489,12 @@ def build_longtrack(radar):
 
 def longtrack_buys(radar, track):
     """長線追蹤裡亮🟢（法人回來了）、而且當天法人燈號也是🟢的 → 列可買，類型「回補」。"""
+    global LT_SHADOW
+    LT_SHADOW = None
     if track is None or track.empty:
         return radar.iloc[0:0]
-    ids = set(track.loc[track["lt_light"] == "🟢", "stock_id"])
+    shadow_ids = set(track.loc[track["lt_text"].astype(str).str.contains("策略暫停"), "stock_id"])
+    ids = set(track.loc[track["lt_light"] == "🟢", "stock_id"]) | shadow_ids
     b = radar[radar["stock_id"].isin(ids)].drop_duplicates("stock_id").copy()
     kind = track.set_index("stock_id")["lt_text"].to_dict()
     turn = {s for s, t in kind.items() if "站上 5 日" in t}
@@ -2485,6 +2504,8 @@ def longtrack_buys(radar, track):
     b["setup"] = b["stock_id"].map(lambda s: "LT_TURN" if s in turn else ("LT_ACCUM" if "先佈局" in kind.get(s, "") else "LT_BREAK"))
     b["lt_stop"] = b["stock_id"].map(track.set_index("stock_id")["bottom"].to_dict())
     b["mbull"] = b["stock_id"].map(track.set_index("stock_id")["mbull"].to_dict()).fillna(False)
+    LT_SHADOW = b[b["stock_id"].isin(shadow_ids)].copy()             # 暫停期間：只記錄成績，不列可買
+    b = b[~b["stock_id"].isin(shadow_ids)]
     b["_o"] = b["setup"].map({"LT_TURN": 0, "LT_BREAK": 1, "LT_ACCUM": 2})
     b = b.sort_values(["mbull", "_o"], ascending=[False, True]).drop(columns="_o")
     return b
@@ -2607,9 +2628,10 @@ def news_lines(sid):
     return out
 
 
-def paper_track(buys, data_date):
-    """推薦成績：每一檔 🟢 可買，都假設隔天開盤買進，追到出現賣出訊號（收盤跌破停損、法人 5 天賣超達成交量 10%、
-    爆量 2 倍收黑或長上影線）為止。回傳信裡的文字。"""
+def paper_records(buys=None, data_date=None):
+    """推薦成績的計算：每一檔 🟢（含策略暫停期間原本會給 🟢 的），都假設隔天開盤買進，追到出現賣出訊號
+    （收盤跌破停損、法人 5 天賣超達成交量 10%、爆量 2 倍收黑或長上影線）為止。報酬已扣交易成本。
+    回傳 (已出場, 持有中, 等開盤)。buys 有給就先把今天的推薦存起來。"""
     with db() as c:
         c.execute("CREATE TABLE IF NOT EXISTS paper (sig_date TEXT, stock_id TEXT, name TEXT, stop REAL, "
                   "PRIMARY KEY(sig_date, stock_id))")
@@ -2621,13 +2643,15 @@ def paper_track(buys, data_date):
                           sd[["sig_date", "stock_id", "name", "stop"]].itertuples(index=False, name=None))
             old = sd
         for _, r in (buys if buys is not None else pd.DataFrame()).iterrows():
+            if data_date is None:
+                break
             sid, stop = str(r["stock_id"]), r.get("lt_stop")
             if pd.isna(stop) or ((old["stock_id"] == sid) & (old["sig_date"] == data_date)).any():
                 continue
             c.execute("INSERT OR IGNORE INTO paper VALUES (?,?,?,?)", (data_date, sid, str(r["stock_name"]), float(stop)))
         sig = pd.read_sql("SELECT * FROM paper ORDER BY sig_date", c, dtype={"stock_id": str})
         if sig.empty:
-            return ""
+            return [], [], []
         ids = tuple(sig["stock_id"].unique())
         q = ",".join("?" * len(ids))
         px = pd.read_sql(f"SELECT stock_id, date, open, high, low, close, volume FROM prices WHERE stock_id IN ({q}) "
@@ -2667,11 +2691,36 @@ def paper_track(buys, data_date):
             if k > k0 and vr >= 2 and dump:
                 j, why = k, "爆量出貨"; break
         rec = dict(sid=sid, name=x["name"], sig=x["sig_date"], in_d=p["date"][k0], e=e, out_d=p["date"][j], x=cl[j],
-                   ret=cl[j] / e - 1, why=why)
+                   ret=cl[j] / e - 1 - TRADE_COST, why=why)
         (done if why else live).append(rec)
         until[sid] = p["date"][j] if why else "9999"
+    return done, live, wait
+
+
+def strategy_decay():
+    """因子失效監控：最近 DECAY_N 筆已出場的推薦，勝率太低或扣完成本平均是負的 → 暫停給 🟢。"""
+    try:
+        done, _, _ = paper_records()
+    except Exception as e:
+        print(f"失效監控計算失敗（當作正常）：{e}")
+        return False, ""
+    if len(done) < DECAY_N:
+        return False, f"最近已出場 {len(done)} 筆，還不到 {DECAY_N} 筆，先不判斷"
+    t = pd.DataFrame(done).sort_values("out_d").tail(DECAY_N)
+    win, avg = (t.ret > 0).mean(), t.ret.mean()
+    bad = win < DECAY_MIN_WIN or avg < 0
+    return bad, f"最近 {DECAY_N} 筆推薦：勝率 {win:.0%}、扣完成本平均 {avg:+.1%}"
+
+
+def paper_track(buys, data_date):
+    """信裡的「推薦成績」那一段。"""
+    extra = LT_SHADOW if LT_SHADOW is not None and not LT_SHADOW.empty else None
+    allb = pd.concat([b for b in (buys, extra) if b is not None and not b.empty]) if (extra is not None or (buys is not None and not buys.empty)) else None
+    done, live, wait = paper_records(allb, data_date)
+    if not (done or live or wait):
+        return ""
     md = lambda d: f"{int(d[5:7])}/{int(d[8:])}"
-    lines = [f"\n\n【推薦成績】（假設每檔 🟢 都在隔天開盤買進，出現賣出訊號才賣）"]
+    lines = [f"\n\n【推薦成績】（假設每檔 🟢 都在隔天開盤買進，出現賣出訊號才賣；已扣交易成本 {TRADE_COST:.2%}）"]
     if done:
         t = pd.DataFrame(done)
         w, l = t.loc[t.ret > 0, "ret"], t.loc[t.ret <= 0, "ret"]
@@ -2703,7 +2752,10 @@ def build_simple_email(radar, data_date, holdings, track=None):
 
     if MARKET_BREADTH is not None:
         parts.append(f"大盤：{MARKET_BREADTH:.0%} 的股票站上月線" + ("（超過 60%，大盤太熱，這套策略不給買點）" if MARKET_BREADTH >= LT_BREADTH_MAX else ""))
-    parts.append(f"\n【可買】{len(buys)} 檔（從高點下來、低點盤整後轉強或噴出，上面有空間）")
+    if STRATEGY_PAUSED and STRATEGY_PAUSED[0]:
+        parts.append(f"⚠️ 策略近期失效，暫停買進：{STRATEGY_PAUSED[1]}（推薦還是照樣記錄，成績恢復就自動解除）")
+    parts.append(f"\n【可買】{len(buys)} 檔（從高點下來、低點盤整後轉強或噴出，上面有空間）"
+                 + ("\n部位：每檔最多用短線資金的 10%（回測最多連續賠 16 筆，這樣最大回撤大約 2 成）" if not buys.empty else ""))
     if buys.empty:
         parts.append("今天沒有，耐心等" if not (MARKET_BREADTH is not None and MARKET_BREADTH >= LT_BREADTH_MAX)
                      else "今天沒有：大盤太熱（回測這種時候勝率只有 27%），等大盤回檔")
