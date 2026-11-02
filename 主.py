@@ -2523,6 +2523,16 @@ HOLD_DUMP_VOL = 2.0        # 🔴 爆量出貨：量是前 5 日均量 2 倍以�
 HOLD_STOP_DAYS = 15        # 沒填停損價：用最近幾天的最低點
 
 
+def paper_stop(sid):
+    """這檔如果是程式推薦過的，用推薦時的低點當停損（跟回測一樣）；不是推薦過的回傳 None。"""
+    try:
+        with db() as c:
+            r = c.execute("SELECT stop FROM paper WHERE stock_id=? ORDER BY sig_date DESC LIMIT 1", (sid,)).fetchone()
+        return float(r[0]) if r and r[0] else None
+    except Exception:
+        return None
+
+
 def hold_signals(sids):
     """持股燈號（雷達短線用）：🔴 跌破停損／法人大賣／爆量出貨；🟡 法人小賣；🟢 續抱。回傳 {代號: (燈號說明, 停損價)}。"""
     out = {}
@@ -2540,7 +2550,7 @@ def hold_signals(sids):
         hi = pd.to_numeric(p["high"], errors="coerce").fillna(pd.Series(cl, index=p.index)).to_numpy()
         lo = pd.to_numeric(p["low"], errors="coerce").fillna(pd.Series(cl, index=p.index)).to_numpy()
         vol = pd.to_numeric(p["volume"], errors="coerce").to_numpy()
-        stop = HOLDING_STOPS.get(sid, float(np.nanmin(lo[-HOLD_STOP_DAYS:])))
+        stop = HOLDING_STOPS.get(sid) or paper_stop(sid) or float(np.nanmin(lo[-HOLD_STOP_DAYS:]))   # 自己填的 > 推薦時的低點 > 近 15 天最低
         g = inst[inst["stock_id"] == sid]
         net = (pd.to_numeric(g["foreign_net"], errors="coerce").fillna(0) + pd.to_numeric(g["trust_net"], errors="coerce").fillna(0)).tail(5)
         n5, v5sum = float(net.sum()), float(np.nansum(vol[-5:]))
@@ -2743,7 +2753,7 @@ def build_simple_email(radar, data_date, holdings, track=None):
         blk = stock_block(r, sid, target=True)
         if hs:
             n_sell += hs[0].startswith("🔴")
-            blk = blk.replace(f"法人動態：{inst_light(r)}", f"持股燈號：{hs[0]}") + f"\n停損價格：{fmt_now(hs[1])}"
+            blk = blk.replace(f"法人動態：{inst_light(r)}", f"持股燈號：{hs[0]}")      # 只給燈號，停損在燈號裡判斷
         else:
             n_sell += inst_light(r).startswith("🔴")
         parts.append("\n" + blk + (f"\n{adds[sid]}" if sid in adds and not (hs and hs[0].startswith("🔴")) else "")

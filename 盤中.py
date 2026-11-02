@@ -237,7 +237,7 @@ def run(send_mail=True, now=None, quotes=None):
         if q is None:
             parts.append(f"\n股票代號：{nm}({sid})\n目前價格：抓不到報價")
             continue
-        stop = R.HOLDING_STOPS.get(sid, ma.get(sid, {}).get("low15", np.nan))
+        stop = R.HOLDING_STOPS.get(sid) or R.paper_stop(sid) or ma.get(sid, {}).get("low15", np.nan)
         chg, st = hold_status(q, vol5.get(sid), frac, stop)
         n_red += st.startswith("🔴")
         m = ma.get(sid)
