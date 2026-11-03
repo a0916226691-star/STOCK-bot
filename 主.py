@@ -1013,7 +1013,9 @@ def backfill_tpex(days):
 
 # ───────────────────────── 月 K（長期趨勢）─────────────────────────
 MONTHLY_COLS = ["month", "stock_id", "market", "open", "high", "low", "close", "volume"]
-KEEP_DAILY_DAYS = 380      # 每日股價只留這麼多天（資料庫不能超過 GitHub 100MB 上限）；更早的只留月 K
+SIGNAL_KEEP_DAYS = 7       # signals、signal_log（舊版選股的全市場紀錄，一個月就 13MB，信裡沒用到）只留 7 天
+KEEP_DAILY_DAYS = 300      # 每日股價、外資持股只留這麼多天（資料庫不能超過 GitHub 100MB 上限；選股最多用到 141 天）；更早的只留月 K
+INST_KEEP_DAYS = 200       # 法人買賣超只留 200 天（選股只用 45 天）；長期歷史另外存在 output/history/
 
 
 def _agg_month(df):
@@ -1077,10 +1079,24 @@ def update_monthly_and_prune():
             first_month = g["date"].min()[:7]
             g = g[g["date"].str[:7] > first_month]             # 第一個月可能不完整，留給回補的資料
             upsert("monthly", _agg_month(g), MONTHLY_COLS)
+    try:                                                   # 刪之前先把資料存進長期歷史檔（output/history/）
+        import importlib.util as _iu
+        _sp = _iu.spec_from_file_location("radar_hist", os.path.join(os.path.dirname(os.path.abspath(__file__)), "歷史.py"))
+        _h = _iu.module_from_spec(_sp)
+        _sp.loader.exec_module(_h)
+        _h.daily_export()
+    except Exception as e:
+        print(f"⚠ 歷史資料存檔失敗，這次先不刪舊資料：{e}")
+        return
     cutoff = (now_tw() - timedelta(days=KEEP_DAILY_DAYS)).strftime("%Y-%m-%d")
     with db() as conn:
         n1 = conn.execute("DELETE FROM prices WHERE date < ?", (cutoff,)).rowcount
         n2 = conn.execute("DELETE FROM foreign_hold WHERE date < ?", (cutoff,)).rowcount
+        n2 += conn.execute("DELETE FROM institutional WHERE date < ?",
+                           ((now_tw() - timedelta(days=INST_KEEP_DAYS)).strftime("%Y-%m-%d"),)).rowcount
+        cut2 = (now_tw() - timedelta(days=SIGNAL_KEEP_DAYS)).strftime("%Y-%m-%d")      # 舊版訊號紀錄：信裡沒用到，只留最近一個月
+        n2 += conn.execute("DELETE FROM signals WHERE signal_date < ?", (cut2,)).rowcount
+        n2 += conn.execute("DELETE FROM signal_log WHERE signal_date < ?", (cut2,)).rowcount
     if n1 or n2:
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("VACUUM")

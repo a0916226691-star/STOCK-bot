@@ -1,0 +1,54 @@
+name: History Backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      years:
+        description: "回補哪幾年的每日股價和法人（空白分隔，例：2021 2022 2023）"
+        required: true
+        default: "2021"
+
+permissions:
+  contents: write
+
+jobs:
+  history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests lxml html5lib
+
+      - name: Backfill
+        env:
+          YEARS: ${{ github.event.inputs.years }}
+        run: |
+          python 歷史.py --years $YEARS --budget 270
+
+      - name: Save data to GitHub
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "4189282+github-actions[bot]@users.noreply.github.com"
+          git add output/history/
+          if git diff --cached --quiet; then
+            echo "No changes."
+          else
+            git commit -m "Save history data"
+            for i in 1 2 3; do
+              git pull --rebase origin ${{ github.ref_name }} && git push origin HEAD:${{ github.ref_name }} && break
+              sleep 10
+            done
+          fi
