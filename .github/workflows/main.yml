@@ -2,7 +2,7 @@ name: Stock Trading Bot
 
 on:
   schedule:
-    - cron: "7 23 * * 0-4"  # 台灣時間每週一至週五早上 07:07 自動執行（資料最完整）
+    - cron: "7 23 * * 0-4"  # 台灣時間每週一至週五早上 07:07 收資料（不寄信）
   workflow_dispatch:        # 保留手動觸發按鈕
     inputs:
       backfill_days:
@@ -84,7 +84,8 @@ jobs:
           if [ -n "$BACKFILL_DAYS" ] && [ "$BACKFILL_DAYS" != "0" ]; then
             python 主.py --backfill "$BACKFILL_DAYS"
           else
-            python 主.py
+            # 11/3 起不寄短線信（5 年回測贏不了 0050），每天只收資料給長線用（股價、月 K、外資持股、歷史檔）
+            python 主.py --collect-only
           fi
 
       # 低檔止跌掃描（谷底型）暫停：跟「法人確定進場才買」的風格不同。低檔.py 保留，要恢復就把下面幾行的 # 拿掉

@@ -1,8 +1,9 @@
 name: Intraday 10am Check
 
 on:
-  schedule:
-    - cron: "27 3 * * 1-5"  # 台灣時間週一至週五 11:27 啟動（GitHub 常延遲幾分鐘，信大約 11:30～11:45 到）
+  # 11/3 起停用短線，盤中信不再自動寄（要恢復就把下面兩行的 # 拿掉）
+  # schedule:
+  #   - cron: "27 3 * * 1-5"  # 台灣時間週一至週五 11:27
   workflow_dispatch:        # 手動觸發按鈕（盤中才有報價）
 
 jobs:
