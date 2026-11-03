@@ -434,9 +434,10 @@ def main():
     ap = argparse.ArgumentParser(description="長線成長股雷達")
     ap.add_argument("--backfill", action="store_true")
     ap.add_argument("--no-email", action="store_true")
+    ap.add_argument("--years", type=int, default=3, help="回補幾年（研究用可以填 7）")
     a = ap.parse_args()
     if a.backfill:
-        backfill()
+        backfill(years=max(a.years, 3), budget_min=270 if a.years > 3 else 70)
         return
     run(send_mail=not a.no_email)
 

@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       backfill:
-        description: "回補月營收、財報（第一次填 1）；平常留空"
+        description: "回補月營收、財報：填年數（例：7 ＝ 補 7 年）；平常留空"
         required: false
         default: ""
 
@@ -44,7 +44,7 @@ jobs:
           if [ "$BACKFILL" = "probe" ]; then
             python 長線.py --probe
           elif [ -n "$BACKFILL" ]; then
-            python 長線.py --backfill
+            python 長線.py --backfill --years "$(echo "$BACKFILL" | tr -cd '0-9' | sed 's/^$/3/')"
           else
             python 長線.py
           fi
