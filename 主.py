@@ -2238,6 +2238,7 @@ LT_MIN_PRICE = 10.0        # 短線：股價 10 元以上（10/22 從 20 元放�
 LT_MIN_TURNOVER = 15_000_000   # 短線：成交金額 1,500 萬以上（10/22 從 3,000 萬放寬）
 TRADE_COST = 0.00585       # 來回交易成本：證交稅 0.3%＋手續費 0.1425%×2（推薦成績扣掉這個）
 DECAY_N = 20               # 失效警報：看最近 20 筆已出場的推薦
+DECAY_SINCE = "2026-11-02"  # 只算這天以後的推薦（之前是舊規則，沒有大盤濾網）
 DECAY_MIN_WIN = 0.40       # 勝率低於 40%，或扣完成本平均是負的，就暫停給 🟢（推薦還是照樣記錄，成績恢復就自動解除）
 STRATEGY_PAUSED = None     # (是否暫停, 說明文字)
 LT_SHADOW = None           # 暫停期間原本會給 🟢 的股票（只記錄成績，不叫你買）
@@ -2704,8 +2705,9 @@ def strategy_decay():
     except Exception as e:
         print(f"失效監控計算失敗（當作正常）：{e}")
         return False, ""
+    done = [r for r in done if r["sig"] >= DECAY_SINCE]
     if len(done) < DECAY_N:
-        return False, f"最近已出場 {len(done)} 筆，還不到 {DECAY_N} 筆，先不判斷"
+        return False, f"新規則（{int(DECAY_SINCE[5:7])}/{int(DECAY_SINCE[8:])} 以後）的推薦已出場 {len(done)} 筆，還不到 {DECAY_N} 筆，先不判斷"
     t = pd.DataFrame(done).sort_values("out_d").tail(DECAY_N)
     win, avg = (t.ret > 0).mean(), t.ret.mean()
     bad = win < DECAY_MIN_WIN or avg < 0
@@ -2727,6 +2729,10 @@ def paper_track(buys, data_date):
         pl = f"{w.mean() / abs(l.mean()):.2f}" if len(w) and len(l) else "—"
         lines.append(f"已出場 {len(t)} 筆：勝率 {(t.ret > 0).mean():.0%}，平均每筆 {t.ret.mean():+.1%}，"
                      f"賺的平均 {w.mean() if len(w) else 0:+.1%}、賠的平均 {l.mean() if len(l) else 0:+.1%}，盈虧比 {pl}")
+        n = t[t.sig >= DECAY_SINCE]
+        lines.append(f"其中新規則（{int(DECAY_SINCE[5:7])}/{int(DECAY_SINCE[8:])} 以後的推薦）：" +
+                     (f"{len(n)} 筆，勝率 {(n.ret > 0).mean():.0%}，平均每筆 {n.ret.mean():+.1%}" if len(n) else "還沒有出場的")
+                     + f"（滿 {DECAY_N} 筆開始判斷要不要暫停）")
     else:
         lines.append("已出場：還沒有")
     if live:
