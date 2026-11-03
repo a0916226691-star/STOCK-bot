@@ -1,6 +1,6 @@
 import requests, json, time
 UA={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0"}
-T=["0050.TW","0056.TW","00878.TW","00919.TW","2383.TW","2368.TW","6197.TW","3293.TWO","4763.TW","1808.TW","1503.TW","6919.TW","^TWII"]
+T=["0050.TW","00631L.TW","2330.TW","006208.TW","0056.TW","00878.TW","^TWII"]
 out={}
 for t in T:
     for host in ("query1","query2"):
@@ -12,4 +12,4 @@ for t in T:
         except Exception as e:
             print(t,host,"失敗",e)
     time.sleep(1)
-json.dump(out,open("output/compare.json","w"))
+json.dump(out,open("output/compare2.json","w"))
