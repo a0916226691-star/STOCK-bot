@@ -286,8 +286,16 @@ def ttm_fin(fin):
     return out
 
 
+def complete_months(rev):
+    """只用「大部分公司都公布了」的月份：每月 10 號前陸續公布，月初那個月只有幾十家，不能當成最新月份。"""
+    n = rev.groupby("month")["stock_id"].nunique()
+    ok = n[n >= 0.8 * n.max()].index
+    return rev[rev["month"] <= max(ok)] if len(ok) else rev
+
+
 def screen():
     rev, fin, mon, px = load_all()
+    rev = complete_months(rev)
     rev["yoy"] = np.where(rev["rev_ly"] > 0, rev["revenue"] / rev["rev_ly"] - 1, np.nan)
     RV = rev.pivot(index="month", columns="stock_id", values="revenue").sort_index()
     YY = rev.pivot(index="month", columns="stock_id", values="yoy").sort_index()
@@ -332,6 +340,7 @@ def long_hold_alerts(rev, today):
     ids = list(R.LONG_HOLDINGS)
     if not ids:
         return []
+    rev = complete_months(rev)
     r = rev[rev["stock_id"].isin(ids)].copy()
     r["yoy"] = np.where(r["rev_ly"] > 0, r["revenue"] / r["rev_ly"] - 1, np.nan)
     with ldb() as c:
