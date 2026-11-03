@@ -365,6 +365,46 @@ def long_hold_alerts(rev, today):
     return out
 
 
+def holdings_section(df, last, pct):
+    """我的長期持股（股票追蹤〔長期持股〕區）：每週都列，燈號看公司生意，不看短期股價。
+    🔴 營收連 2 個月年減（生意在變差）；🟡 最新一個月營收年減（留意）；🟢 營收還在成長。
+    燈號只看營收：回測「跌破 10 月線就賣」反而比較差，股價趨勢只列出來參考。"""
+    R.LONG_HOLDINGS.clear()
+    R.load_holdings()
+    ids = list(R.LONG_HOLDINGS)
+    if not ids:
+        return []
+    allx = df.set_index("stock_id")
+    p2 = lambda v: (">+999%（建案認列這種一次入帳的）" if pd.notna(v) and v > 9.99 else pct(v))
+    try:
+        px = R.load_table("prices", 400)
+        hi = px.groupby("stock_id")["close"].max()
+    except Exception:
+        hi = pd.Series(dtype=float)
+    rows = []
+    for sid in ids:
+        if sid not in allx.index:
+            rows.append((3, f"\n{sid}：這週沒有資料（可能成交量太小或營收還沒公布）"))
+            continue
+        x = allx.loc[sid]
+        ok = int(bool(x.revhi)) + int(x.yoy3 > YOY3_MIN) + int(bool(x.trend)) + int(x.eps > 0) + int(pd.notna(x.om) and x.om >= OM_MIN)
+        if x.neg2:
+            light, why, o = "🔴", "營收連 2 個月年減，生意在變差，要不要減碼你自己判斷", 0
+        elif pd.notna(x.yoy_last) and x.yoy_last < 0:
+            light, why, o = "🟡", f"{last} 營收年減，再一個月也年減就會變 🔴，留意", 1
+        else:
+            light, why, o = "🟢", "營收還在成長，續抱", 2
+        h = hi.get(sid, np.nan)
+        rows.append((o, f"\n{light} {x['name']}({sid})：{why}\n"
+                        f"價格：{R.fmt_now(x.close)}（離一年高點 {pct(x.close / h - 1) if pd.notna(h) and h > 0 else '—'}；"
+                        f"月 K {'在 10 月線上' if x.trend else '跌破 10 月線'}）\n"
+                        f"營收：近 3 月年增 {p2(x.yoy3)}，{last} 年增 {p2(x.yoy_last)}\n"
+                        f"EPS 近四季：{x.eps:.2f} 元｜ROE：{pct(x.roe)}｜營業利益率：{pct(x.om)}｜長線條件符合 {ok}/5"))
+    rows.sort(key=lambda r: r[0])
+    n = {k: sum(1 for o, _ in rows if o == k) for k in (0, 1, 2)}
+    return [f"\n【我的長期持股】{len(ids)} 檔（🟢{n[2]} 🟡{n[1]} 🔴{n[0]}；看公司生意，不看短期股價）"] + [r for _, r in rows]
+
+
 def run(send_mail=True):
     init_ldb()
     with ldb() as c:
@@ -407,7 +447,11 @@ def run(send_mail=True):
     parts = [f"長線成長股｜{today}（月營收到 {last}）",
              "選股：營收創 12 個月新高＋近 3 個月年增 > 20%＋月K站上 10 月線且往上＋EPS 近四季 > 0＋營業利益率 ≥ 10%，挑 ROE 最高的 10 檔。",
              "賣出：營收連 2 個月年減。"]
-    parts.append(f"\n【本週名單】{len(top)} 檔（🆕＝新進榜）")
+    try:
+        parts += holdings_section(df, last, pct)
+    except Exception as e:
+        print(f"長期持股區塊失敗：{e}")
+    parts.append(f"\n\n【本週名單】{len(top)} 檔（🆕＝新進榜；只當參考名單，不建議照著買）")
     for _, x in top.iterrows():
         parts.append(f"\n{'🆕 ' if x.stock_id not in held_ids else ''}{x['name']}({x.stock_id})\n"
                      f"目前價格：{R.fmt_now(x.close)}\n"
@@ -430,8 +474,8 @@ def run(send_mail=True):
         parts.append(f"\n\n【🟢 續抱】{len(keeps)} 檔（之前進榜、營收還沒轉弱）")
         for h, x, ret in keeps:
             parts.append(f"{h['name']}({h.stock_id})：進榜 {h.since} {R.fmt_now(h.close)} → {R.fmt_now(x.close)}（{pct(ret)}）")
-    parts.append("\n回測（2024/8～2026/3 每月選一次）：平均 6 個月 +31%、中位數 +15%、61% 賺錢；"
-                 "抱到營收連 2 月年減才賣，中位數 +25%。只有約 1 年半的資料，僅供參考，不是投資建議。")
+    parts.append("\n回測（2019/12～2026/10，扣成本）：名單整體年化 +24.7%、最大回撤 −49%；同期 0050 含息年化 +29.1%、最大回撤 −34%。"
+                 "名單沒有贏過 0050，只當作「最近哪些公司營收很強」的參考，不是投資建議。")
     body = "\n".join(parts) + "\n"
     print(body)
     if send_mail:
