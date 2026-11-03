@@ -2882,6 +2882,14 @@ def run(send_mail=True, collect_only=False):
     except Exception as e:
         print(f"月 K 更新／清理失敗（不影響寄信）：{e}")
     if collect_only:
+        try:                                               # 大跌加碼器：有觸發才寄信
+            import importlib.util as _iu
+            _sp = _iu.spec_from_file_location("radar_dip", os.path.join(os.path.dirname(os.path.abspath(__file__)), "加碼.py"))
+            _d = _iu.module_from_spec(_sp)
+            _sp.loader.exec_module(_d)
+            _d.check(send_mail=send_mail)
+        except Exception as e:
+            print(f"大跌加碼器失敗（不影響收資料）：{e}")
         print("=== 只收資料完成（舊版訊號與信件已略過）===")
         return
 
