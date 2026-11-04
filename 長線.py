@@ -510,6 +510,30 @@ def run(send_mail=True):
                      + (f" 賣出{len(sells)}" if sells else "") + (f" 長期持股轉弱{len(lh)}" if lh else ""), body)
 
 
+def company_refs(sid, name):
+    """通知信附上的參考：公開資訊觀測站法說會連結＋鉅亨網最近和營收、法說有關的新聞標題。"""
+    out = [f"   法說會資料：https://mopsov.twse.com.tw/mops/web/t100sb02_1（輸入代號 {sid} 查詢）",
+           f"   公司重大訊息：https://mopsov.twse.com.tw/mops/web/t05st01（輸入代號 {sid} 查詢）"]
+    try:
+        r = R.requests.get("https://ess.api.cnyes.com/ess/api/v1/news/keyword", params={"q": sid, "limit": 30, "page": 1},
+                           headers=UA, timeout=15)
+        items = r.json().get("data", {}).get("items", [])
+        keys = ("法說", "營收", "展望", "訂單", "新產品", "缺貨", "產能", "毛利", "庫存", "出貨", "客戶")
+        n = 0
+        for it in items:
+            t = str(it.get("title", "")).replace("<mark>", "").replace("</mark>", "")
+            if not any(k in t for k in keys):
+                continue
+            ts = datetime.fromtimestamp(int(it.get("publishAt", 0)), R.TZ)
+            out.append(f"   ・{ts.month}/{ts.day} {t[:60]}")
+            n += 1
+            if n >= 5:
+                break
+    except Exception as e:
+        print(f"{sid} 新聞抓不到：{e}")
+    return out
+
+
 def hold_watch(send_mail=True):
     """每天晚上：抓最新一個月的營收（每家公司 1～10 號陸續公布），我的長期持股一公布就判斷，有問題馬上寄信。
     🟡 最新一個月營收年減（提醒留意）；🔴 連 2 個月年減（生意在變差）。同一檔同一個月同一個燈號只寄一次。"""
@@ -562,7 +586,10 @@ def hold_watch(send_mail=True):
         else:
             lines.append(f"🟡 {nm}({sid})：{y1['month']} 營收年減 {pct(y1.yoy)}"
                          + (f"（上個月還是 {pct(y2.yoy)}）" if y2 is not None else "") + "，先留意，下個月也年減就會變 🔴")
-    lines += ["", "（營收是一個月公布一次的，股價短期漲跌不會觸發這個通知。只是提醒，不是投資建議。）"]
+        lines += company_refs(sid, nm) + [""]
+    lines += ["2019～2026 年，成長股第一次連 2 月年減，56% 在 3 個月內轉回成長（換產品、客戶調庫存、基期高）；",
+              "44% 沒轉回，之後 6 個月平均輸大盤 7%。所以先看法說會和新聞怎麼解釋，再決定。",
+              "（營收是一個月公布一次的，股價短期漲跌不會觸發這個通知。只是提醒，不是投資建議。）"]
     body = "\n".join(lines)
     print(body)
     if send_mail and R.send_email(f"{'🔴' if any(a[2] == '🔴' for a in alerts) else '🟡'} 持股營收提醒：{'、'.join(a[1] for a in alerts)}", body):
