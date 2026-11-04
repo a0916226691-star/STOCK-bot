@@ -29,6 +29,7 @@ LEVELS = [0.10, 0.15, 0.20, 0.25, 0.30]
 RISK_GAP = 0.08            # 指數比季線（60 日）高 8% 以上
 RISK_FOREIGN = -811.5      # 外資（上市＋上櫃）近 10 天賣超金額（億）低於這個＝歷史上賣最多的兩成
 RISK_COOLDOWN = 20         # 風險提醒至少隔 20 個交易日才再寄一次
+DEPLOY_DAYS = 125          # 第一次加碼通知後 6 個月（約 125 個交易日），剩下的子彈全部投入
 PORTION = {0.10: 1, 0.15: 1.5, 0.20: 2, 0.25: 2.5, 0.30: 3}   # 加碼預備金分成 10 份，越跌買越多（剩下的留著）
 STATE = os.path.join(R.OUTPUT_DIR, "dip_state.json")
 
@@ -95,6 +96,8 @@ def check(send_mail=True):
         st = {}
     if st.get("peak_date") != peak_d:                       # 創新高（或第一次跑）：重新開始這一波
         st = {"peak_date": peak_d, "alerted": [], "risk_date": st.get("risk_date", "")}
+    if st["alerted"] and not st.get("start"):
+        st["start"] = last_d                                # 這一波第一次通知的日子（6 個月期限從這天算）
     print(f"加權指數 {last_d} {last:,.0f}，高點 {peak_d} {peak:,.0f}（{dd:+.1%}）｜季線乖離 {gap:+.1%}｜外資近 10 天 {f10:,.0f} 億")
     mails = []
     hit = [lv for lv in LEVELS if dd <= -lv and lv not in st["alerted"]]
@@ -113,7 +116,8 @@ def check(send_mail=True):
                  f"【這一檔的參考做法】把你的「加碼預備金」分成 10 份，這一檔買 {sum(PORTION[x] for x in hit):g} 份"
                  f"（這一波到目前累計 {done:g} 份，還留 {10 - done:g} 份）。",
                  "  跌 10% 買 1 份、15% 買 1.5 份、20% 買 2 份、25% 買 2.5 份、30% 買 3 份：越跌買越多。",
-                 "  加碼預備金要另外準備，不要動到生活費和緊急預備金。很多波只跌 10～15% 就回升，用不完是正常的。",
+                 "  加碼預備金要另外準備，不要動到生活費和緊急預備金。",
+                 "  6 個月期限：從第一次通知算起 6 個月，還沒用完的會再寄信提醒你全部投入（30 年回測這樣最好：2 年後平均 +20%）。",
                  "",
                  "【1997～2026 年、30 年的統計】（加權指數，不含每年約 3～4% 的配息）",
                  "  跌 10%：1 年後平均 −2%，50% 賺錢｜2 年後平均 +15%，71% 賺錢｜之後平均還會再跌 18%，最多 62%",
@@ -130,6 +134,21 @@ def check(send_mail=True):
                  "",
                  f"這一波還沒通知的跌幅：{'、'.join(f'{int(x * 100)}%' for x in LEVELS if x not in st['alerted']) or '已經全部通知過'}。大盤創新高之後會重新開始計算。"]
         mails.append((f"📉 大跌加碼參考：大盤從高點跌 {int(lv * 100)}%（{last_d[5:7]}/{last_d[8:]}）", "\n".join(lines)))
+    if hit and not st.get("start"):
+        st["start"] = last_d
+    # 6 個月期限：第一次通知後約 125 個交易日，子彈還沒用完就提醒全部投入（30 年回測：2 年後平均 +17% → +20%，最差一樣 −19%）
+    if st.get("start") and not st.get("deploy_sent") and (t.index > st["start"]).sum() >= DEPLOY_DAYS:
+        used = sum(PORTION[x] for x in st["alerted"])
+        if used < 10:
+            st["deploy_sent"] = last_d
+            lines = [f"從 {st['start']} 第一次通知到現在已經滿 6 個月，這一波的加碼預備金還剩 {10 - used:g} 份沒用。",
+                     f"加權指數：{last_d} 收 {last:,.0f} 點（離高點 {dd:+.1%}）",
+                     "",
+                     "參考做法：剩下的這幾份，現在全部投入 0050，不要再等更低的點。",
+                     "1997～2026 年 30 年回測：分批加碼、6 個月後把剩下的全買，2 年後平均 +20%；",
+                     "一直留著當現金等大跌，平均只有 +17%（最差的情況兩種一樣是 −19%）。錢放著等，通常會錯過更多。",
+                     "（只是歷史統計，不是投資建議。）"]
+            mails.append((f"💰 加碼預備金：6 個月到了，剩下 {10 - used:g} 份可以投入（{last_d[5:7]}/{last_d[8:]}）", "\n".join(lines)))
     risk = pd.notna(f10) and gap >= RISK_GAP and f10 <= RISK_FOREIGN
     if risk:
         days_since = (t.index > st.get("risk_date", "")).sum() if st.get("risk_date") else 999
