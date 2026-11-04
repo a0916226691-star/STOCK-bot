@@ -413,7 +413,8 @@ def om_change(fin):
 
 def holdings_section(df, last, pct):
     """我的長期持股（股票追蹤〔長期持股〕區）：每週都列，燈號看公司生意，不看短期股價。
-    🔴 營收連 2 個月年減（生意在變差）；🟡 最新一個月營收年減，或單季營業利益率比去年同季掉 ≥ 8 個百分點（留意）；🟢 營收還在成長。
+    🔴 營收連 2 個月年減（生意在變差）；🟡 最新一個月營收年減，或單季營業利益率比去年同季掉 ≥ 8 個百分點，
+    或股價離高點跌 ≥ 20% 又比大盤多跌 ≥ 25%（留意、去查原因）；🟢 營收還在成長。
     燈號只看營收：回測「跌破 10 月線就賣」反而比較差，股價趨勢只列出來參考。"""
     R.LONG_HOLDINGS.clear()
     R.load_holdings()
@@ -434,6 +435,11 @@ def holdings_section(df, last, pct):
     except Exception as e:
         print(f"營業利益率變化失敗：{e}")
         omc = {}
+    try:
+        rel = rel_strength([s for s in ids if not s.startswith("00")])
+    except Exception as e:
+        print(f"相對大盤失敗：{e}")
+        rel = {}
     rows = []
     for sid in ids:
         if sid.startswith("00"):                             # ETF：沒有營收，只列價格；照加碼計畫抱著
@@ -459,6 +465,13 @@ def holdings_section(df, last, pct):
                 om_txt += "\n⚠️ 利潤率大掉：獲利可能被成本、降價或擴廠折舊吃掉，去看財報或法說會找原因（一次性的就沒事）"
                 if o == 2:
                     light, why, o = "🟡", "營收還在成長，但利潤率比去年同季大掉，留意", 1
+        rv = rel.get(sid)
+        if rv:
+            om_txt += f"\n近 3 個月：{rv[1] * 100:+.0f}%，同期大盤 {rv[2] * 100:+.0f}%（{'落後大盤 ' + format(-(rv[1] - rv[2]) * 100, '.0f') + ' 個百分點' if rv[1] < rv[2] else '贏大盤'}）"
+            if rv[3] <= REL_DD and rv[1] - rv[2] <= REL_GAP:
+                om_txt += "\n📉 跌深而且比大盤多跌很多：可能是公司自己出事，去查法說會、重大訊息、同業營收"
+                if o == 2:
+                    light, why, o = "🟡", "營收還在成長，但股價自己跌特別多，去查原因", 1
         h = hi.get(sid, np.nan)
         rows.append((o, f"\n{light} {x['name']}({sid})：{why}\n"
                         f"價格：{R.fmt_now(x.close)}（離一年高點 {pct(x.close / h - 1) if pd.notna(h) and h > 0 else '—'}；"
@@ -636,6 +649,71 @@ def hold_watch(send_mail=True):
                           [(a[0], str(m), a[2], now.strftime("%Y-%m-%d")) for a in alerts])
 
 
+REL_DD = -0.20             # 離一年高點跌 ≥ 20%
+REL_GAP = -0.25            # 而且近 3 個月比大盤多跌 ≥ 25 個百分點 → 可能是公司自己出事（11/4 回測：之後 6 個月中位數輸大盤 16%，
+                           # 跟大盤一起跌的只輸 8%；前後兩段都成立。但 28% 照樣贏大盤，只提醒去查原因，不當賣訊）
+
+
+def rel_strength(ids):
+    """每檔：近 3 個月（約 63 個交易日）漲跌、同期大盤、離一年高點。拆股、減資造成的跳動就不算。"""
+    with sqlite3.connect(R.DB_PATH) as c:
+        px = pd.read_sql(f"SELECT date, stock_id, stock_name, close FROM prices WHERE date >= ? AND stock_id IN ({','.join('?' * len(ids))})",
+                         c, params=[(R.now_tw() - timedelta(days=400)).strftime("%Y-%m-%d")] + list(ids), dtype={"stock_id": str})
+        tx = pd.read_sql("SELECT date, close FROM taiex ORDER BY date", c).set_index("date")["close"]
+    out = {}
+    for sid, g in px.sort_values("date").groupby("stock_id"):
+        x = g.set_index("date")["close"].astype(float).dropna()
+        if len(x) < 70 or ((x / x.shift(1)) < 0.5).any() or ((x / x.shift(1)) > 1.6).any():
+            continue
+        d0 = x.index[-64]
+        t = tx[tx.index <= x.index[-1]]
+        t0 = tx[tx.index <= d0]
+        if t.empty or t0.empty:
+            continue
+        r3, m3 = x.iloc[-1] / x.loc[d0] - 1, t.iloc[-1] / t0.iloc[-1] - 1
+        out[sid] = (g["stock_name"].iloc[-1], r3, m3, x.iloc[-1] / x.tail(250).max() - 1, x.index[-1])
+    return out
+
+
+def price_watch(send_mail=True):
+    """每天晚上：持股股價跌深，而且跌得比大盤多很多 → 可能是公司自己出事，馬上提醒去查原因（同一檔一個月只寄一次）。"""
+    R.LONG_HOLDINGS.clear()
+    R.load_holdings()
+    ids = [s for s in R.LONG_HOLDINGS if not s.startswith("00")]
+    if not ids:
+        return
+    try:
+        rs = rel_strength(ids)
+    except Exception as e:
+        print(f"相對大盤檢查失敗：{e}")
+        return
+    month = R.now_tw().strftime("%Y-%m")
+    with ldb() as c:
+        c.execute("CREATE TABLE IF NOT EXISTS hold_watch (stock_id TEXT, month TEXT, level TEXT, date TEXT, "
+                  "PRIMARY KEY(stock_id, month, level))")
+        done = set(map(tuple, c.execute("SELECT stock_id, month, level FROM hold_watch").fetchall()))
+    pct = lambda v: f"{v * 100:+.0f}%"
+    hits = [(s, v) for s, v in rs.items() if v[3] <= REL_DD and v[1] - v[2] <= REL_GAP and (s, month, "📉") not in done]
+    for s, v in rs.items():
+        print(f"{v[0]}({s})：近 3 月 {pct(v[1])}，大盤 {pct(v[2])}，差 {pct(v[1] - v[2])}，離一年高點 {pct(v[3])}")
+    if not hits:
+        print("相對大盤：沒有持股自己跌特別多")
+        return
+    lines = ["你的長期持股有股價「自己跌特別多」的情況（不是大盤一起跌）：", ""]
+    for s, (nm, r3, m3, dd, d) in hits:
+        lines.append(f"📉 {nm}({s})：近 3 個月 {pct(r3)}，同期大盤 {pct(m3)}，多跌 {pct(r3 - m3)}；離一年高點 {pct(dd)}（到 {d}）")
+        lines.append("股價常比營收早幾個月反映壞消息。先查：法說會、重大訊息、同業和客戶的營收、新聞，看是一次性還是生意在變差。")
+        lines += company_refs(s, nm) + [""]
+    lines += ["回測（2019～2026，營收還在成長的股票）：從高點跌 20% 以上、又比大盤多跌 25% 以上的，之後 6 個月中位數輸大盤 16%，",
+              "72% 跑輸；跟大盤一起跌的只輸 8%。但還是有 28% 之後贏大盤，所以這是「去查原因」的提醒，不是賣出訊號。"]
+    body = "\n".join(lines)
+    print(body)
+    if send_mail and R.send_email(f"📉 持股相對大盤提醒：{'、'.join(v[0] for _, v in hits)}", body):
+        with ldb() as c:
+            c.executemany("INSERT OR IGNORE INTO hold_watch VALUES (?,?,?,?)",
+                          [(s, month, "📉", R.now_tw().strftime("%Y-%m-%d")) for s, _ in hits])
+
+
 def main():
     ap = argparse.ArgumentParser(description="長線成長股雷達")
     ap.add_argument("--backfill", action="store_true")
@@ -645,6 +723,7 @@ def main():
     a = ap.parse_args()
     if a.hold_watch:
         hold_watch(send_mail=not a.no_email)
+        price_watch(send_mail=not a.no_email)
         return
     if a.backfill:
         backfill(years=max(a.years, 3), budget_min=270 if a.years > 3 else 70)
