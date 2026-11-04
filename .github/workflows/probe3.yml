@@ -1,0 +1,18 @@
+name: Probe3
+on:
+  push:
+    branches: [probe3]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  p:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install requests && python tools/cl_fetch.py
+      - if: always()
+        run: |
+          git config user.name bot && git config user.email bot@x
+          git add -f output/cl.csv && git commit -m "cl data" && for i in 1 2 3; do git pull --rebase && git push && break; sleep 5; done
