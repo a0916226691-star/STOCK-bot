@@ -24,6 +24,7 @@ v9 修正重點
 import argparse
 import io
 import os
+import re
 import smtplib
 import sqlite3
 import time
@@ -1765,6 +1766,9 @@ def load_holdings():
                     continue
                 parts = [p.strip() for p in line.replace("\t", ",").replace(" ", ",").split(",") if p.strip()]
                 sid = normalize_stock_id(parts[0])
+                if group == LONG_HOLD_GROUP and re.fullmatch(r"00\d{2,4}[A-Z]?", sid):
+                    LONG_HOLDINGS[sid] = group             # ETF（例：006208、00878）：長線週報只列價格，不看營收
+                    continue
                 if not is_stock_id(sid):
                     continue                           # 標題列或亂打的字
                 if group == LONG_HOLD_GROUP:

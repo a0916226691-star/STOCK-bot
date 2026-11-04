@@ -365,6 +365,30 @@ def long_hold_alerts(rev, today):
     return out
 
 
+def etf_line(sid):
+    """ETF 的價格：用證交所 STOCK_DAY（個股日成交資訊）抓這個月和上個月，取最新收盤。"""
+    rows = []
+    now = R.now_tw()
+    for k in (1, 0):
+        d = (now.replace(day=1) - pd.DateOffset(months=k)).strftime("%Y%m01")
+        try:
+            j = R.get_json("https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY", {"stockNo": sid, "date": d, "response": "json"})
+            f = j.get("fields") or []
+            i_c = next(i for i, x in enumerate(f) if "收盤" in x)
+            for r in j.get("data") or []:
+                v = R.safe_float(r[i_c])
+                if pd.notna(v):
+                    rows.append((r[0], v))
+        except Exception as e:
+            print(f"{sid} 價格抓不到：{e}")
+        R.time.sleep(1)
+    name = {"006208": "富邦台50", "0050": "元大台灣50"}.get(sid, sid)
+    if not rows:
+        return f"\n⚪ {name}({sid})：ETF，這週抓不到價格"
+    dt, px = rows[-1]
+    return f"\n⚪ {name}({sid})：ETF，不看營收，照加碼計畫長期抱著\n價格：{R.fmt_now(px)}（{dt}）"
+
+
 def holdings_section(df, last, pct):
     """我的長期持股（股票追蹤〔長期持股〕區）：每週都列，燈號看公司生意，不看短期股價。
     🔴 營收連 2 個月年減（生意在變差）；🟡 最新一個月營收年減（留意）；🟢 營收還在成長。
@@ -383,6 +407,9 @@ def holdings_section(df, last, pct):
         hi = pd.Series(dtype=float)
     rows = []
     for sid in ids:
+        if sid.startswith("00"):                             # ETF：沒有營收，只列價格；照加碼計畫抱著
+            rows.append((3, etf_line(sid)))
+            continue
         if sid not in allx.index:
             rows.append((3, f"\n{sid}：這週沒有資料（可能成交量太小或營收還沒公布）"))
             continue
