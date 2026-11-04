@@ -9,10 +9,16 @@ jobs:
   p:
     runs-on: ubuntu-latest
     timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [fund, margin]
     steps:
       - uses: actions/checkout@v4
-      - run: pip install requests && python tools/cl_fetch.py
+      - run: pip install requests && python tools/f_fetch.py
+        env:
+          MODE: ${{ matrix.mode }}
       - if: always()
         run: |
           git config user.name bot && git config user.email bot@x
-          git add -f output/cl.csv && git commit -m "cl data" && for i in 1 2 3; do git pull --rebase && git push && break; sleep 5; done
+          git add -f output/${{ matrix.mode }}.csv && git commit -m "${{ matrix.mode }} data" && for i in 1 2 3 4 5; do git pull --rebase && git push && break; sleep 15; done
