@@ -11,7 +11,6 @@ jobs:
       matrix:
         include:
           - {sid: "6197", url: "http://irconference.twse.com.tw/6197_21_20260901_ch.mp4"}
-          - {sid: "4763", url: "http://irconference.twse.com.tw/4763_47_20260930_ch.mp4"}
           - {sid: "1503", url: "http://irconference.twse.com.tw/1503_15_20260910_ch.mp4"}
     steps:
       - uses: actions/checkout@v4

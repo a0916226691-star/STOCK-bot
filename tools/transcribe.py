@@ -5,7 +5,11 @@ os.makedirs("out", exist_ok=True)
 if "youtu" in url:
     subprocess.run(["yt-dlp","-f","bestaudio","-x","--audio-format","mp3","-o","a.%(ext)s",url],check=True); src="a.mp3"
 else:
-    subprocess.run(["curl","-sSL","-o","a.mp4",url],check=True); src="a.mp4"
+    import time
+    for k in range(15):
+        if subprocess.run(["curl","-sSL","--retry","5","-C","-","-o","a.mp4",url]).returncode==0: break
+        time.sleep(5)
+    src="a.mp4"
 import numpy as np
 raw=subprocess.run(["ffmpeg","-loglevel","error","-i",src,"-ac","1","-ar","16000","-f","s16le","-"],check=True,capture_output=True).stdout
 audio=np.frombuffer(raw,np.int16).astype(np.float32)/32768
