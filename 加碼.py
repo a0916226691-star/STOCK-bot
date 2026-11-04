@@ -98,6 +98,11 @@ def check(send_mail=True):
     print(f"加權指數 {last_d} {last:,.0f}，高點 {peak_d} {peak:,.0f}（{dd:+.1%}）｜季線乖離 {gap:+.1%}｜外資近 10 天 {f10:,.0f} 億")
     mails = []
     hit = [lv for lv in LEVELS if dd <= -lv and lv not in st["alerted"]]
+    if os.environ.get("DIP_RESEND") and not hit:                     # 手動重寄：用目前碰到的最深一檔再寄一次
+        crossed = [lv for lv in LEVELS if dd <= -lv]
+        if crossed:
+            st["alerted"] = [x for x in st["alerted"] if x not in crossed]
+            hit = crossed
     if hit:
         lv = max(hit)
         st["alerted"] = sorted(set(st["alerted"]) | set(hit))

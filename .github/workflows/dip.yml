@@ -1,0 +1,38 @@
+name: Dip Alert Resend
+
+on:
+  workflow_dispatch:        # 手動重寄目前的大跌加碼通知
+
+permissions:
+  contents: write
+
+jobs:
+  dip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests lxml html5lib
+      - name: Resend dip alert
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          DIP_RESEND: "1"
+        run: |
+          python -c "import importlib.util as u; s=u.spec_from_file_location('d','加碼.py'); m=u.module_from_spec(s); s.loader.exec_module(m); m.check(send_mail=True)"
+      - name: Save state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "4189282+github-actions[bot]@users.noreply.github.com"
+          git add output/dip_state.json output/tw_radar.db 2>/dev/null || true
+          if git diff --cached --quiet; then echo "No changes."; else
+            git commit -m "Save dip state"
+            for i in 1 2 3; do git pull --rebase origin ${{ github.ref_name }} && git push origin HEAD:${{ github.ref_name }} && break; sleep 10; done
+          fi
