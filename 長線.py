@@ -510,12 +510,77 @@ def run(send_mail=True):
                      + (f" 賣出{len(sells)}" if sells else "") + (f" 長期持股轉弱{len(lh)}" if lh else ""), body)
 
 
+def hold_watch(send_mail=True):
+    """每天晚上：抓最新一個月的營收（每家公司 1～10 號陸續公布），我的長期持股一公布就判斷，有問題馬上寄信。
+    🟡 最新一個月營收年減（提醒留意）；🔴 連 2 個月年減（生意在變差）。同一檔同一個月同一個燈號只寄一次。"""
+    init_ldb()
+    R.LONG_HOLDINGS.clear()
+    R.load_holdings()
+    ids = [s for s in R.LONG_HOLDINGS if not s.startswith("00")]     # ETF 沒有營收
+    if not ids:
+        print("沒有長期持股")
+        return
+    now = R.now_tw()
+    m = (pd.Period(now.strftime("%Y-%m")) - 1)                      # 這個月公布的是上個月的營收
+    for mk in ("sii", "otc"):
+        for ky in (False, True):
+            try:
+                n = lupsert("revenue", fetch_revenue(m.year, m.month, mk, ky=ky), REV_COLS)
+                print(f"{m} {mk}{' KY' if ky else ''} 營收：{n} 家")
+            except Exception as e:
+                print(f"{m} {mk}{' KY' if ky else ''} 營收抓不到（可能還沒有公司公布）：{e}")
+            time.sleep(3)
+    with ldb() as c:
+        c.execute("CREATE TABLE IF NOT EXISTS hold_watch (stock_id TEXT, month TEXT, level TEXT, date TEXT, "
+                  "PRIMARY KEY(stock_id, month, level))")
+        rev = pd.read_sql(f"SELECT month, stock_id, name, revenue, rev_ly FROM revenue WHERE stock_id IN ({','.join('?' * len(ids))})",
+                          c, params=ids, dtype={"stock_id": str})
+        done = set(map(tuple, c.execute("SELECT stock_id, month, level FROM hold_watch").fetchall()))
+    rev["yoy"] = np.where(rev["rev_ly"] > 0, rev["revenue"] / rev["rev_ly"] - 1, np.nan)
+    pct = lambda v: f"{v * 100:+.0f}%" if pd.notna(v) else "—"
+    alerts = []
+    for sid, g in rev.sort_values("month").groupby("stock_id"):
+        g = g.dropna(subset=["yoy"])
+        if g.empty or g.iloc[-1]["month"] != str(m):
+            continue                                                # 這個月還沒公布
+        y1 = g.iloc[-1]
+        y2 = g.iloc[-2] if len(g) >= 2 and g.iloc[-2]["month"] == str(m - 1) else None
+        if y1.yoy >= 0:
+            continue
+        level = "🔴" if y2 is not None and y2.yoy < 0 else "🟡"
+        if (sid, str(m), level) in done:
+            continue
+        alerts.append((sid, y1["name"], level, y1, y2))
+    if not alerts:
+        print(f"持股營收：{m} 沒有新的問題")
+        return
+    lines = [f"你的長期持股有 {len(alerts)} 檔公布了 {m} 營收，出現年減：", ""]
+    for sid, nm, level, y1, y2 in sorted(alerts, key=lambda a: a[2] != "🔴"):
+        if level == "🔴":
+            lines.append(f"🔴 {nm}({sid})：營收連 2 個月年減（{y2['month']} {pct(y2.yoy)}、{y1['month']} {pct(y1.yoy)}），"
+                         "公司生意可能在變差，要不要減碼你自己判斷")
+        else:
+            lines.append(f"🟡 {nm}({sid})：{y1['month']} 營收年減 {pct(y1.yoy)}"
+                         + (f"（上個月還是 {pct(y2.yoy)}）" if y2 is not None else "") + "，先留意，下個月也年減就會變 🔴")
+    lines += ["", "（營收是一個月公布一次的，股價短期漲跌不會觸發這個通知。只是提醒，不是投資建議。）"]
+    body = "\n".join(lines)
+    print(body)
+    if send_mail and R.send_email(f"{'🔴' if any(a[2] == '🔴' for a in alerts) else '🟡'} 持股營收提醒：{'、'.join(a[1] for a in alerts)}", body):
+        with ldb() as c:
+            c.executemany("INSERT OR IGNORE INTO hold_watch VALUES (?,?,?,?)",
+                          [(a[0], str(m), a[2], now.strftime("%Y-%m-%d")) for a in alerts])
+
+
 def main():
     ap = argparse.ArgumentParser(description="長線成長股雷達")
     ap.add_argument("--backfill", action="store_true")
     ap.add_argument("--no-email", action="store_true")
     ap.add_argument("--years", type=int, default=3, help="回補幾年（研究用可以填 7）")
+    ap.add_argument("--hold-watch", action="store_true", help="每天晚上：持股一公布營收就檢查")
     a = ap.parse_args()
+    if a.hold_watch:
+        hold_watch(send_mail=not a.no_email)
+        return
     if a.backfill:
         backfill(years=max(a.years, 3), budget_min=270 if a.years > 3 else 70)
         return
