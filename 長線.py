@@ -718,6 +718,63 @@ def price_watch(send_mail=True):
                           [(s, month, "📉", R.now_tw().strftime("%Y-%m-%d")) for s, _ in hits])
 
 
+def margin_watch(send_mail=True):
+    """每天晚上（財報季才跑）：持股一公布季報就算單季營業利益率，比去年同季掉 ≥ 8 個百分點馬上寄信（同一檔同一季只寄一次）。
+    只存持股那幾檔，不影響週六整批回補（那邊看公司數 > 100 才算這季抓完）。"""
+    now = R.now_tw()
+    y, m = now.year, now.month
+    q = {4: (y, 1), 5: (y, 1), 7: (y, 2), 8: (y, 2), 10: (y, 3), 11: (y, 3), 1: (y - 1, 4), 2: (y - 1, 4), 3: (y - 1, 4)}.get(m)
+    if q is None:
+        print("利潤率：不是財報公布季，略過")
+        return
+    R.LONG_HOLDINGS.clear()
+    R.load_holdings()
+    ids = [s for s in R.LONG_HOLDINGS if not s.startswith("00")]
+    if not ids:
+        return
+    init_ldb()
+    for mk in ("sii", "otc"):
+        try:
+            df = fetch_fin(q[0], q[1], mk)
+            n = lupsert("fin", df[df["stock_id"].isin(ids)], FIN_COLS)
+            print(f"{q[0]}Q{q[1]} {mk} 季報：持股 {n} 檔已公布")
+        except Exception as e:
+            print(f"{q[0]}Q{q[1]} {mk} 季報抓不到（可能還沒公布）：{e}")
+        time.sleep(3)
+    quarter = f"{q[0]}Q{q[1]}"
+    with ldb() as c:
+        c.execute("CREATE TABLE IF NOT EXISTS hold_watch (stock_id TEXT, month TEXT, level TEXT, date TEXT, "
+                  "PRIMARY KEY(stock_id, month, level))")
+        fin = pd.read_sql(f"SELECT quarter, stock_id, op_revenue, op_income FROM fin WHERE stock_id IN ({','.join('?' * len(ids))})",
+                          c, params=ids, dtype={"stock_id": str})
+        done = set(map(tuple, c.execute("SELECT stock_id, month, level FROM hold_watch").fetchall()))
+        names = dict(c.execute(f"SELECT stock_id, name FROM revenue WHERE stock_id IN ({','.join('?' * len(ids))}) "
+                               "GROUP BY stock_id HAVING month = MAX(month)", ids).fetchall())
+    omc = om_change(fin)
+    hits = [(s, v) for s, v in omc.items() if v[0] == quarter and v[2] > 0 and v[3] <= -OM_DROP and (s, quarter, "利潤率") not in done]
+    for s, v in omc.items():
+        if v[0] == quarter:
+            print(f"{s} {quarter} 單季營業利益率 {v[1] * 100:.1f}%（去年同季 {v[2] * 100:.1f}%）")
+    if not hits:
+        print(f"利潤率：{quarter} 沒有持股大掉")
+        return
+    lines = [f"你的長期持股公布了 {quarter} 季報，利潤率比去年同季大掉：", ""]
+    for s, (qq, a, b, d) in hits:
+        nm = names.get(s, s)
+        lines.append(f"🟡 {nm}({s})：單季營業利益率 {a * 100:.1f}%，去年同季 {b * 100:.1f}%（{d * 100:+.1f} 個百分點）")
+        lines.append("  營收還在長、獲利卻被吃掉：可能是成本上升、降價、擴廠折舊，也可能是一次性的（停工歲修、匯損、一次性費用）。")
+        lines.append("  1. 先看法說會、財報附註怎麼解釋 → 2. 一次性的就續抱 → 3. 找不到好理由就賣一半換富邦台50")
+        lines += company_refs(s, nm) + [""]
+    lines += ["回測（2019～2026，成長股）：單季營業利益率比去年同季掉 8 個百分點以上，之後 6 個月比對照組差約 10%，",
+              "但 4 成照樣贏大盤，所以是「去查原因」的提醒，不是賣出訊號。"]
+    body = "\n".join(lines)
+    print(body)
+    if send_mail and R.send_email(f"🟡 持股利潤率提醒：{'、'.join(names.get(s, s) for s, _ in hits)}", body):
+        with ldb() as c:
+            c.executemany("INSERT OR IGNORE INTO hold_watch VALUES (?,?,?,?)",
+                          [(s, quarter, "利潤率", now.strftime("%Y-%m-%d")) for s, _ in hits])
+
+
 def main():
     ap = argparse.ArgumentParser(description="長線成長股雷達")
     ap.add_argument("--backfill", action="store_true")
@@ -726,8 +783,11 @@ def main():
     ap.add_argument("--hold-watch", action="store_true", help="每天晚上：持股一公布營收就檢查")
     a = ap.parse_args()
     if a.hold_watch:
-        hold_watch(send_mail=not a.no_email)
-        price_watch(send_mail=not a.no_email)
+        for f in (hold_watch, price_watch, margin_watch):        # 三條都每晚檢查，觸發就馬上寄信
+            try:
+                f(send_mail=not a.no_email)
+            except Exception as e:
+                print(f"{f.__name__} 失敗：{e}")
         return
     if a.backfill:
         backfill(years=max(a.years, 3), budget_min=270 if a.years > 3 else 70)
