@@ -389,9 +389,31 @@ def etf_line(sid):
     return f"\n⚪ {name}({sid})：ETF，不看營收，照加碼計畫長期抱著\n價格：{R.fmt_now(px)}（{dt}）"
 
 
+OM_DROP = 0.08            # 單季營業利益率比去年同季掉 ≥ 8 個百分點 → 🟡（11/4 回測：之後 6 個月比對照組差約 10%、前後兩段都成立；但 4 成照樣贏大盤，只提醒去看原因，不當賣訊）
+
+
+def om_change(fin):
+    """每檔最新一季：單季營業利益率、去年同季的、差幾個百分點（營運槓桿：營收小掉，獲利可能大掉）。"""
+    f = fin.copy()
+    f["y"] = f["quarter"].str[:4].astype(int)
+    f["q"] = f["quarter"].str[-1].astype(int)
+    f = f.sort_values(["stock_id", "y", "q"])
+    for col in ("op_revenue", "op_income"):
+        f[col + "_q"] = f[col] - f.groupby(["stock_id", "y"])[col].shift(1).fillna(0)
+    f["om"] = np.where(f["op_revenue_q"] > 0, f["op_income_q"] / f["op_revenue_q"], np.nan)
+    out = {}
+    for sid, g in f.groupby("stock_id"):
+        g = g.set_index(["y", "q"])
+        y, q = g.index.max()
+        if (y - 1, q) in g.index and pd.notna(g.loc[(y, q), "om"]) and pd.notna(g.loc[(y - 1, q), "om"]):
+            a, b = float(g.loc[(y, q), "om"]), float(g.loc[(y - 1, q), "om"])
+            out[sid] = (f"{y}Q{q}", a, b, a - b)
+    return out
+
+
 def holdings_section(df, last, pct):
     """我的長期持股（股票追蹤〔長期持股〕區）：每週都列，燈號看公司生意，不看短期股價。
-    🔴 營收連 2 個月年減（生意在變差）；🟡 最新一個月營收年減（留意）；🟢 營收還在成長。
+    🔴 營收連 2 個月年減（生意在變差）；🟡 最新一個月營收年減，或單季營業利益率比去年同季掉 ≥ 8 個百分點（留意）；🟢 營收還在成長。
     燈號只看營收：回測「跌破 10 月線就賣」反而比較差，股價趨勢只列出來參考。"""
     R.LONG_HOLDINGS.clear()
     R.load_holdings()
@@ -405,6 +427,13 @@ def holdings_section(df, last, pct):
         hi = px.groupby("stock_id")["close"].max()
     except Exception:
         hi = pd.Series(dtype=float)
+    try:
+        with ldb() as c:
+            omc = om_change(pd.read_sql("SELECT quarter, stock_id, op_revenue, op_income FROM fin WHERE stock_id IN (%s)"
+                                        % ",".join("?" * len(ids)), c, params=ids, dtype={"stock_id": str}))
+    except Exception as e:
+        print(f"營業利益率變化失敗：{e}")
+        omc = {}
     rows = []
     for sid in ids:
         if sid.startswith("00"):                             # ETF：沒有營收，只列價格；照加碼計畫抱著
@@ -421,12 +450,21 @@ def holdings_section(df, last, pct):
             light, why, o = "🟡", f"{last} 營收年減，再一個月也年減就會變 🔴，留意", 1
         else:
             light, why, o = "🟢", "營收還在成長，續抱", 2
+        m = omc.get(sid)
+        om_txt = ""
+        if m:
+            om_txt = (f"\n單季營業利益率（{m[0]}）：{m[1] * 100:.1f}%，" +
+                      (f"去年同季 {m[2] * 100:.1f}%（{m[3] * 100:+.1f} 個百分點）" if m[2] > 0 else "去年同季虧損，不比"))
+            if m[2] > 0 and m[3] <= -OM_DROP:
+                om_txt += "\n⚠️ 利潤率大掉：獲利可能被成本、降價或擴廠折舊吃掉，去看財報或法說會找原因（一次性的就沒事）"
+                if o == 2:
+                    light, why, o = "🟡", "營收還在成長，但利潤率比去年同季大掉，留意", 1
         h = hi.get(sid, np.nan)
         rows.append((o, f"\n{light} {x['name']}({sid})：{why}\n"
                         f"價格：{R.fmt_now(x.close)}（離一年高點 {pct(x.close / h - 1) if pd.notna(h) and h > 0 else '—'}；"
                         f"月 K {'在 10 月線上' if x.trend else '跌破 10 月線'}）\n"
                         f"營收：近 3 月年增 {p2(x.yoy3)}，{last} 年增 {p2(x.yoy_last)}\n"
-                        f"EPS 近四季：{x.eps:.2f} 元｜ROE：{pct(x.roe)}｜營業利益率：{pct(x.om)}｜長線條件符合 {ok}/5"))
+                        f"EPS 近四季：{x.eps:.2f} 元｜ROE：{pct(x.roe)}｜營業利益率：{pct(x.om)}｜長線條件符合 {ok}/5{om_txt}"))
     rows.sort(key=lambda r: r[0])
     n = {k: sum(1 for o, _ in rows if o == k) for k in (0, 1, 2)}
     return [f"\n【我的長期持股】{len(ids)} 檔（🟢{n[2]} 🟡{n[1]} 🔴{n[0]}；看公司生意，不看短期股價）"] + [r for _, r in rows]
