@@ -3,21 +3,8 @@ on:
   push:
     branches: [probe]
 jobs:
-  t:
+  p:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - {sid: "6197", url: "http://irconference.twse.com.tw/6197_21_20260901_ch.mp4"}
-          - {sid: "1503", url: "http://irconference.twse.com.tw/1503_15_20260910_ch.mp4"}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: {python-version: "3.11"}
-      - run: sudo apt-get install -y -q ffmpeg >/dev/null && pip install -q faster-whisper yt-dlp
-      - run: python tools/transcribe.py ${{ matrix.sid }} "${{ matrix.url }}"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with: {name: "t${{ matrix.sid }}", path: out/}
+      - run: pip install requests && python tools/probe_call.py
