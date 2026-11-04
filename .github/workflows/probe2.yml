@@ -2,9 +2,17 @@ name: Probe2
 on:
   push:
     branches: [probe2]
+  workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   p:
     runs-on: ubuntu-latest
+    timeout-minutes: 340
     steps:
       - uses: actions/checkout@v4
       - run: pip install requests && python tools/probe_call.py
+      - if: always()
+        run: |
+          git config user.name bot && git config user.email bot@x
+          git add -f output/tdcc.csv && git commit -m "tdcc data" && for i in 1 2 3; do git pull --rebase && git push && break; sleep 5; done
