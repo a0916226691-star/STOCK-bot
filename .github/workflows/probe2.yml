@@ -1,0 +1,10 @@
+name: Probe2
+on:
+  push:
+    branches: [probe2]
+jobs:
+  p:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install requests && python tools/probe_call.py
