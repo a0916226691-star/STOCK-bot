@@ -389,7 +389,7 @@ def etf_line(sid):
     return f"\n⚪ {name}({sid})：ETF，不看營收，照加碼計畫長期抱著\n價格：{R.fmt_now(px)}（{dt}）"
 
 
-OM_DROP = 0.08            # 單季營業利益率比去年同季掉 ≥ 8 個百分點 → 🟡（11/4 回測：之後 6 個月比對照組差約 10%、前後兩段都成立；但 4 成照樣贏大盤，只提醒去看原因，不當賣訊）
+# 單季營業利益率：只列出來參考，不亮燈（11/5 回測：在過去一年大漲的強勢股，2023～26 掉 8 個百分點以上之後並沒有比較差）
 
 
 def om_change(fin):
@@ -412,10 +412,9 @@ def om_change(fin):
 
 
 def holdings_section(df, last, pct):
-    """我的長期持股（股票追蹤〔長期持股〕區）：每週都列，燈號看公司生意，不看短期股價。
-    🔴 營收連 2 個月年減（生意在變差）；🟡 最新一個月營收年減，或單季營業利益率比去年同季掉 ≥ 8 個百分點，
-    或股價離高點跌 ≥ 20% 又比大盤多跌 ≥ 25%（留意、去查原因）；🟢 營收還在成長。
-    燈號只看營收：回測「跌破 10 月線就賣」反而比較差，股價趨勢只列出來參考。"""
+    """我的長期持股（股票追蹤〔長期持股〕區）：每週都列。燈號只用 11/5 回測過、兩段時期都有效的三條（每晚也會檢查、觸發馬上寄信）：
+    📉 離高點跌 ≥ 20% 又 3 個月比大盤多跌 ≥ 25%；🐢 營收成長大減速又 3 個月輸大盤 ≥ 15%；🔊 近 20 天爆量又比大盤多跌 ≥ 15%。
+    任一條 → 🟡（照三步查原因）；都沒有 → 🟢 續抱。月營收年增、利潤率、10 月線只列出來參考。"""
     R.LONG_HOLDINGS.clear()
     R.load_holdings()
     ids = list(R.LONG_HOLDINGS)
@@ -435,11 +434,24 @@ def holdings_section(df, last, pct):
     except Exception as e:
         print(f"營業利益率變化失敗：{e}")
         omc = {}
+    stk = [s for s in ids if not s.startswith("00")]
     try:
-        rel = rel_strength([s for s in ids if not s.startswith("00")])
+        rel = rel_strength(stk)
     except Exception as e:
         print(f"相對大盤失敗：{e}")
         rel = {}
+    try:
+        vol = vol_spike(stk)
+    except Exception as e:
+        print(f"爆量檢查失敗：{e}")
+        vol = {}
+    try:
+        with ldb() as c:
+            dec = rev_decel(pd.read_sql(f"SELECT month, stock_id, name, revenue, rev_ly FROM revenue WHERE stock_id IN ({','.join('?' * len(stk))})",
+                                        c, params=stk, dtype={"stock_id": str}))
+    except Exception as e:
+        print(f"營收減速失敗：{e}")
+        dec = {}
     rows = []
     for sid in ids:
         if sid.startswith("00"):                             # ETF：沒有營收，只列價格；照加碼計畫抱著
@@ -450,29 +462,31 @@ def holdings_section(df, last, pct):
             continue
         x = allx.loc[sid]
         ok = int(bool(x.revhi)) + int(x.yoy3 > YOY3_MIN) + int(bool(x.trend)) + int(x.eps > 0) + int(pd.notna(x.om) and x.om >= OM_MIN)
-        if x.neg2:
-            light, why, o = "🔴", "營收連 2 個月年減，生意在變差，要不要減碼你自己判斷", 0
-        elif pd.notna(x.yoy_last) and x.yoy_last < 0:
-            light, why, o = "🟡", f"{last} 營收年減，再一個月也年減就會變 🔴，留意", 1
-        else:
-            light, why, o = "🟢", "營收還在成長，續抱", 2
+        flags = []
         m = omc.get(sid)
         om_txt = ""
         if m:
             om_txt = (f"\n單季營業利益率（{m[0]}）：{m[1] * 100:.1f}%，" +
                       (f"去年同季 {m[2] * 100:.1f}%（{m[3] * 100:+.1f} 個百分點）" if m[2] > 0 else "去年同季虧損，不比"))
-            if m[2] > 0 and m[3] <= -OM_DROP:
-                om_txt += "\n⚠️ 利潤率大掉：獲利可能被成本、降價或擴廠折舊吃掉，去看財報或法說會找原因（一次性的就沒事）"
-                if o == 2:
-                    light, why, o = "🟡", "營收還在成長，但利潤率比去年同季大掉，留意", 1
         rv = rel.get(sid)
         if rv:
             om_txt += f"\n近 3 個月：{rv[1] * 100:+.0f}%，同期大盤 {rv[2] * 100:+.0f}%（{'落後大盤 ' + format(-(rv[1] - rv[2]) * 100, '.0f') + ' 個百分點' if rv[1] < rv[2] else '贏大盤'}）"
             if rv[3] <= REL_DD and rv[1] - rv[2] <= REL_GAP:
-                om_txt += ("\n📉 跌深而且比大盤多跌很多：可能是公司自己出事。1.先查原因（法說會、重大訊息、同業營收）"
-                           "→ 2.一次性的就續抱 → 3.找不到好理由就賣一半換富邦台50")
-                if o == 2:
-                    light, why, o = "🟡", "營收還在成長，但股價自己跌特別多，去查原因", 1
+                flags.append("📉 跌深而且比大盤多跌很多")
+        dv = dec.get(sid)
+        if dv:
+            om_txt += f"\n營收成長速度：近 3 個月年增 {dv[1] * 100:+.0f}%（到 {dv[0]}），半年前 {dv[2] * 100:+.0f}%"
+            if dv[2] - dv[1] >= DECEL and rv and rv[1] - rv[2] <= DECEL_GAP:
+                flags.append("🐢 營收成長大減速、股價也輸大盤")
+        vv = vol.get(sid)
+        if vv:
+            om_txt += f"\n近 20 天成交金額：平常的 {vv[1]:.1f} 倍（股價 {vv[2] * 100:+.0f}%，大盤 {vv[3] * 100:+.0f}%）"
+            if vv[1] >= VOL_X and vv[2] - vv[3] <= VOL_GAP:
+                flags.append("🔊 爆量下跌")
+        if flags:
+            light, why, o = "🟡", "、".join(flags) + "：照三步 1.查原因 → 2.一次性的就續抱 → 3.找不到好理由就賣一半換富邦台50", 1
+        else:
+            light, why, o = "🟢", "三條警示都沒有，續抱", 2
         h = hi.get(sid, np.nan)
         rows.append((o, f"\n{light} {x['name']}({sid})：{why}\n"
                         f"價格：{R.fmt_now(x.close)}（離一年高點 {pct(x.close / h - 1) if pd.notna(h) and h > 0 else '—'}；"
@@ -481,7 +495,7 @@ def holdings_section(df, last, pct):
                         f"EPS 近四季：{x.eps:.2f} 元｜ROE：{pct(x.roe)}｜營業利益率：{pct(x.om)}｜長線條件符合 {ok}/5{om_txt}"))
     rows.sort(key=lambda r: r[0])
     n = {k: sum(1 for o, _ in rows if o == k) for k in (0, 1, 2)}
-    return [f"\n【我的長期持股】{len(ids)} 檔（🟢{n[2]} 🟡{n[1]} 🔴{n[0]}；看公司生意，不看短期股價）"] + [r for _, r in rows]
+    return [f"\n【我的長期持股】{len(ids)} 檔（🟢{n[2]} 🟡{n[1]}；🟡 = 📉相對大盤／🐢營收減速／🔊爆量下跌 任一條）"] + [r for _, r in rows]
 
 
 def run(send_mail=True):
@@ -586,9 +600,32 @@ def company_refs(sid, name):
     return out
 
 
+DECEL = 0.30               # 近 3 個月營收年增率比半年前少 ≥ 30 個百分點（例：+50% → +15%）
+DECEL_GAP = -0.15          # 而且近 3 個月股價比大盤多跌 ≥ 15 個百分點
+# 11/5 回測（2019～2026，過去一年贏大盤 20% 以上的強勢股，像你的持股）：之後半年中位數輸大盤 16%，
+# 32% 落在最差兩成（隨便挑是 20%），兩段都成立。原本的「月營收年減」在強勢股 2023～26 沒效，改成只列資訊不寄信。
+
+
+def rev_decel(rev):
+    """每檔：最新 3 個月營收年增率、半年前那 3 個月的，月份要連續才算。"""
+    out = {}
+    for sid, g in rev.sort_values("month").groupby("stock_id"):
+        g = g[(g["revenue"] > 0) & (g["rev_ly"] > 0)].set_index("month")
+        if g.empty:
+            continue
+        m = pd.Period(g.index[-1])
+        now3 = [str(m - k) for k in range(3)]
+        old3 = [str(m - 6 - k) for k in range(3)]
+        if not all(k in g.index for k in now3 + old3):
+            continue
+        y = lambda ks: g.loc[ks, "revenue"].sum() / g.loc[ks, "rev_ly"].sum() - 1
+        out[sid] = (str(m), y(now3), y(old3), g["name"].iloc[-1])
+    return out
+
+
 def hold_watch(send_mail=True):
-    """每天晚上：抓最新一個月的營收（每家公司 1～10 號陸續公布），我的長期持股一公布就判斷，有問題馬上寄信。
-    🟡 最新一個月營收年減（提醒留意）；🔴 連 2 個月年減（生意在變差）。同一檔同一個月同一個燈號只寄一次。"""
+    """每天晚上：抓最新一個月的營收（每家公司 1～10 號陸續公布）。持股營收成長大減速、股價又輸大盤 → 馬上寄信。
+    同一檔同一個營收月份只寄一次。"""
     init_ldb()
     R.LONG_HOLDINGS.clear()
     R.load_holdings()
@@ -612,42 +649,43 @@ def hold_watch(send_mail=True):
         rev = pd.read_sql(f"SELECT month, stock_id, name, revenue, rev_ly FROM revenue WHERE stock_id IN ({','.join('?' * len(ids))})",
                           c, params=ids, dtype={"stock_id": str})
         done = set(map(tuple, c.execute("SELECT stock_id, month, level FROM hold_watch").fetchall()))
-    rev["yoy"] = np.where(rev["rev_ly"] > 0, rev["revenue"] / rev["rev_ly"] - 1, np.nan)
-    pct = lambda v: f"{v * 100:+.0f}%" if pd.notna(v) else "—"
-    alerts = []
-    for sid, g in rev.sort_values("month").groupby("stock_id"):
-        g = g.dropna(subset=["yoy"])
-        if g.empty or g.iloc[-1]["month"] != str(m):
-            continue                                                # 這個月還沒公布
-        y1 = g.iloc[-1]
-        y2 = g.iloc[-2] if len(g) >= 2 and g.iloc[-2]["month"] == str(m - 1) else None
-        if y1.yoy >= 0:
-            continue
-        level = "🔴" if y2 is not None and y2.yoy < 0 else "🟡"
-        if (sid, str(m), level) in done:
-            continue
-        alerts.append((sid, y1["name"], level, y1, y2))
-    if not alerts:
-        print(f"持股營收：{m} 沒有新的問題")
+    dec = rev_decel(rev)
+    try:
+        rs = rel_strength(ids)
+    except Exception as e:
+        print(f"相對大盤失敗：{e}")
+        rs = {}
+    pct = lambda v: f"{v * 100:+.0f}%"
+    hits = []
+    for sid, (mm, y3, y3o, nm) in dec.items():
+        rv = rs.get(sid)
+        gap = rv[1] - rv[2] if rv else np.nan
+        print(f"{nm}({sid})：近 3 月營收年增 {pct(y3)}（到 {mm}），半年前 {pct(y3o)}；近 3 月股價比大盤 {pct(gap) if pd.notna(gap) else '—'}")
+        if y3o - y3 >= DECEL and pd.notna(gap) and gap <= DECEL_GAP and (sid, mm, "減速") not in done:
+            hits.append((sid, nm, mm, y3, y3o, rv))
+    if not hits:
+        print("營收減速：沒有持股觸發")
         return
-    lines = [f"你的長期持股有 {len(alerts)} 檔公布了 {m} 營收，出現年減：", ""]
-    for sid, nm, level, y1, y2 in sorted(alerts, key=lambda a: a[2] != "🔴"):
-        if level == "🔴":
-            lines.append(f"🔴 {nm}({sid})：營收連 2 個月年減（{y2['month']} {pct(y2.yoy)}、{y1['month']} {pct(y1.yoy)}），"
-                         "公司生意可能在變差，要不要減碼你自己判斷")
-        else:
-            lines.append(f"🟡 {nm}({sid})：{y1['month']} 營收年減 {pct(y1.yoy)}"
-                         + (f"（上個月還是 {pct(y2.yoy)}）" if y2 is not None else "") + "，先留意，下個月也年減就會變 🔴")
+    lines = ["你的長期持股出現「營收成長大減速、股價也開始輸大盤」：", ""]
+    for sid, nm, mm, y3, y3o, rv in hits:
+        lines.append(f"🐢 {nm}({sid})：近 3 個月營收年增 {pct(y3)}（到 {mm}），半年前是 {pct(y3o)}，"
+                     f"少了 {(y3o - y3) * 100:.0f} 個百分點；近 3 個月股價 {pct(rv[1])}，大盤 {pct(rv[2])}，多跌 {pct(rv[1] - rv[2])}")
+        lines.append("成長股最怕的不是營收衰退，而是成長突然變慢：市場會先降評價。照這三步：")
+        lines += STEPS
         lines += company_refs(sid, nm) + [""]
-    lines += ["2019～2026 年，成長股第一次連 2 月年減，56% 在 3 個月內轉回成長（換產品、客戶調庫存、基期高）；",
-              "44% 沒轉回，之後 6 個月平均輸大盤 7%。所以先看法說會和新聞怎麼解釋，再決定。",
-              "（營收是一個月公布一次的，股價短期漲跌不會觸發這個通知。只是提醒，不是投資建議。）"]
+    lines += ["回測（2019～2026，過去一年贏大盤 20% 以上的強勢股）：營收成長大減速、股價又輸大盤 15% 以上的，",
+              "之後半年中位數輸大盤 16%，74% 跑輸；兩段時期都成立。但還是有 26% 之後贏大盤，所以先查原因再決定。"]
     body = "\n".join(lines)
     print(body)
-    if send_mail and R.send_email(f"{'🔴' if any(a[2] == '🔴' for a in alerts) else '🟡'} 持股營收提醒：{'、'.join(a[1] for a in alerts)}", body):
+    if send_mail and R.send_email(f"🐢 持股營收減速提醒：{'、'.join(h[1] for h in hits)}", body):
         with ldb() as c:
             c.executemany("INSERT OR IGNORE INTO hold_watch VALUES (?,?,?,?)",
-                          [(a[0], str(m), a[2], now.strftime("%Y-%m-%d")) for a in alerts])
+                          [(h[0], h[2], "減速", now.strftime("%Y-%m-%d")) for h in hits])
+
+
+STEPS = ["  1. 先查原因：法說會、重大訊息、同業和客戶的營收、新聞（下面有連結）",
+         "  2. 找到一次性的好理由（大股東賣股、單一事件、一次性費用、客戶調庫存）→ 續抱",
+         "  3. 找不到好理由，或同業也在轉弱 → 賣一半換成富邦台50(006208)；猜錯了剩下一半還跟得到，猜對了少虧一半"]
 
 
 REL_DD = -0.20             # 離一年高點跌 ≥ 20%
@@ -704,9 +742,7 @@ def price_watch(send_mail=True):
     for s, (nm, r3, m3, dd, d) in hits:
         lines.append(f"📉 {nm}({s})：近 3 個月 {pct(r3)}，同期大盤 {pct(m3)}，多跌 {pct(r3 - m3)}；離一年高點 {pct(dd)}（到 {d}）")
         lines.append("股價常比營收早幾個月反映壞消息。照這三步：")
-        lines.append("  1. 先查原因：法說會、重大訊息、同業和客戶的營收、新聞（下面有連結）")
-        lines.append("  2. 找到一次性的好理由（大股東賣股、單一事件、一次性費用）→ 續抱")
-        lines.append("  3. 找不到好理由，或同業也在轉弱 → 賣一半換成富邦台50(006208)；猜錯了剩下一半還跟得到，猜對了少虧一半")
+        lines += STEPS
         lines += company_refs(s, nm) + [""]
     lines += ["回測（2019～2026，營收還在成長的股票）：從高點跌 20% 以上、又比大盤多跌 25% 以上的，之後 6 個月中位數輸大盤 16%，",
               "72% 跑輸；跟大盤一起跌的只輸 8%。但還是有 28% 之後贏大盤，所以這是「去查原因」的提醒，不是賣出訊號。"]
@@ -718,61 +754,70 @@ def price_watch(send_mail=True):
                           [(s, month, "📉", R.now_tw().strftime("%Y-%m-%d")) for s, _ in hits])
 
 
-def margin_watch(send_mail=True):
-    """每天晚上（財報季才跑）：持股一公布季報就算單季營業利益率，比去年同季掉 ≥ 8 個百分點馬上寄信（同一檔同一季只寄一次）。
-    只存持股那幾檔，不影響週六整批回補（那邊看公司數 > 100 才算這季抓完）。"""
-    now = R.now_tw()
-    y, m = now.year, now.month
-    q = {4: (y, 1), 5: (y, 1), 7: (y, 2), 8: (y, 2), 10: (y, 3), 11: (y, 3), 1: (y - 1, 4), 2: (y - 1, 4), 3: (y - 1, 4)}.get(m)
-    if q is None:
-        print("利潤率：不是財報公布季，略過")
-        return
+VOL_X = 2.0                # 近 20 個交易日成交金額 ≥ 平常的 2 倍
+VOL_GAP = -0.15            # 而且近 20 個交易日比大盤多跌 ≥ 15 個百分點
+# 11/5 回測（2019～2026 強勢股，每天滾動判斷）：之後半年中位數輸大盤 10～14%，比強勢股平均多輸約 4～5 個百分點，
+# 兩段都成立；跟其他兩條幾乎不重疊，能抓到它們漏掉的。
+
+
+def vol_spike(ids):
+    """每檔：近 20 個交易日成交金額 ÷ 之前平常 20 天的成交金額（之前最多 250 天、至少 100 天）、近 20 日漲跌、同期大盤。"""
+    with sqlite3.connect(R.DB_PATH) as c:
+        px = pd.read_sql(f"SELECT date, stock_id, stock_name, close, turnover FROM prices WHERE date >= ? AND stock_id IN ({','.join('?' * len(ids))})",
+                         c, params=[(R.now_tw() - timedelta(days=420)).strftime("%Y-%m-%d")] + list(ids), dtype={"stock_id": str})
+        tx = pd.read_sql("SELECT date, close FROM taiex ORDER BY date", c).set_index("date")["close"]
+    out = {}
+    for sid, g in px.sort_values("date").groupby("stock_id"):
+        g = g.set_index("date")
+        x, t = g["close"].astype(float), g["turnover"].astype(float)
+        if len(g) < 121 or x.tail(21).isna().any() or ((x / x.shift(1)) < 0.5).any() or ((x / x.shift(1)) > 1.6).any():
+            continue
+        base = t.iloc[:-20].tail(250).mean() * 20
+        if not base > 0:
+            continue
+        d0 = x.index[-21]
+        t1, t0 = tx[tx.index <= x.index[-1]], tx[tx.index <= d0]
+        if t1.empty or t0.empty:
+            continue
+        out[sid] = (g["stock_name"].iloc[-1], t.tail(20).sum() / base, x.iloc[-1] / x.loc[d0] - 1,
+                    t1.iloc[-1] / t0.iloc[-1] - 1, x.index[-1])
+    return out
+
+
+def volume_watch(send_mail=True):
+    """每天晚上：持股爆量下跌（近 20 天成交金額 ≥ 平常 2 倍，又比大盤多跌 ≥ 15%）→ 大量資金在賣，馬上寄信（同一檔一個月只寄一次）。"""
     R.LONG_HOLDINGS.clear()
     R.load_holdings()
     ids = [s for s in R.LONG_HOLDINGS if not s.startswith("00")]
     if not ids:
         return
-    init_ldb()
-    for mk in ("sii", "otc"):
-        try:
-            df = fetch_fin(q[0], q[1], mk)
-            n = lupsert("fin", df[df["stock_id"].isin(ids)], FIN_COLS)
-            print(f"{q[0]}Q{q[1]} {mk} 季報：持股 {n} 檔已公布")
-        except Exception as e:
-            print(f"{q[0]}Q{q[1]} {mk} 季報抓不到（可能還沒公布）：{e}")
-        time.sleep(3)
-    quarter = f"{q[0]}Q{q[1]}"
+    month = R.now_tw().strftime("%Y-%m")
     with ldb() as c:
         c.execute("CREATE TABLE IF NOT EXISTS hold_watch (stock_id TEXT, month TEXT, level TEXT, date TEXT, "
                   "PRIMARY KEY(stock_id, month, level))")
-        fin = pd.read_sql(f"SELECT quarter, stock_id, op_revenue, op_income FROM fin WHERE stock_id IN ({','.join('?' * len(ids))})",
-                          c, params=ids, dtype={"stock_id": str})
         done = set(map(tuple, c.execute("SELECT stock_id, month, level FROM hold_watch").fetchall()))
-        names = dict(c.execute(f"SELECT stock_id, name FROM revenue WHERE stock_id IN ({','.join('?' * len(ids))}) "
-                               "GROUP BY stock_id HAVING month = MAX(month)", ids).fetchall())
-    omc = om_change(fin)
-    hits = [(s, v) for s, v in omc.items() if v[0] == quarter and v[2] > 0 and v[3] <= -OM_DROP and (s, quarter, "利潤率") not in done]
-    for s, v in omc.items():
-        if v[0] == quarter:
-            print(f"{s} {quarter} 單季營業利益率 {v[1] * 100:.1f}%（去年同季 {v[2] * 100:.1f}%）")
+    vs = vol_spike(ids)
+    pct = lambda v: f"{v * 100:+.0f}%"
+    for s, v in vs.items():
+        print(f"{v[0]}({s})：近 20 日成交金額是平常的 {v[1]:.1f} 倍，近 20 日 {pct(v[2])}，大盤 {pct(v[3])}")
+    hits = [(s, v) for s, v in vs.items() if v[1] >= VOL_X and v[2] - v[3] <= VOL_GAP and (s, month, "🔊") not in done]
     if not hits:
-        print(f"利潤率：{quarter} 沒有持股大掉")
+        print("爆量下跌：沒有持股觸發")
         return
-    lines = [f"你的長期持股公布了 {quarter} 季報，利潤率比去年同季大掉：", ""]
-    for s, (qq, a, b, d) in hits:
-        nm = names.get(s, s)
-        lines.append(f"🟡 {nm}({s})：單季營業利益率 {a * 100:.1f}%，去年同季 {b * 100:.1f}%（{d * 100:+.1f} 個百分點）")
-        lines.append("  營收還在長、獲利卻被吃掉：可能是成本上升、降價、擴廠折舊，也可能是一次性的（停工歲修、匯損、一次性費用）。")
-        lines.append("  1. 先看法說會、財報附註怎麼解釋 → 2. 一次性的就續抱 → 3. 找不到好理由就賣一半換富邦台50")
+    lines = ["你的長期持股出現「爆量下跌」：成交量放大、股價又跌得比大盤多，代表有大量資金在賣：", ""]
+    for s, (nm, ratio, r20, m20, d) in hits:
+        lines.append(f"🔊 {nm}({s})：近 20 個交易日成交金額是平常的 {ratio:.1f} 倍；同期股價 {pct(r20)}，大盤 {pct(m20)}，多跌 {pct(r20 - m20)}（到 {d}）")
+        lines.append("可能是法人、大股東在出貨，也可能只是整個族群被賣（大盤一起跌就比較不用擔心）。照這三步：")
+        lines += STEPS
         lines += company_refs(s, nm) + [""]
-    lines += ["回測（2019～2026，成長股）：單季營業利益率比去年同季掉 8 個百分點以上，之後 6 個月比對照組差約 10%，",
-              "但 4 成照樣贏大盤，所以是「去查原因」的提醒，不是賣出訊號。"]
+    lines += ["回測（2019～2026，過去一年贏大盤 20% 以上的強勢股）：爆量又比大盤多跌 15% 以上的，之後半年中位數輸大盤 10～14%，",
+              "兩段時期都成立。不是爆量一出現就要賣：照上面三步先查原因。"]
     body = "\n".join(lines)
     print(body)
-    if send_mail and R.send_email(f"🟡 持股利潤率提醒：{'、'.join(names.get(s, s) for s, _ in hits)}", body):
+    if send_mail and R.send_email(f"🔊 持股爆量下跌提醒：{'、'.join(v[0] for _, v in hits)}", body):
         with ldb() as c:
             c.executemany("INSERT OR IGNORE INTO hold_watch VALUES (?,?,?,?)",
-                          [(s, quarter, "利潤率", now.strftime("%Y-%m-%d")) for s, _ in hits])
+                          [(s, month, "🔊", R.now_tw().strftime("%Y-%m-%d")) for s, _ in hits])
 
 
 def main():
@@ -780,10 +825,10 @@ def main():
     ap.add_argument("--backfill", action="store_true")
     ap.add_argument("--no-email", action="store_true")
     ap.add_argument("--years", type=int, default=3, help="回補幾年（研究用可以填 7）")
-    ap.add_argument("--hold-watch", action="store_true", help="每天晚上：持股一公布營收就檢查")
+    ap.add_argument("--hold-watch", action="store_true", help="每天晚上：持股營收減速、相對大盤、爆量下跌檢查")
     a = ap.parse_args()
     if a.hold_watch:
-        for f in (hold_watch, price_watch, margin_watch):        # 三條都每晚檢查，觸發就馬上寄信
+        for f in (hold_watch, price_watch, volume_watch):        # 三條都每晚檢查，觸發就馬上寄信
             try:
                 f(send_mail=not a.no_email)
             except Exception as e:
