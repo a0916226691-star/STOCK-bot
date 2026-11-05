@@ -820,6 +820,20 @@ def volume_watch(send_mail=True):
                           [(s, month, "🔊", R.now_tw().strftime("%Y-%m-%d")) for s, _ in hits])
 
 
+def refresh_today():
+    """晚上檢查前先把「今天」的收盤價、成交金額、加權指數收進來（不然要等隔天早上 7:10 才有，警示會晚一天）。"""
+    R.init_db()
+    q = R.collect_quotes(R.load_table("prices", 120))
+    if not q.empty:
+        R.upsert("prices", q, R.QUOTE_COLS)
+        print(f"今天行情：{len(q)} 檔（{q['date'].max()}）")
+    import importlib.util as iu
+    sp = iu.spec_from_file_location("radar_dip", os.path.join(os.path.dirname(os.path.abspath(__file__)), "加碼.py"))
+    d = iu.module_from_spec(sp)
+    sp.loader.exec_module(d)
+    d.update_taiex(months=1)
+
+
 def main():
     ap = argparse.ArgumentParser(description="長線成長股雷達")
     ap.add_argument("--backfill", action="store_true")
@@ -828,6 +842,10 @@ def main():
     ap.add_argument("--hold-watch", action="store_true", help="每天晚上：持股營收減速、相對大盤、爆量下跌檢查")
     a = ap.parse_args()
     if a.hold_watch:
+        try:
+            refresh_today()
+        except Exception as e:
+            print(f"今天行情收不到（用資料庫裡最新的）：{e}")
         for f in (hold_watch, price_watch, volume_watch):        # 三條都每晚檢查，觸發就馬上寄信
             try:
                 f(send_mail=not a.no_email)

@@ -2,7 +2,7 @@ name: Holdings Revenue Watch
 
 on:
   schedule:
-    - cron: "47 12 * * *"   # 台灣時間每天晚上 20:47：持股一公布月營收就檢查，有問題馬上寄信
+    - cron: "47 12 * * *"   # 台灣時間每天晚上 20:47：先收今天收盤資料，再檢查持股三條警示（營收減速、相對大盤、爆量下跌），觸發當晚寄信
   workflow_dispatch:
 
 permissions:
@@ -31,8 +31,8 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "4189282+github-actions[bot]@users.noreply.github.com"
-          git add output/longterm.db
+          git add output/longterm.db output/tw_radar.db
           if git diff --cached --quiet; then echo "No changes."; else
             git commit -m "Save holdings watch"
-            for i in 1 2 3; do git pull --rebase origin ${{ github.ref_name }} && git push origin HEAD:${{ github.ref_name }} && break; sleep 10; done
+            for i in 1 2 3; do git pull --rebase -X theirs origin ${{ github.ref_name }} && git push origin HEAD:${{ github.ref_name }} && break; git rebase --abort 2>/dev/null; sleep 10; done
           fi
