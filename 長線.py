@@ -495,6 +495,20 @@ def holdings_section(df, last, pct):
                        f"股價隱含每年成長 {va[6] * 100:+.0f}%，實際營收成長 {va[4] * 100:+.0f}%")
             if va[6] - va[4] >= VAL_GAP:
                 flags.append("💰 估值太貴")
+            est = fetch_est(sid)
+            if est:
+                try:
+                    save_est(sid, est)
+                except Exception as e:
+                    print(f"{sid} 法人預估存不進去：{e}")
+            sc, how, g_an = scenarios(va, est)
+            om_txt += ("\n三情境估值：" + "｜".join(f"{k} {v:,.0f}" for k, v in sc.items()) + f"（股價 {va[1]:,.0f}；{how}）")
+            if est and est.get("tp"):
+                t = est["tp"]
+                om_txt += f"\n法人目標價：中位數 {t['feMedian']:,.0f}（最低 {t['feLow']:,.0f}～最高 {t['feHigh']:,.0f}，{t['numEst']} 家，{t.get('rateDate', '')}）"
+            if g_an is not None:
+                om_txt += (f"\n課程判斷：股價隱含每年成長 {va[6] * 100:+.0f}%，法人預估每年成長 {g_an * 100:+.0f}% → "
+                           + ("法人預估比較高，潛在低估" if g_an > va[6] else "股價隱含比較高，潛在高估") + "（參考，未回測）")
         if flags:
             light, why, o = "🟡", "、".join(flags) + "：照三步 1.查原因 → 2.一次性的就續抱 → 3.找不到好理由就賣一半換富邦台50", 1
         else:
@@ -894,6 +908,72 @@ def valuation(ids):
         p = float(last[sid])
         out[sid] = (names.get(sid, sid), p, eps, roe, g, dcf_value(eps, g, roe), implied_growth(p, eps, roe))
     return out
+
+
+CNYES = "https://marketinfo.api.cnyes.com/mi/api/v1/financialIndicator/"
+SCEN = {"悲觀": ("feLow", 0.05), "中等": ("feMedian", 0.15), "樂觀": ("feHigh", 0.25)}   # 用哪個法人 EPS、法人預估年度之後每年成長多少（再慢慢降到 2%）
+SCEN_NOEST = {"悲觀": 0.5, "中等": 1.0, "樂觀": 1.5}                                   # 沒有法人預估：用過去實際成長 × 這個倍數
+
+
+def fetch_est(sid):
+    """鉅亨網的 FactSet 綜合預估（外資＋本土券商一起算）：目標價、各年度 EPS（最高、最低、中位數、幾家）。抓不到回 None。"""
+    h = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.cnyes.com/"}
+    out = {}
+    try:
+        tp = requests.get(f"{CNYES}targetPrice/TWS:{sid}:STOCK", headers=h, timeout=20).json().get("data") or {}
+        if tp.get("numEst"):
+            out["tp"] = tp
+        ep = requests.get(f"{CNYES}estimateProfit/TWS:{sid}:STOCK", params={"type": "eps"}, headers=h, timeout=20).json().get("data") or []
+        this_year = R.now_tw().year
+        out["eps"] = {int(x["financialYear"]): x for x in ep
+                      if x.get("numEst") and int(x["financialYear"]) > this_year - 1 and x.get("feMedian")}
+    except Exception as e:
+        print(f"{sid} 法人預估抓不到：{e}")
+        return None
+    return out if (out.get("tp") or out.get("eps")) else None
+
+
+def save_est(sid, est):
+    """每週存一份，累積幾年後就能回測「法人預估準不準」。"""
+    d = R.now_tw().strftime("%Y-%m-%d")
+    rows = [(d, sid, "tp", None, est["tp"].get("feLow"), est["tp"].get("feMedian"), est["tp"].get("feHigh"), est["tp"].get("numEst"))] if est.get("tp") else []
+    rows += [(d, sid, "eps", y, x.get("feLow"), x.get("feMedian"), x.get("feHigh"), x.get("numEst")) for y, x in est.get("eps", {}).items()]
+    with ldb() as c:
+        c.execute("CREATE TABLE IF NOT EXISTS analyst_est (date TEXT, stock_id TEXT, kind TEXT, year INTEGER, low REAL, median REAL, high REAL, n INTEGER, "
+                  "PRIMARY KEY(date, stock_id, kind, year))")
+        c.executemany("INSERT OR REPLACE INTO analyst_est VALUES (?,?,?,?,?,?,?,?)", rows)
+
+
+def dcf_path(e0, eps_years, g_after, roe):
+    """DCF：前面幾年用給定的 EPS，之後每年成長 g_after 到第 5 年，第 6～10 年線性降到 2%，再永續 2%（沒給 EPS 時跟 dcf_value 一樣）。現金 = 盈餘 ×（1 − 成長 ÷ ROE）。"""
+    roe = min(max(roe, 0.08), 0.40)
+    v, prev, e, n = 0.0, e0, e0, len(eps_years)
+    for t in range(1, 11):
+        if t <= n:
+            e = eps_years[t - 1]
+            gt = e / prev - 1 if prev > 0 else g_after
+        else:
+            gt = g_after if t <= 5 else g_after + (DCF_GT - g_after) * (t - max(5, n)) / (10 - max(5, n))
+            e *= 1 + gt
+        prev = e
+        v += e * (1 - min(max(min(gt, 0.40) / roe, 0), 0.9)) / (1 + DCF_R) ** t   # 一年暴增（漲價、產能利用率）不需要等比例擴廠，再投資按最多 40% 成長算
+    return v + e * (1 + DCF_GT) * (1 - DCF_GT / roe) / (DCF_R - DCF_GT) / (1 + DCF_R) ** 10
+
+
+def scenarios(va, est):
+    """三情境估值。有法人 EPS 預估：悲觀用最低、中等用中位數、樂觀用最高，預估年度之後每年成長 5%／15%／25%；
+    沒有法人預估：用過去實際營收成長 × 0.5／1／1.5（上限 40%）。回 ({情境: 估值}, 說明, 法人預估年成長或 None)。"""
+    nm, p, eps, roe, g, v, gi = va
+    ys = sorted((est or {}).get("eps", {}))
+    ys = [y for y in ys if y > R.now_tw().year]                       # 今年快結束了，從明年開始算
+    if ys:
+        out = {k: dcf_path(eps, [est["eps"][y][col] for y in ys], ga, roe) for k, (col, ga) in SCEN.items()}
+        n = max(est["eps"][y]["numEst"] for y in ys)
+        last = est["eps"][ys[-1]]["feMedian"]
+        g_an = (last / eps) ** (1 / (ys[-1] - R.now_tw().year)) - 1 if eps > 0 and last > 0 else None
+        return out, f"法人預估（FactSet 綜合 {n} 家）{ys[0]}～{ys[-1]} 年 EPS", g_an
+    out = {k: dcf_value(eps, min(max(g * m, -0.10), 0.40), roe) for k, m in SCEN_NOEST.items()}
+    return out, "沒有法人預估，用過去實際營收成長 ×0.5／1／1.5", None
 
 
 def value_watch(send_mail=True):
