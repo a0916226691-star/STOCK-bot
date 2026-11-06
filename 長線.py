@@ -413,7 +413,7 @@ def om_change(fin):
 
 def holdings_section(df, last, pct):
     """我的長期持股（股票追蹤〔長期持股〕區）：每週都列。燈號只用 11/5 回測過、兩段時期都有效的三條（每晚也會檢查、觸發馬上寄信）：
-    📉 離高點跌 ≥ 20% 又 3 個月比大盤多跌 ≥ 25%；🐢 營收成長大減速又 3 個月輸大盤 ≥ 15%；🔊 近 20 天爆量又比大盤多跌 ≥ 15%。
+    📉 離高點跌 ≥ 20% 又 3 個月比大盤多跌 ≥ 25%；🐢 營收成長大減速（不用等股價）；🔊 近 20 天爆量又比大盤多跌 ≥ 15%。
     任一條 → 🟡（照三步查原因）；都沒有 → 🟢 續抱。月營收年增、利潤率、10 月線只列出來參考。"""
     R.LONG_HOLDINGS.clear()
     R.load_holdings()
@@ -476,8 +476,8 @@ def holdings_section(df, last, pct):
         dv = dec.get(sid)
         if dv:
             om_txt += f"\n營收成長速度：近 3 個月年增 {dv[1] * 100:+.0f}%（到 {dv[0]}），半年前 {dv[2] * 100:+.0f}%"
-            if dv[2] - dv[1] >= DECEL and rv and rv[1] - rv[2] <= DECEL_GAP:
-                flags.append("🐢 營收成長大減速、股價也輸大盤")
+            if dv[2] - dv[1] >= DECEL:
+                flags.append("🐢 營收成長大減速")
         vv = vol.get(sid)
         if vv:
             om_txt += f"\n近 20 天成交金額：平常的 {vv[1]:.1f} 倍（股價 {vv[2] * 100:+.0f}%，大盤 {vv[3] * 100:+.0f}%）"
@@ -601,9 +601,9 @@ def company_refs(sid, name):
 
 
 DECEL = 0.30               # 近 3 個月營收年增率比半年前少 ≥ 30 個百分點（例：+50% → +15%）
-DECEL_GAP = -0.15          # 而且近 3 個月股價比大盤多跌 ≥ 15 個百分點
-# 11/5 回測（2019～2026，過去一年贏大盤 20% 以上的強勢股，像你的持股）：之後半年中位數輸大盤 16%，
-# 32% 落在最差兩成（隨便挑是 20%），兩段都成立。原本的「月營收年減」在強勢股 2023～26 沒效，改成只列資訊不寄信。
+# 11/6 回測（2019～2026，過去一年贏大盤 20% 以上的強勢股，像你的持股）：減速當下股價通常還在贏大盤（+4～7%），
+# 之後半年中位數輸大盤 12～14%、約七成跑輸，兩段都成立。不等「股價也輸大盤 15%」：等的話平均已先多輸約 20 個百分點，
+# 而且 74% 的減速根本等不到。原本的「月營收年減」在強勢股 2023～26 沒效，只列資訊不寄信。
 
 
 def rev_decel(rev):
@@ -624,7 +624,7 @@ def rev_decel(rev):
 
 
 def hold_watch(send_mail=True):
-    """每天晚上：抓最新一個月的營收（每家公司 1～10 號陸續公布）。持股營收成長大減速、股價又輸大盤 → 馬上寄信。
+    """每天晚上：抓最新一個月的營收（每家公司 1～10 號陸續公布）。持股營收成長大減速 → 馬上寄信（不等股價反應）。
     同一檔同一個營收月份只寄一次。"""
     init_ldb()
     R.LONG_HOLDINGS.clear()
@@ -661,20 +661,21 @@ def hold_watch(send_mail=True):
         rv = rs.get(sid)
         gap = rv[1] - rv[2] if rv else np.nan
         print(f"{nm}({sid})：近 3 月營收年增 {pct(y3)}（到 {mm}），半年前 {pct(y3o)}；近 3 月股價比大盤 {pct(gap) if pd.notna(gap) else '—'}")
-        if y3o - y3 >= DECEL and pd.notna(gap) and gap <= DECEL_GAP and (sid, mm, "減速") not in done:
+        if y3o - y3 >= DECEL and (sid, mm, "減速") not in done:
             hits.append((sid, nm, mm, y3, y3o, rv))
     if not hits:
         print("營收減速：沒有持股觸發")
         return
-    lines = ["你的長期持股出現「營收成長大減速、股價也開始輸大盤」：", ""]
+    lines = ["你的長期持股出現「營收成長大減速」：", ""]
     for sid, nm, mm, y3, y3o, rv in hits:
         lines.append(f"🐢 {nm}({sid})：近 3 個月營收年增 {pct(y3)}（到 {mm}），半年前是 {pct(y3o)}，"
-                     f"少了 {(y3o - y3) * 100:.0f} 個百分點；近 3 個月股價 {pct(rv[1])}，大盤 {pct(rv[2])}，多跌 {pct(rv[1] - rv[2])}")
-        lines.append("成長股最怕的不是營收衰退，而是成長突然變慢：市場會先降評價。照這三步：")
+                     f"少了 {(y3o - y3) * 100:.0f} 個百分點" +
+                     (f"；近 3 個月股價 {pct(rv[1])}，大盤 {pct(rv[2])}" if rv else ""))
+        lines.append("成長股最怕的不是營收衰退，而是成長突然變慢：市場接下來常會降評價，股價通常還沒反應。照這三步：")
         lines += STEPS
         lines += company_refs(sid, nm) + [""]
-    lines += ["回測（2019～2026，過去一年贏大盤 20% 以上的強勢股）：營收成長大減速、股價又輸大盤 15% 以上的，",
-              "之後半年中位數輸大盤 16%，74% 跑輸；兩段時期都成立。但還是有 26% 之後贏大盤，所以先查原因再決定。"]
+    lines += ["回測（2019～2026，過去一年贏大盤 20% 以上的強勢股）：營收成長大減速時股價通常還在贏大盤，",
+              "之後半年中位數輸大盤 12～14%，約七成跑輸；兩段時期都成立。但還是有三成之後贏大盤，所以先查原因再決定。"]
     body = "\n".join(lines)
     print(body)
     if send_mail and R.send_email(f"🐢 持股營收減速提醒：{'、'.join(h[1] for h in hits)}", body):
