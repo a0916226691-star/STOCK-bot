@@ -476,7 +476,7 @@ def holdings_section(df, last, pct):
         dv = dec.get(sid)
         if dv:
             om_txt += f"\n營收成長速度：近 3 個月年增 {dv[1] * 100:+.0f}%（到 {dv[0]}），半年前 {dv[2] * 100:+.0f}%"
-            if dv[2] - dv[1] >= DECEL:
+            if dv[2] - dv[1] >= DECEL and dv[2] <= DECEL_BASE:
                 flags.append("🐢 營收成長大減速")
         vv = vol.get(sid)
         if vv:
@@ -601,6 +601,7 @@ def company_refs(sid, name):
 
 
 DECEL = 0.30               # 近 3 個月營收年增率比半年前少 ≥ 30 個百分點（例：+50% → +15%）
+DECEL_BASE = 2.0          # 半年前年增 > 200% 不比（去年基期太小，像建商交屋，比了沒意義；回測排除後兩段一樣成立）
 # 11/6 回測（2019～2026，過去一年贏大盤 20% 以上的強勢股，像你的持股）：減速當下股價通常還在贏大盤（+4～7%），
 # 之後半年中位數輸大盤 12～14%、約七成跑輸，兩段都成立。不等「股價也輸大盤 15%」：等的話平均已先多輸約 20 個百分點，
 # 而且 74% 的減速根本等不到。原本的「月營收年減」在強勢股 2023～26 沒效，只列資訊不寄信。
@@ -661,7 +662,7 @@ def hold_watch(send_mail=True):
         rv = rs.get(sid)
         gap = rv[1] - rv[2] if rv else np.nan
         print(f"{nm}({sid})：近 3 月營收年增 {pct(y3)}（到 {mm}），半年前 {pct(y3o)}；近 3 月股價比大盤 {pct(gap) if pd.notna(gap) else '—'}")
-        if y3o - y3 >= DECEL and (sid, mm, "減速") not in done:
+        if y3o - y3 >= DECEL and y3o <= DECEL_BASE and (sid, mm, "減速") not in done:
             hits.append((sid, nm, mm, y3, y3o, rv))
     if not hits:
         print("營收減速：沒有持股觸發")
