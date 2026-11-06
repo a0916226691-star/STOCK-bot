@@ -414,6 +414,7 @@ def om_change(fin):
 def holdings_section(df, last, pct):
     """我的長期持股（股票追蹤〔長期持股〕區）：每週都列。燈號只用 11/5 回測過、兩段時期都有效的三條（每晚也會檢查、觸發馬上寄信）：
     📉 離高點跌 ≥ 20% 又 3 個月比大盤多跌 ≥ 25%；🐢 營收成長大減速（不用等股價）；🔊 近 20 天爆量又比大盤多跌 ≥ 15%。
+    💰 股價隱含成長率比實際營收成長高 ≥ 35 個百分點（反推 DCF，11/7 回測）。
     任一條 → 🟡（照三步查原因）；都沒有 → 🟢 續抱。月營收年增、利潤率、10 月線只列出來參考。"""
     R.LONG_HOLDINGS.clear()
     R.load_holdings()
@@ -452,6 +453,11 @@ def holdings_section(df, last, pct):
     except Exception as e:
         print(f"營收減速失敗：{e}")
         dec = {}
+    try:
+        val = valuation(stk)
+    except Exception as e:
+        print(f"估值失敗：{e}")
+        val = {}
     rows = []
     for sid in ids:
         if sid.startswith("00"):                             # ETF：沒有營收，只列價格；照加碼計畫抱著
@@ -483,10 +489,16 @@ def holdings_section(df, last, pct):
             om_txt += f"\n近 20 天成交金額：平常的 {vv[1]:.1f} 倍（股價 {vv[2] * 100:+.0f}%，大盤 {vv[3] * 100:+.0f}%）"
             if vv[1] >= VOL_X and vv[2] - vv[3] <= VOL_GAP:
                 flags.append("🔊 爆量下跌")
+        va = val.get(sid)
+        if va:
+            om_txt += (f"\n估值（DCF）：約 {va[5]:.0f}，股價是估值的 {va[1] / va[5]:.1f} 倍；"
+                       f"股價隱含每年成長 {va[6] * 100:+.0f}%，實際營收成長 {va[4] * 100:+.0f}%")
+            if va[6] - va[4] >= VAL_GAP:
+                flags.append("💰 估值太貴")
         if flags:
             light, why, o = "🟡", "、".join(flags) + "：照三步 1.查原因 → 2.一次性的就續抱 → 3.找不到好理由就賣一半換富邦台50", 1
         else:
-            light, why, o = "🟢", "三條警示都沒有，續抱", 2
+            light, why, o = "🟢", "四條警示都沒有，續抱", 2
         h = hi.get(sid, np.nan)
         rows.append((o, f"\n{light} {x['name']}({sid})：{why}\n"
                         f"價格：{R.fmt_now(x.close)}（離一年高點 {pct(x.close / h - 1) if pd.notna(h) and h > 0 else '—'}；"
@@ -495,7 +507,7 @@ def holdings_section(df, last, pct):
                         f"EPS 近四季：{x.eps:.2f} 元｜ROE：{pct(x.roe)}｜營業利益率：{pct(x.om)}｜長線條件符合 {ok}/5{om_txt}"))
     rows.sort(key=lambda r: r[0])
     n = {k: sum(1 for o, _ in rows if o == k) for k in (0, 1, 2)}
-    return [f"\n【我的長期持股】{len(ids)} 檔（🟢{n[2]} 🟡{n[1]}；🟡 = 📉相對大盤／🐢營收減速／🔊爆量下跌 任一條）"] + [r for _, r in rows]
+    return [f"\n【我的長期持股】{len(ids)} 檔（🟢{n[2]} 🟡{n[1]}；🟡 = 📉相對大盤／🐢營收減速／🔊爆量下跌／💰估值太貴 任一條）"] + [r for _, r in rows]
 
 
 def run(send_mail=True):
@@ -823,6 +835,106 @@ def volume_watch(send_mail=True):
                           [(s, month, "🔊", R.now_tw().strftime("%Y-%m-%d")) for s, _ in hits])
 
 
+DCF_R = 0.10               # 折現率（台股股東要求報酬）
+DCF_GT = 0.02              # 永續成長率
+VAL_GAP = 0.35             # 股價隱含成長率比實際營收成長率高 ≥ 35 個百分點 → 💰 太貴
+# 11/7 回測（2019～2026，過去一年贏大盤 20% 以上的強勢股）：之後半年中位數輸大盤 12～18%、七成跑輸，
+# 比其他強勢股多輸 7～8 個百分點，兩段都成立；跟另外三條警示幾乎不重疊（1,900 次只重疊 261 次）。
+
+
+def dcf_value(e0, g, roe):
+    """盈餘版 DCF：前 5 年每年成長 g，第 6～10 年線性降到 2%，之後永續 2%；
+    每年能拿出來的現金 = 盈餘 ×（1 − 成長率 ÷ ROE），成長要靠再投資，ROE 越高要留的越少。"""
+    roe = min(max(roe, 0.08), 0.40)
+    v, e = 0.0, e0
+    for t in range(1, 11):
+        gt = g if t <= 5 else g + (DCF_GT - g) * (t - 5) / 5
+        e *= 1 + gt
+        v += e * (1 - min(max(gt / roe, 0), 0.9)) / (1 + DCF_R) ** t
+    return v + e * (1 + DCF_GT) * (1 - DCF_GT / roe) / (DCF_R - DCF_GT) / (1 + DCF_R) ** 10
+
+
+def implied_growth(price, e0, roe):
+    """反推 DCF：現在股價等於「市場相信未來 5 年每年成長多少」。"""
+    lo, hi = -0.3, 1.5
+    if dcf_value(e0, hi, roe) < price:
+        return hi
+    if dcf_value(e0, lo, roe) > price:
+        return lo
+    for _ in range(50):
+        m = (lo + hi) / 2
+        lo, hi = (m, hi) if dcf_value(e0, m, roe) < price else (lo, m)
+    return (lo + hi) / 2
+
+
+def valuation(ids):
+    """每檔：(名稱, 股價, 近四季 EPS, ROE, 估計成長率, DCF 估值, 隱含成長率)。估計成長率 = 近 1 年和近 3 年營收（近 12 個月合計）年成長平均，限制在 −10%～40%。"""
+    if not ids:
+        return {}
+    q = ",".join("?" * len(ids))
+    with ldb() as c:
+        tf = ttm_fin(pd.read_sql(f"SELECT * FROM fin WHERE stock_id IN ({q})", c, params=ids, dtype={"stock_id": str}))
+        rv = pd.read_sql(f"SELECT month, stock_id, name, revenue FROM revenue WHERE stock_id IN ({q})", c, params=ids, dtype={"stock_id": str})
+    with sqlite3.connect(R.DB_PATH) as c:
+        px = pd.read_sql(f"SELECT date, stock_id, close FROM prices WHERE date >= ? AND stock_id IN ({q})", c,
+                         params=[(R.now_tw() - timedelta(days=15)).strftime("%Y-%m-%d")] + list(ids), dtype={"stock_id": str})
+    last = px.sort_values("date").groupby("stock_id")["close"].last()
+    names = rv.sort_values("month").groupby("stock_id")["name"].last()
+    ttm = rv.pivot_table(index="month", columns="stock_id", values="revenue").sort_index().rolling(12, min_periods=12).sum()
+    out = {}
+    for sid in ids:
+        if sid not in tf or sid not in last.index or sid not in ttm.columns:
+            continue
+        eps, roe = tf[sid][0], tf[sid][1]
+        t = ttm[sid].dropna()
+        if not (eps > 0) or pd.isna(roe) or len(t) < 13:
+            continue
+        gs = [t.iloc[-1] / t.iloc[-13] - 1] + ([(t.iloc[-1] / t.iloc[-37]) ** (1 / 3) - 1] if len(t) >= 37 and t.iloc[-37] > 0 else [])
+        g = min(max(float(np.mean(gs)), -0.10), 0.40)
+        p = float(last[sid])
+        out[sid] = (names.get(sid, sid), p, eps, roe, g, dcf_value(eps, g, roe), implied_growth(p, eps, roe))
+    return out
+
+
+def value_watch(send_mail=True):
+    """每天晚上：持股股價隱含的成長率，比公司實際營收成長高太多（≥ 35 個百分點）→ 太貴，寄信（同一檔一個月一次）。"""
+    R.LONG_HOLDINGS.clear()
+    R.load_holdings()
+    ids = [s for s in R.LONG_HOLDINGS if not s.startswith("00")]
+    month = R.now_tw().strftime("%Y-%m")
+    with ldb() as c:
+        c.execute("CREATE TABLE IF NOT EXISTS hold_watch (stock_id TEXT, month TEXT, level TEXT, date TEXT, "
+                  "PRIMARY KEY(stock_id, month, level))")
+        done = set(map(tuple, c.execute("SELECT stock_id, month, level FROM hold_watch").fetchall()))
+    va = valuation(ids)
+    pct = lambda v: f"{v * 100:+.0f}%"
+    for s, v in va.items():
+        print(f"{v[0]}({s})：股價 {v[1]:.1f}，DCF 估值 {v[5]:.1f}（股價是估值的 {v[1] / v[5]:.2f} 倍）；"
+              f"股價隱含每年成長 {pct(v[6])}，實際營收成長 {pct(v[4])}")
+    hits = [(s, v) for s, v in va.items() if v[6] - v[4] >= VAL_GAP and (s, month, "💰") not in done]
+    if not hits:
+        print("估值：沒有持股太貴")
+        return
+    lines = ["你的長期持股股價太貴：市場預期的成長，遠高於公司實際的成長：", ""]
+    for s, (nm, p, eps, roe, g, v, gi) in hits:
+        lines.append(f"💰 {nm}({s})：股價 {p:.1f}，DCF 估值約 {v:.0f}（股價是估值的 {p / v:.1f} 倍）")
+        lines.append(f"   現在的股價等於相信「未來 5 年每年成長 {gi * 100:.0f}%」，但近 1～3 年營收實際每年只成長 {g * 100:.0f}%；"
+                     f"（近四季 EPS {eps:.2f}、ROE {roe * 100:.0f}%、折現率 10%）")
+        lines.append("照這三步（第 1 步改成查「成長撐不撐得住」）：")
+        lines += ["  1. 查有沒有理由相信未來成長會比過去快很多：新產品、新客戶、在手訂單、法說會展望",
+                  "  2. 有具體的理由（訂單、擴產、客戶已確認）→ 續抱，之後盯營收有沒有跟上",
+                  "  3. 只是題材、說不出數字 → 賣一半換成富邦台50(006208)；猜錯了剩下一半還跟得到，猜對了少虧一半"]
+        lines += company_refs(s, nm) + [""]
+    lines += ["回測（2019～2026，過去一年贏大盤 20% 以上的強勢股）：股價隱含成長比實際營收成長高 35 個百分點以上的，",
+              "之後半年中位數輸大盤 12～18%、七成跑輸，兩段時期都成立。估值只是假設（未來成長、折現率），太貴的股票也可能續漲一陣子，所以先查再決定。"]
+    body = "\n".join(lines)
+    print(body)
+    if send_mail and R.send_email(f"💰 持股估值太貴提醒：{'、'.join(v[0] for _, v in hits)}", body):
+        with ldb() as c:
+            c.executemany("INSERT OR IGNORE INTO hold_watch VALUES (?,?,?,?)",
+                          [(s, month, "💰", R.now_tw().strftime("%Y-%m-%d")) for s, _ in hits])
+
+
 def refresh_today():
     """晚上檢查前先把「今天」的收盤價、成交金額、加權指數收進來（不然要等隔天早上 7:10 才有，警示會晚一天）。"""
     R.init_db()
@@ -842,14 +954,14 @@ def main():
     ap.add_argument("--backfill", action="store_true")
     ap.add_argument("--no-email", action="store_true")
     ap.add_argument("--years", type=int, default=3, help="回補幾年（研究用可以填 7）")
-    ap.add_argument("--hold-watch", action="store_true", help="每天晚上：持股營收減速、相對大盤、爆量下跌檢查")
+    ap.add_argument("--hold-watch", action="store_true", help="每天晚上：持股營收減速、相對大盤、爆量下跌、估值太貴檢查")
     a = ap.parse_args()
     if a.hold_watch:
         try:
             refresh_today()
         except Exception as e:
             print(f"今天行情收不到（用資料庫裡最新的）：{e}")
-        for f in (hold_watch, price_watch, volume_watch):        # 三條都每晚檢查，觸發就馬上寄信
+        for f in (hold_watch, price_watch, volume_watch, value_watch):        # 四條都每晚檢查，觸發就馬上寄信
             try:
                 f(send_mail=not a.no_email)
             except Exception as e:
