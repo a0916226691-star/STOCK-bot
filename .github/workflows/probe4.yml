@@ -1,0 +1,20 @@
+name: Probe4
+on:
+  push:
+    branches: [probe4]
+jobs:
+  p:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: pip install -q pandas numpy requests lxml html5lib beautifulsoup4
+      - run: |
+          python - <<'P'
+          import 長線 as L
+          from datetime import datetime
+          L.R.now_tw = lambda: datetime(2026, 11, 9, 21, 0)   # 假裝週一，測試抓取
+          L.init_ldb(); L.est_collect()
+          for s in ("2383", "4763"): print(s, L.est_week(s))
+          P
