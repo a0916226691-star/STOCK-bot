@@ -506,6 +506,9 @@ def holdings_section(df, last, pct):
             if est and est.get("tp"):
                 t = est["tp"]
                 om_txt += f"\n法人目標價：中位數 {t['feMedian']:,.0f}（最低 {t['feLow']:,.0f}～最高 {t['feHigh']:,.0f}，{t['numEst']} 家，{t.get('rateDate', '')}）"
+            wk = est_week(sid)
+            if wk:
+                om_txt += "\n" + wk
             if g_an is not None:
                 om_txt += (f"\n課程判斷：股價隱含每年成長 {va[6] * 100:+.0f}%，法人預估每年成長 {g_an * 100:+.0f}% → "
                            + ("法人預估比較高，潛在低估" if g_an > va[6] else "股價隱含比較高，潛在高估") + "（參考，未回測）")
@@ -912,7 +915,8 @@ def valuation(ids):
 
 CNYES = "https://marketinfo.api.cnyes.com/mi/api/v1/financialIndicator/"
 SCEN = {"悲觀": ("feLow", 0.05), "中等": ("feMedian", 0.15), "樂觀": ("feHigh", 0.25)}   # 用哪個法人 EPS、法人預估年度之後每年成長多少（再慢慢降到 2%）
-SCEN_NOEST = {"悲觀": 0.5, "中等": 1.0, "樂觀": 1.5}                                   # 沒有法人預估：用過去實際成長 × 這個倍數
+SCEN_NOEST = {"悲觀": 0.5, "中等": 1.0, "樂觀": 1.5}                                   # 沒有法人預估：用過去實際成長 × 這個倍數（衰退中的公司倍數反過來）
+EST_MAX_AGE = 180                                                                     # 法人預估超過半年沒更新就不用
 
 
 def fetch_est(sid):
@@ -920,13 +924,15 @@ def fetch_est(sid):
     h = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.cnyes.com/"}
     out = {}
     try:
+        old = (R.now_tw() - timedelta(days=EST_MAX_AGE)).strftime("%Y-%m-%d")    # 太久沒更新的預估不用
         tp = requests.get(f"{CNYES}targetPrice/TWS:{sid}:STOCK", headers=h, timeout=20).json().get("data") or {}
-        if tp.get("numEst"):
+        if tp.get("numEst") and str(tp.get("rateDate", "")) >= old:
             out["tp"] = tp
         ep = requests.get(f"{CNYES}estimateProfit/TWS:{sid}:STOCK", params={"type": "eps"}, headers=h, timeout=20).json().get("data") or []
         this_year = R.now_tw().year
         out["eps"] = {int(x["financialYear"]): x for x in ep
-                      if x.get("numEst") and int(x["financialYear"]) > this_year - 1 and x.get("feMedian")}
+                      if x.get("numEst") and int(x["financialYear"]) > this_year - 1 and x.get("feMedian")
+                      and str(x.get("rateDate", "")) >= old}
     except Exception as e:
         print(f"{sid} 法人預估抓不到：{e}")
         return None
@@ -972,8 +978,47 @@ def scenarios(va, est):
         last = est["eps"][ys[-1]]["feMedian"]
         g_an = (last / eps) ** (1 / (ys[-1] - R.now_tw().year)) - 1 if eps > 0 and last > 0 else None
         return out, f"法人預估（FactSet 綜合 {n} 家）{ys[0]}～{ys[-1]} 年 EPS", g_an
-    out = {k: dcf_value(eps, min(max(g * m, -0.10), 0.40), roe) for k, m in SCEN_NOEST.items()}
+    out = {k: dcf_value(eps, min(max(g * (m if g >= 0 else 2 - m), -0.10), 0.40), roe) for k, m in SCEN_NOEST.items()}
     return out, "沒有法人預估，用過去實際營收成長 ×0.5／1／1.5", None
+
+
+def est_collect(send_mail=True):
+    """週一到週五每晚：抓持股的法人預估（FactSet 綜合）存起來，週六的信裡比較這週有沒有調升、調降。不寄信。"""
+    if R.now_tw().weekday() >= 5:
+        print("週末不抓法人預估")
+        return
+    R.LONG_HOLDINGS.clear()
+    R.load_holdings()
+    for sid in [s for s in R.LONG_HOLDINGS if not s.startswith("00")]:
+        est = fetch_est(sid)
+        if est:
+            save_est(sid, est)
+            t = est.get("tp") or {}
+            print(f"{sid} 法人預估：目標價中位數 {t.get('feMedian', '—')}（{t.get('numEst', 0)} 家），EPS 年度 {sorted(est.get('eps', {}))}")
+        else:
+            print(f"{sid} 沒有法人預估")
+        time.sleep(1)
+
+
+def est_week(sid):
+    """這一週（7 天內最早一筆 vs 最新一筆）目標價中位數、明年 EPS 中位數的變化。"""
+    try:
+        with ldb() as c:
+            d = pd.read_sql("SELECT date, kind, year, median, n FROM analyst_est WHERE stock_id = ? AND date >= ? ORDER BY date",
+                            c, params=(sid, (R.now_tw() - timedelta(days=7)).strftime("%Y-%m-%d")))
+    except Exception:
+        return ""
+    out = []
+    tp = d[d.kind == "tp"]
+    if len(tp) >= 2 and tp["median"].iloc[0] > 0 and tp["median"].iloc[-1] != tp["median"].iloc[0]:
+        a, b = tp["median"].iloc[0], tp["median"].iloc[-1]
+        out.append(f"目標價中位數 {a:,.0f} → {b:,.0f}（{(b / a - 1) * 100:+.1f}%）")
+    ny = R.now_tw().year + 1
+    ep = d[(d.kind == "eps") & (d.year == ny)]
+    if len(ep) >= 2 and ep["median"].iloc[0] > 0 and ep["median"].iloc[-1] != ep["median"].iloc[0]:
+        a, b = ep["median"].iloc[0], ep["median"].iloc[-1]
+        out.append(f"{ny} 年 EPS 中位數 {a:.2f} → {b:.2f}（{(b / a - 1) * 100:+.1f}%）")
+    return ("本週法人：" + "；".join(out)) if out else ("本週法人：沒有調整" if len(tp) or len(ep) else "")
 
 
 def value_watch(send_mail=True):
@@ -1041,7 +1086,7 @@ def main():
             refresh_today()
         except Exception as e:
             print(f"今天行情收不到（用資料庫裡最新的）：{e}")
-        for f in (hold_watch, price_watch, volume_watch, value_watch):        # 四條都每晚檢查，觸發就馬上寄信
+        for f in (hold_watch, price_watch, volume_watch, value_watch, est_collect):        # 四條都每晚檢查，觸發就馬上寄信
             try:
                 f(send_mail=not a.no_email)
             except Exception as e:
