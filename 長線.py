@@ -884,13 +884,29 @@ def implied_growth(price, e0, roe):
     return (lo + hi) / 2
 
 
+def ytd_eps(fin, sid):
+    """今年已公布幾季的 EPS（年初累計）年化，和去年同期比的成長。回 (說明, 年化 EPS, 成長率或 None)；今年還沒有財報回 None。"""
+    f = fin[fin["stock_id"] == sid].dropna(subset=["eps"]).sort_values("quarter")
+    if f.empty:
+        return None
+    q = f["quarter"].iloc[-1]
+    y, n = int(q[:4]), int(q[-1])
+    if y < R.now_tw().year:
+        return None
+    e = float(f["eps"].iloc[-1])
+    ly = f[f["quarter"] == f"{y - 1}Q{n}"]["eps"]
+    ge = e / float(ly.iloc[0]) - 1 if len(ly) and float(ly.iloc[0]) > 0 and e > 0 else None
+    return (f"今年前 {n} 季 EPS {e:.2f} 元年化成 {e * 4 / n:.2f} 元", e * 4 / n, ge)
+
+
 def valuation(ids):
     """每檔：(名稱, 股價, 近四季 EPS, ROE, 估計成長率, DCF 估值, 隱含成長率)。估計成長率 = 近 1 年和近 3 年營收（近 12 個月合計）年成長平均，限制在 −10%～40%。"""
     if not ids:
         return {}
     q = ",".join("?" * len(ids))
     with ldb() as c:
-        tf = ttm_fin(pd.read_sql(f"SELECT * FROM fin WHERE stock_id IN ({q})", c, params=ids, dtype={"stock_id": str}))
+        fin = pd.read_sql(f"SELECT * FROM fin WHERE stock_id IN ({q})", c, params=ids, dtype={"stock_id": str})
+        tf = ttm_fin(fin)
         rv = pd.read_sql(f"SELECT month, stock_id, name, revenue FROM revenue WHERE stock_id IN ({q})", c, params=ids, dtype={"stock_id": str})
     with sqlite3.connect(R.DB_PATH) as c:
         px = pd.read_sql(f"SELECT date, stock_id, close FROM prices WHERE date >= ? AND stock_id IN ({q})", c,
@@ -909,7 +925,7 @@ def valuation(ids):
         gs = [t.iloc[-1] / t.iloc[-13] - 1] + ([(t.iloc[-1] / t.iloc[-37]) ** (1 / 3) - 1] if len(t) >= 37 and t.iloc[-37] > 0 else [])
         g = min(max(float(np.mean(gs)), -0.10), 0.40)
         p = float(last[sid])
-        out[sid] = (names.get(sid, sid), p, eps, roe, g, dcf_value(eps, g, roe), implied_growth(p, eps, roe))
+        out[sid] = (names.get(sid, sid), p, eps, roe, g, dcf_value(eps, g, roe), implied_growth(p, eps, roe), ytd_eps(fin, sid))
     return out
 
 
@@ -969,7 +985,7 @@ def dcf_path(e0, eps_years, g_after, roe):
 def scenarios(va, est):
     """三情境估值。有法人 EPS 預估：悲觀用最低、中等用中位數、樂觀用最高，預估年度之後每年成長 5%／15%／25%；
     沒有法人預估：用過去實際營收成長 × 0.5／1／1.5（上限 40%）。回 ({情境: 估值}, 說明, 法人預估年成長或 None)。"""
-    nm, p, eps, roe, g, v, gi = va
+    nm, p, eps, roe, g, v, gi = va[:7]
     ys = sorted((est or {}).get("eps", {}))
     ys = [y for y in ys if y > R.now_tw().year]                       # 今年快結束了，從明年開始算
     if ys:
@@ -978,6 +994,13 @@ def scenarios(va, est):
         last = est["eps"][ys[-1]]["feMedian"]
         g_an = (last / eps) ** (1 / (ys[-1] - R.now_tw().year)) - 1 if eps > 0 and last > 0 else None
         return out, f"法人預估（FactSet 綜合 {n} 家）{ys[0]}～{ys[-1]} 年 EPS", g_an
+    yt = va[7] if len(va) > 7 else None
+    if yt:                                                             # 今年已公布的幾季 EPS 年化，當今年的 EPS
+        lab, e1, ge = yt
+        gg = min(max(ge if ge is not None else g, -0.10), 0.40)        # 先限制在 −10%～40%，再乘情境倍數，三個情境才分得開
+        out = {k: dcf_path(eps, [e1], gg * (m if gg >= 0 else 2 - m), roe) for k, m in SCEN_NOEST.items()}
+        why = f"EPS 年增 {ge * 100:+.0f}%" if ge is not None else f"去年同期虧損，改用營收成長 {g * 100:+.0f}%"
+        return out, f"沒有法人預估：用{lab}（{why}）×0.5／1／1.5", None
     out = {k: dcf_value(eps, min(max(g * (m if g >= 0 else 2 - m), -0.10), 0.40), roe) for k, m in SCEN_NOEST.items()}
     return out, "沒有法人預估，用過去實際營收成長 ×0.5／1／1.5", None
 
@@ -1041,7 +1064,7 @@ def value_watch(send_mail=True):
         print("估值：沒有持股太貴")
         return
     lines = ["你的長期持股股價太貴：市場預期的成長，遠高於公司實際的成長：", ""]
-    for s, (nm, p, eps, roe, g, v, gi) in hits:
+    for s, (nm, p, eps, roe, g, v, gi, *_) in hits:
         lines.append(f"💰 {nm}({s})：股價 {p:.1f}，DCF 估值約 {v:.0f}（股價是估值的 {p / v:.1f} 倍）")
         lines.append(f"   現在的股價等於相信「未來 5 年每年成長 {gi * 100:.0f}%」，但近 1～3 年營收實際每年只成長 {g * 100:.0f}%；"
                      f"（近四季 EPS {eps:.2f}、ROE {roe * 100:.0f}%、折現率 10%）")
