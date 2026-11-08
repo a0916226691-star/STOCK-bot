@@ -1,0 +1,45 @@
+name: Dip Intraday
+
+on:
+  schedule:
+    - cron: "*/30 1-5 * * 1-5"   # 台灣時間週一至週五 09:00～13:30 每 30 分鐘：大盤盤中碰到加碼檔位就先寄信（GitHub 排程可能晚 10～30 分鐘）
+  workflow_dispatch:
+    inputs:
+      sample:
+        description: "只寄一封範例信（不改狀態）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dip-state
+  cancel-in-progress: false
+
+jobs:
+  intra:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pandas numpy requests lxml
+      - name: Intraday dip check
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        run: python 加碼.py --intraday ${{ inputs.sample && '--sample' || '' }}
+      - name: Save state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "4189282+github-actions[bot]@users.noreply.github.com"
+          git add output/dip_state.json
+          if git diff --cached --quiet; then echo "No changes."; else
+            git commit -m "Save dip intraday state"
+            for i in 1 2 3; do git pull --rebase -X theirs origin ${{ github.ref_name }} && git push origin HEAD:${{ github.ref_name }} && break; git rebase --abort 2>/dev/null; sleep 10; done
+          fi

@@ -1,7 +1,8 @@
 """大跌加碼器：大盤從近 2 年高點跌到 10%、15%、20%、25%、30% 時各通知一次（分批加碼 0050 的參考）；
 大盤漲太多又遇到外資大賣時，寄「風險升高」提醒（不是叫你賣，是提醒先不要在高點追加資金）。
 
-每天早上收資料（主.py --collect-only）後呼叫 check()。有觸發才寄信，沒有就不打擾。
+盤中每 30 分鐘 intraday()：碰到新檔位先寄「盤中觸及」；每晚 20:47（長線.py --hold-watch）用當天收盤 check() 確認，
+盤中寄過的不重複寄；早上 7:10 收資料後也會再跑一次 check() 當備援。有觸發才寄信，沒有就不打擾。
 狀態存在 output/dip_state.json：同一波下跌，每個跌幅只通知一次；指數創新高後重新開始。
 
 回測依據（11/4 改用 1997～2026 加權指數，含 2000 網路泡沫、2008 金融海嘯；高點＝近 2 年最高）：
@@ -138,6 +139,11 @@ def check(send_mail=True):
         if crossed:
             st["alerted"] = [x for x in st["alerted"] if x not in crossed]
             hit = crossed
+    pre = [x for x in hit if x in st.get("intra", [])]              # 盤中已經寄過「盤中觸及」：收盤確認，不再重複寄
+    if pre:
+        st["alerted"] = sorted(set(st["alerted"]) | set(pre))
+        hit = [x for x in hit if x not in pre]
+        print(f"收盤確認：跌 {'、'.join(f'{int(x * 100)}%' for x in pre)} 盤中已通知過，不重複寄")
     if hit:
         lv = max(hit)
         st["alerted"] = sorted(set(st["alerted"]) | set(hit))
@@ -195,5 +201,107 @@ def check(send_mail=True):
         print("大跌加碼器：今天沒有要通知的")
 
 
+MIS_INDEX = "https://mis.twse.com.tw/stock/index.jsp"
+MIS_API = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+
+
+def mis_now():
+    """證交所盤中即時：加權指數、006208 現價。回 (時間, 指數, ETF 價)；不在交易時間或抓不到回 None。"""
+    s = R.requests.Session()
+    s.headers.update({"User-Agent": "Mozilla/5.0 Chrome/124.0", "Referer": MIS_INDEX})
+    try:
+        s.get(MIS_INDEX, timeout=15)
+        j = s.get(MIS_API, params={"ex_ch": f"tse_t00.tw|tse_{ETF[0]}.tw", "json": "1", "delay": "0"}, timeout=15).json()
+    except Exception as e:
+        print(f"盤中報價抓不到：{e}")
+        return None
+    q = {x.get("c"): x for x in j.get("msgArray") or []}
+    num = lambda v: R.safe_float(v) if v not in (None, "-", "") else np.nan
+    ix, et = q.get("t00", {}), q.get(ETF[0], {})
+    v = num(ix.get("z"))
+    if pd.isna(v):
+        return None
+    if ix.get("d") != R.now_tw().strftime("%Y%m%d"):
+        print(f"報價日期 {ix.get('d')} 不是今天（休市？）")
+        return None
+    p = num(et.get("z"))
+    if pd.isna(p):
+        p = num((et.get("b") or "").split("_")[0])                 # 還沒成交就用最佳買價
+    return ix.get("t", ""), float(v), (float(p) if pd.notna(p) else None)
+
+
+def intraday(send_mail=True, sample=False):
+    """盤中每 30 分鐘：大盤碰到新的加碼檔位就先寄「盤中觸及」（收盤還沒確定，要不要先買自己決定）。
+    同一檔只寄一次；當天晚上用收盤價確認，盤中寄過的不再重複寄。sample=True 只寄一封範例信、不改狀態。"""
+    with R.db() as c:
+        t = pd.read_sql("SELECT date, close FROM taiex ORDER BY date", c).set_index("date")["close"]
+    peak_d, peak = t.idxmax(), float(t.max())
+    try:
+        st = json.load(open(STATE, encoding="utf-8"))
+    except Exception:
+        st = {}
+    if st.get("peak_date") != peak_d:
+        st = {"peak_date": peak_d, "alerted": [], "risk_date": st.get("risk_date", "")}
+    now = mis_now()
+    if now is None and not sample:
+        print("不在交易時間或抓不到盤中報價，跳過")
+        return
+    tm, v, px = now if now else ("10:30（範例時間）", float(t.iloc[-1]), None)
+    px_note = "盤中"
+    if px is None:                                                   # 盤中抓不到 ETF 價（或範例信）：用上一個交易日收盤估張數
+        pdt, px = etf_price()
+        px_note = f"{pdt} 收盤，實際以下單時的價格為準" if px else ""
+    dd = v / peak - 1
+    sent = set(st["alerted"]) | set(st.get("intra", []))
+    hit = [lv for lv in LEVELS if dd <= -lv and lv not in sent]
+    print(f"盤中 {tm} 加權指數 {v:,.0f}（離高點 {dd:+.1%}）")
+    if sample:
+        nxt = [x for x in LEVELS if x not in sent]
+        if not nxt:
+            print("加碼點都用完了，沒有範例可寄")
+            return
+        hit = [nxt[0]]
+    if not hit:
+        print("盤中：沒有碰到新的加碼檔位")
+        return
+    lv = max(hit)
+    amt = sum(PORTION[x] for x in hit) * BUDGET / 10
+    done = sum(PORTION[x] for x in sent | set(hit))
+    nxt = [x for x in LEVELS if x not in sent | set(hit)]
+    if sample:
+        v_show, dd_show = peak * (1 - lv), -lv
+    else:
+        v_show, dd_show = v, dd
+    lines = (["【這是範例信，不是真的觸發】大盤真的碰到時，信會長這樣：", ""] if sample else []) + [
+        f"👉 可以先買 {ETF[1]}（{ETF[0]}） {lots(amt, px)}，大約 {amt / 1e4:,.0f} 萬" + (f"（{px_note} {px:,.2f} 元）" if px else ""),
+        "",
+        f"原因：盤中 {tm} 大盤 {v_show:,.0f} 點，離高點 {peak:,.0f} 點 {dd_show:.1%}，碰到「跌 {int(lv * 100)}%」這一檔。",
+        "⚠️ 這是盤中觸及，收盤還沒確定：收盤可能又拉回來。要不要現在就買，你自己決定；也可以等今晚的收盤確認。",
+        "今晚 21:00 左右會用收盤價確認：收盤也跌破，就不會再寄同一檔的信；收盤拉回，這一檔先保留，之後收盤跌破也不會重複寄。",
+        "買了就不用再買第二次。",
+        "",
+        f"這一波買完這檔累計 {done * BUDGET / 10 / 1e4:,.0f} 萬，加碼預備金 {BUDGET / 1e4:,.0f} 萬還剩 {(10 - done) * BUDGET / 10 / 1e4:,.0f} 萬。",
+        (f"下一檔：大盤跌 {int(nxt[0] * 100)}%（約 {peak * (1 - nxt[0]):,.0f} 點）買 {PORTION[nxt[0]] * BUDGET / 10 / 1e4:,.0f} 萬。" if nxt else "這一波的加碼點都用完了。"),
+        "",
+        "（30 年統計：跌了分批買，抱 2 年以上平均約 +20%；1 年內可能還會再跌。只是參考，不是投資建議。）"]
+    subj = f"{'【範例】' if sample else ''}⚡ 盤中觸及：大盤跌 {int(lv * 100)}%，可以先買 {ETF[1]} {lots(amt, px)}"
+    body = "\n".join(lines)
+    print("\n===== " + subj + " =====\n" + body)
+    if sample:
+        if send_mail:
+            R.send_email(subj, body)
+        return
+    st["intra"] = sorted(set(st.get("intra", [])) | set(hit))
+    if not st.get("start"):
+        st["start"] = R.now_tw().strftime("%Y-%m-%d")
+    json.dump(st, open(STATE, "w", encoding="utf-8"), ensure_ascii=False)
+    if send_mail:
+        R.send_email(subj, body)
+
+
 if __name__ == "__main__":
-    check(send_mail=False)
+    import sys
+    if "--intraday" in sys.argv:
+        intraday(send_mail="--no-email" not in sys.argv, sample="--sample" in sys.argv)
+    else:
+        check(send_mail=False)

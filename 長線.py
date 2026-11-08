@@ -1095,6 +1095,7 @@ def refresh_today():
     d = iu.module_from_spec(sp)
     sp.loader.exec_module(d)
     d.update_taiex(months=1)
+    return d
 
 
 def main():
@@ -1105,10 +1106,16 @@ def main():
     ap.add_argument("--hold-watch", action="store_true", help="每天晚上：持股營收減速、相對大盤、爆量下跌、估值太貴檢查")
     a = ap.parse_args()
     if a.hold_watch:
+        dip = None
         try:
-            refresh_today()
+            dip = refresh_today()
         except Exception as e:
             print(f"今天行情收不到（用資料庫裡最新的）：{e}")
+        if dip is not None:
+            try:                                                   # 大跌加碼器：當天晚上就用收盤價確認（盤中寄過的不重複寄）
+                dip.check(send_mail=not a.no_email)
+            except Exception as e:
+                print(f"大跌加碼器失敗：{e}")
         for f in (hold_watch, price_watch, volume_watch, value_watch, est_collect):        # 四條都每晚檢查，觸發就馬上寄信
             try:
                 f(send_mail=not a.no_email)
