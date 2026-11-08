@@ -35,6 +35,7 @@ BUDGET = 1_000_000         # 加碼預備金（使用者說 100 多萬，先用 
 ETF = ("006208", "富邦台50")   # 加碼買哪一檔
 PORTION = {0.10: 1, 0.15: 1.5, 0.20: 2, 0.25: 2.5, 0.30: 3}   # 加碼預備金分成 10 份，越跌買越多（剩下的留著）
 STATE = os.path.join(R.OUTPUT_DIR, "dip_state.json")
+# dip_state.json 的 "skipped"：通知過但沒有買的檔位（不再重寄，錢算在剩下的預備金裡，6 個月到期時一起買）
 
 
 def _roc_date(s):
@@ -147,7 +148,7 @@ def check(send_mail=True):
     if hit:
         lv = max(hit)
         st["alerted"] = sorted(set(st["alerted"]) | set(hit))
-        done = sum(PORTION[x] for x in st["alerted"])
+        done = sum(PORTION[x] for x in st["alerted"] if x not in st.get("skipped", []))
         amt = sum(PORTION[x] for x in hit) * BUDGET / 10
         pdt, px = etf_price()
         nxt = [x for x in LEVELS if x not in st["alerted"]]
@@ -165,7 +166,7 @@ def check(send_mail=True):
         st["start"] = last_d
     # 6 個月期限：第一次通知後約 125 個交易日，子彈還沒用完就提醒全部投入（30 年回測：2 年後平均 +17% → +20%，最差一樣 −19%）
     if st.get("start") and not st.get("deploy_sent") and (t.index > st["start"]).sum() >= DEPLOY_DAYS:
-        used = sum(PORTION[x] for x in st["alerted"])
+        used = sum(PORTION[x] for x in st["alerted"] if x not in st.get("skipped", []))   # 通知了但沒買的那檔，錢還在
         if used < 10:
             st["deploy_sent"] = last_d
             rest = (10 - used) * BUDGET / 10
@@ -266,7 +267,7 @@ def intraday(send_mail=True, sample=False):
         return
     lv = max(hit)
     amt = sum(PORTION[x] for x in hit) * BUDGET / 10
-    done = sum(PORTION[x] for x in sent | set(hit))
+    done = sum(PORTION[x] for x in sent | set(hit) if x not in st.get("skipped", []))
     nxt = [x for x in LEVELS if x not in sent | set(hit)]
     if sample:
         v_show, dd_show = peak * (1 - lv), -lv
