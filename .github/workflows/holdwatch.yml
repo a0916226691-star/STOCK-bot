@@ -2,7 +2,7 @@ name: Holdings Revenue Watch
 
 on:
   schedule:
-    - cron: "47 12 * * *"   # 台灣時間每天晚上 20:47：先收今天收盤資料，再檢查持股四條警示＋大跌加碼收盤確認，觸發當晚寄信
+    - cron: "47 12 * * *"   # 台灣時間每天晚上 20:47：先收今天收盤資料，再檢查持股四條警示＋大跌加碼收盤確認＋法說會公告，觸發當晚寄信
   workflow_dispatch:
 
 permissions:

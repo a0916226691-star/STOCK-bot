@@ -12,6 +12,7 @@
 import argparse
 import io
 import os
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -495,23 +496,6 @@ def holdings_section(df, last, pct):
                        f"股價隱含每年成長 {va[6] * 100:+.0f}%，實際營收成長 {va[4] * 100:+.0f}%")
             if va[6] - va[4] >= VAL_GAP:
                 flags.append("💰 估值太貴")
-            est = fetch_est(sid)
-            if est:
-                try:
-                    save_est(sid, est)
-                except Exception as e:
-                    print(f"{sid} 法人預估存不進去：{e}")
-            sc, how, g_an = scenarios(va, est)
-            om_txt += ("\n三情境估值：" + "｜".join(f"{k} {v:,.0f}" for k, v in sc.items()) + f"（股價 {va[1]:,.0f}；{how}）")
-            if est and est.get("tp"):
-                t = est["tp"]
-                om_txt += f"\n法人目標價：中位數 {t['feMedian']:,.0f}（最低 {t['feLow']:,.0f}～最高 {t['feHigh']:,.0f}，{t['numEst']} 家，{t.get('rateDate', '')}）"
-            wk = est_week(sid)
-            if wk:
-                om_txt += "\n" + wk
-            if g_an is not None:
-                om_txt += (f"\n課程判斷：股價隱含每年成長 {va[6] * 100:+.0f}%，法人預估每年成長 {g_an * 100:+.0f}% → "
-                           + ("法人預估比較高，潛在低估" if g_an > va[6] else "股價隱含比較高，潛在高估") + "（參考，未回測）")
         if flags:
             light, why, o = "🟡", "、".join(flags) + "：照三步 1.查原因 → 2.一次性的就續抱 → 3.找不到好理由就賣一半換富邦台50", 1
         else:
@@ -1044,6 +1028,162 @@ def est_week(sid):
     return ("本週法人：" + "；".join(out)) if out else ("本週法人：沒有調整" if len(tp) or len(ep) else "")
 
 
+def analyst_news(sid, name, days=7):
+    """鉅亨網這幾天跟目標價、評等有關的新聞標題（升評、降評的原因）。回 [(日期, 標題, 連結)]。"""
+    keys = ("目標價", "評等", "升評", "降評", "調升", "調降", "上修", "下修", "買進", "中立", "加碼", "減碼", "Factset", "外資", "投顧")
+    since = R.now_tw().timestamp() - days * 86400
+    out, seen = [], set()
+    for q in (f"{name} 目標價", name):
+        try:
+            items = R.requests.get("https://ess.api.cnyes.com/ess/api/v1/news/keyword", params={"q": q, "limit": 30, "page": 1},
+                                   headers=UA, timeout=15).json().get("data", {}).get("items", [])
+        except Exception as e:
+            print(f"{sid} 新聞抓不到：{e}")
+            continue
+        for it in items:
+            t = str(it.get("title", "")).replace("<mark>", "").replace("</mark>", "")
+            if it.get("newsId") in seen or (it.get("publishAt") or 0) < since or name not in t or not any(k in t for k in keys):
+                continue
+            seen.add(it.get("newsId"))
+            d = pd.Timestamp(it["publishAt"], unit="s", tz="Asia/Taipei").strftime("%m/%d")
+            out.append((d, t, f"https://news.cnyes.com/news/id/{it['newsId']}"))
+        time.sleep(1)
+    return sorted(out, reverse=True)[:6]
+
+
+def valuation_report(send_mail=True):
+    """每週六下午：持股估值週報。每檔：股價、DCF 估值、三情境、法人目標價（家數、調升／調降）、這週法人有沒有改預估、相關新聞（原因）。"""
+    init_ldb()
+    R.LONG_HOLDINGS.clear()
+    R.load_holdings()
+    ids = [s for s in R.LONG_HOLDINGS if not s.startswith("00")]
+    va_all = valuation(ids)
+    pct = lambda v: f"{v * 100:+.0f}%"
+    today = R.now_tw().strftime("%Y-%m-%d")
+    parts = [f"持股估值週報｜{today}",
+             "估值是用假設算的（成長率、折現率 10%），只當參考；寄信的 💰 估值太貴警示才是回測過的。",
+             "法人預估是 FactSet 綜合（外資＋本土券商一起算）；沒有法人預估的用今年已公布幾季的 EPS 年化。"]
+    for sid in ids:
+        va = va_all.get(sid)
+        nm = va[0] if va else sid
+        if not va:
+            parts.append(f"\n【{nm}({sid})】近四季 EPS ≤ 0 或資料不夠，沒辦法估值")
+            continue
+        est = fetch_est(sid)
+        if est:
+            try:
+                save_est(sid, est)
+            except Exception as e:
+                print(f"{sid} 法人預估存不進去：{e}")
+        sc, how, g_an = scenarios(va, est)
+        p = va[1]
+        lines = [f"\n【{nm}({sid})】股價 {p:,.1f}" + ("　💰 估值太貴（隱含成長比實際高 ≥35 點）" if va[6] - va[4] >= VAL_GAP else ""),
+                 "預估價格（三情境）：" + "｜".join(f"{k} {v:,.0f}（{v / p - 1:+.0%}）" for k, v in sc.items()),
+                 f"　依據：{how}",
+                 f"DCF 估值（用過去實際成長 {pct(va[4])}）：約 {va[5]:,.0f}；股價隱含每年成長 {pct(va[6])}"]
+        if est and est.get("tp"):
+            t = est["tp"]
+            ud = f"，最近調升 {t.get('feUp', 0)} 家、調降 {t.get('feDown', 0)} 家" if t.get("feUp") is not None else ""
+            lines.append(f"法人目標價：中位數 {t['feMedian']:,.0f}（{t['feMedian'] / p - 1:+.0%}；最低 {t['feLow']:,.0f}～最高 {t['feHigh']:,.0f}，"
+                         f"{t['numEst']} 家{ud}，更新到 {t.get('rateDate', '')}）")
+        else:
+            lines.append("法人目標價：沒有（或超過半年沒更新）")
+        if est and est.get("eps"):
+            lines.append("法人 EPS 預估（中位數）：" + "、".join(f"{y} 年 {x['feMedian']:.2f}（{x['numEst']} 家）" for y, x in sorted(est["eps"].items())))
+        wk = est_week(sid)
+        lines.append(wk if wk else "本週法人：還沒有一週的紀錄可以比（週一到週五每晚會抓）")
+        if g_an is not None:
+            lines.append(f"課程判斷：股價隱含每年成長 {pct(va[6])}，法人預估每年成長 {pct(g_an)} → "
+                         + ("法人預估比較高，潛在低估" if g_an > va[6] else "股價隱含比較高，潛在高估") + "（參考，未回測）")
+        news = analyst_news(sid, nm)
+        if news:
+            lines.append("這週的相關新聞（升評、降評的原因看這裡）：")
+            lines += [f"　{d} {t}\n　{u}" for d, t, u in news]
+        else:
+            lines.append("這週沒有跟目標價、評等有關的新聞")
+        parts += lines
+    parts.append("\n（只是參考，不是投資建議。）")
+    body = "\n".join(parts)
+    print(body)
+    if send_mail:
+        R.send_email(f"📊 持股估值週報｜{today}", body)
+
+
+IR_URL = "https://mopsov.twse.com.tw/mops/web/ajax_t100sb07_1"
+
+
+def ir_latest(sid):
+    """公開資訊觀測站：這家公司最近一場法說會。回 dict（日期、時間、地點、摘要、簡報、影音）或 None。"""
+    d = {"encodeURIComponent": 1, "step": 1, "firstin": 1, "off": 1, "queryName": "co_id", "inpuType": "co_id", "TYPEK": "all", "co_id": sid}
+    try:
+        t = R.requests.post(IR_URL, data=d, headers=UA, timeout=30).text
+    except Exception as e:
+        print(f"{sid} 法說會抓不到：{e}")
+        return None
+    txt = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " | ", t))
+    m = re.search(r"召開法人說明會日期：[ |]*(\d{3}/\d{2}/\d{2})[ |]*時間：[ |]*(\d+)[ |]*點[ |]*(\d+)", txt)
+    if not m:
+        return None
+    y, mo, dd = m.group(1).split("/")
+    date = f"{int(y) + 1911}-{mo}-{dd}"
+    pick = lambda pat: (re.search(pat, txt).group(1).strip(" |") if re.search(pat, txt) else "")
+    links = re.findall(r'(?:href|src)=["\']([^"\']+)', t)
+    pdf = [("https://mopsov.twse.com.tw" + x) for x in links if x.endswith("M001.pdf")]
+    video = [x for x in links if "irconference" in x or "youtu" in x]
+    return {"date": date, "time": f"{int(m.group(2)):02d}:{int(m.group(3)):02d}",
+            "place": pick(r"召開法人說明會地點：[ |]*([^|]+)"), "summary": pick(r"法人說明會擇要訊息：[ |]*([^|]+)"),
+            "pdf": pdf[0] if pdf else "", "video": video[0] if video else ""}
+
+
+def ir_watch(send_mail=True):
+    """每天晚上：持股有新的法說會公告、或法說會影音上傳了 → 當晚寄信（附簡報、影音連結，可以丟給 Claude 分析）。"""
+    R.LONG_HOLDINGS.clear()
+    R.load_holdings()
+    ids = [s for s in R.LONG_HOLDINGS if not s.startswith("00")]
+    with ldb() as c:
+        c.execute("CREATE TABLE IF NOT EXISTS ir_seen (stock_id TEXT PRIMARY KEY, date TEXT, video TEXT)")
+        seen = {r[0]: (r[1], r[2]) for r in c.execute("SELECT stock_id, date, video FROM ir_seen")}
+        names = dict(c.execute("SELECT stock_id, name FROM revenue GROUP BY stock_id HAVING month = MAX(month)").fetchall())
+    news, upd = [], []
+    for sid in ids:
+        ir = ir_latest(sid)
+        time.sleep(2)
+        if not ir:
+            continue
+        nm = names.get(sid, sid)
+        old = seen.get(sid)
+        print(f"{nm}({sid}) 最近法說會：{ir['date']} {ir['time']} {ir['place']}；影音 {'有' if ir['video'] else '沒有'}")
+        if old is None:                                   # 第一次記錄：只存起來，不寄（避免一次寄一堆舊的）
+            upd.append((sid, ir["date"], ir["video"]))
+            continue
+        if ir["date"] != old[0]:
+            news.append(("新的法說會", nm, sid, ir))
+        elif ir["video"] and ir["video"] != old[1]:
+            news.append(("法說會影音上傳了", nm, sid, ir))
+        upd.append((sid, ir["date"], ir["video"]))
+    with ldb() as c:
+        c.executemany("INSERT OR REPLACE INTO ir_seen VALUES (?,?,?)", upd)
+    if not news:
+        print("法說會：沒有新的")
+        return
+    lines = []
+    for kind, nm, sid, ir in news:
+        lines += [f"📅 {nm}({sid})：{kind}",
+                  f"   日期：{ir['date']} {ir['time']}　地點：{ir['place']}",
+                  f"   摘要：{ir['summary']}"]
+        if ir["pdf"]:
+            lines.append(f"   簡報：{ir['pdf']}")
+        if ir["video"]:
+            lines.append(f"   影音：{ir['video']}")
+        lines.append("")
+    lines += ["想知道法說會講了什麼（展望、毛利率、訂單、客戶），把影音或簡報連結丟給 Claude，會幫你聽完整理重點，",
+              "並對照四條警示判斷有沒有要注意的。"]
+    body = "\n".join(lines)
+    print(body)
+    if send_mail:
+        R.send_email(f"📅 持股法說會：{'、'.join(f'{x[1]}（{x[0]}）' for x in news)}", body)
+
+
 def value_watch(send_mail=True):
     """每天晚上：持股股價隱含的成長率，比公司實際營收成長高太多（≥ 35 個百分點）→ 太貴，寄信（同一檔一個月一次）。"""
     R.LONG_HOLDINGS.clear()
@@ -1103,8 +1243,12 @@ def main():
     ap.add_argument("--backfill", action="store_true")
     ap.add_argument("--no-email", action="store_true")
     ap.add_argument("--years", type=int, default=3, help="回補幾年（研究用可以填 7）")
+    ap.add_argument("--valuation", action="store_true", help="每週六下午：持股估值週報")
     ap.add_argument("--hold-watch", action="store_true", help="每天晚上：持股營收減速、相對大盤、爆量下跌、估值太貴檢查")
     a = ap.parse_args()
+    if a.valuation:
+        valuation_report(send_mail=not a.no_email)
+        return
     if a.hold_watch:
         dip = None
         try:
@@ -1116,7 +1260,7 @@ def main():
                 dip.check(send_mail=not a.no_email)
             except Exception as e:
                 print(f"大跌加碼器失敗：{e}")
-        for f in (hold_watch, price_watch, volume_watch, value_watch, est_collect):        # 四條都每晚檢查，觸發就馬上寄信
+        for f in (hold_watch, price_watch, volume_watch, value_watch, est_collect, ir_watch):        # 四條都每晚檢查，觸發就馬上寄信
             try:
                 f(send_mail=not a.no_email)
             except Exception as e:
