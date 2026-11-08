@@ -8,7 +8,7 @@
 回測依據（11/4 改用 1997～2026 加權指數，含 2000 網路泡沫、2008 金融海嘯；高點＝近 2 年最高）：
   跌 10% 那天買 → 1 年後平均 −2%（50% 賺錢）、2 年後平均 +15%（71% 賺錢）；之後平均還會再跌 18%，最多 62%
   1997～2015 年碰到時，1 年後多半是賠的；2016 年後的大多頭才幾乎都賺 → 只能當「2 年以上」的參考
-  子彈分配：遞增（1/1.5/2/2.5/3 份）兩年後最差 −19%，一次全買最差 −30%
+  子彈分配：遞增（1/1.5/2/2.5/3 份）兩年後最差 −19%，一次全買最差 −30%（11/8 起使用者每檔固定買 1 張）
   「帶量破線」「在年線上下」測過沒有可靠的差別（樣本只有 17 波），所以不用來判斷
 風險訊號（2019～2026）：指數比季線高 8% 以上、同時外資近 10 天賣超超過 811 億
   → 之後 3 個月內大跌 10% 的機率 47%（平常 19%）；照著賣反而年化少 10 個百分點以上，所以只提醒、不叫賣。
@@ -31,11 +31,9 @@ RISK_GAP = 0.08            # 指數比季線（60 日）高 8% 以上
 RISK_FOREIGN = -811.5      # 外資（上市＋上櫃）近 10 天賣超金額（億）低於這個＝歷史上賣最多的兩成
 RISK_COOLDOWN = 20         # 風險提醒至少隔 20 個交易日才再寄一次
 DEPLOY_DAYS = 125          # 第一次加碼通知後 6 個月（約 125 個交易日），剩下的子彈全部投入
-BUDGET = 1_000_000         # 加碼預備金（使用者說 100 多萬，先用 100 萬算；要改就改這裡）
 ETF = ("006208", "富邦台50")   # 加碼買哪一檔
-PORTION = {0.10: 1, 0.15: 1.5, 0.20: 2, 0.25: 2.5, 0.30: 3}   # 加碼預備金分成 10 份，越跌買越多（剩下的留著）
+LOT = 1                    # 每碰到一檔買幾張（使用者 11/8：「跌到哪檔就買一張」）
 STATE = os.path.join(R.OUTPUT_DIR, "dip_state.json")
-# dip_state.json 的 "skipped"：通知過但沒有買的檔位（不再重寄，錢算在剩下的預備金裡，6 個月到期時一起買）
 
 
 def _roc_date(s):
@@ -103,15 +101,6 @@ def etf_price(sid=None):
     return rows[-1] if rows else (None, None)
 
 
-def lots(amount, price):
-    """金額換成「幾張幾股」。"""
-    if not price:
-        return "（抓不到價格，請用現價自己換算）"
-    sh = int(amount // price)
-    z, o = divmod(sh, 1000)
-    return " ".join(x for x in (f"{z} 張" if z else "", f"{o} 股（零股）" if o else "") if x) or "不到 1 股"
-
-
 def check(send_mail=True):
     update_taiex()
     with R.db() as c:
@@ -148,36 +137,32 @@ def check(send_mail=True):
     if hit:
         lv = max(hit)
         st["alerted"] = sorted(set(st["alerted"]) | set(hit))
-        done = sum(PORTION[x] for x in st["alerted"] if x not in st.get("skipped", []))
-        amt = sum(PORTION[x] for x in hit) * BUDGET / 10
         pdt, px = etf_price()
         nxt = [x for x in LEVELS if x not in st["alerted"]]
-        lines = [f"👉 買 {ETF[1]}（{ETF[0]}） {lots(amt, px)}，大約 {amt / 1e4:,.0f} 萬"
-                 + (f"（{pdt} 收盤 {R.fmt_now(px)} 元）" if px else ""),
+        n_lot = LOT * len(hit)
+        lines = [f"👉 買 {ETF[1]}（{ETF[0]}） {n_lot} 張" + (f"（{pdt} 收盤 {R.fmt_now(px)} 元，1 張約 {px * 1000 / 1e4:,.1f} 萬）" if px else ""),
                  "",
                  f"原因：大盤從高點 {peak:,.0f} 點跌到 {last:,.0f} 點（{dd:.1%}），碰到「跌 {int(lv * 100)}%」這一檔。",
-                 f"這一波累計 {done * BUDGET / 10 / 1e4:,.0f} 萬，加碼預備金 {BUDGET / 1e4:,.0f} 萬還剩 {(10 - done) * BUDGET / 10 / 1e4:,.0f} 萬。",
-                 (f"下一檔：大盤跌 {int(nxt[0] * 100)}%（約 {peak * (1 - nxt[0]):,.0f} 點）買 {PORTION[nxt[0]] * BUDGET / 10 / 1e4:,.0f} 萬。" if nxt else "這一波的加碼點都用完了。"),
-                 f"期限：{(pd.Timestamp(st.get('start') or last_d) + pd.DateOffset(months=6)).strftime('%Y/%m/%d')} 前沒用完的，到時候會提醒你全部買進。",
+                 (f"下一檔：大盤跌 {int(nxt[0] * 100)}%（約 {peak * (1 - nxt[0]):,.0f} 點）再買 {LOT} 張。" if nxt else "這一波的加碼點都用完了。"),
                  "",
                  "（30 年統計：跌了分批買，抱 2 年以上平均約 +20%；1 年內可能還會再跌。只是參考，不是投資建議。）"]
-        mails.append((f"📉 加碼：買 {ETF[1]} {lots(amt, px)}（大盤跌 {int(lv * 100)}%，{last_d[5:7]}/{last_d[8:]}）", "\n".join(lines)))
+        mails.append((f"📉 加碼：買 {ETF[1]} {n_lot} 張（大盤跌 {int(lv * 100)}%，{last_d[5:7]}/{last_d[8:]}）", "\n".join(lines)))
     if hit and not st.get("start"):
         st["start"] = last_d
     # 6 個月期限：第一次通知後約 125 個交易日，子彈還沒用完就提醒全部投入（30 年回測：2 年後平均 +17% → +20%，最差一樣 −19%）
     if st.get("start") and not st.get("deploy_sent") and (t.index > st["start"]).sum() >= DEPLOY_DAYS:
-        used = sum(PORTION[x] for x in st["alerted"] if x not in st.get("skipped", []))   # 通知了但沒買的那檔，錢還在
-        if used < 10:
+        left = [x for x in LEVELS if x not in st["alerted"]]
+        if left:
             st["deploy_sent"] = last_d
-            rest = (10 - used) * BUDGET / 10
+            n_lot = LOT * len(left)
             pdt, px = etf_price()
-            lines = [f"👉 買 {ETF[1]}（{ETF[0]}） {lots(rest, px)}，大約 {rest / 1e4:,.0f} 萬"
-                     + (f"（{pdt} 收盤 {R.fmt_now(px)} 元）" if px else ""),
+            lines = [f"👉 買 {ETF[1]}（{ETF[0]}） {n_lot} 張" + (f"（{pdt} 收盤 {R.fmt_now(px)} 元）" if px else ""),
                      "",
-                     f"原因：從 {st['start']} 第一次加碼到現在滿 6 個月，加碼預備金還剩 {rest / 1e4:,.0f} 萬，現在全部投入，不要再等更低的點。",
+                     f"原因：從 {st['start']} 第一次加碼到現在滿 6 個月，還有 {len(left)} 檔（跌 {'、'.join(f'{int(x * 100)}%' for x in left)}）沒碰到，"
+                     f"每檔 {LOT} 張一起買，不要再等更低的點。",
                      f"加權指數：{last_d} 收 {last:,.0f} 點（離高點 {dd:+.1%}）",
                      "（30 年統計：6 個月後把剩下的全買，比一直留著現金等，2 年後平均多 3 個百分點。只是參考，不是投資建議。）"]
-            mails.append((f"💰 加碼：6 個月到了，買 {ETF[1]} {lots(rest, px)}（{last_d[5:7]}/{last_d[8:]}）", "\n".join(lines)))
+            mails.append((f"💰 加碼：6 個月到了，買 {ETF[1]} {n_lot} 張（{last_d[5:7]}/{last_d[8:]}）", "\n".join(lines)))
     risk = pd.notna(f10) and gap >= RISK_GAP and f10 <= RISK_FOREIGN
     if risk:
         days_since = (t.index > st.get("risk_date", "")).sum() if st.get("risk_date") else 999
@@ -266,26 +251,23 @@ def intraday(send_mail=True, sample=False):
         print("盤中：沒有碰到新的加碼檔位")
         return
     lv = max(hit)
-    amt = sum(PORTION[x] for x in hit) * BUDGET / 10
-    done = sum(PORTION[x] for x in sent | set(hit) if x not in st.get("skipped", []))
     nxt = [x for x in LEVELS if x not in sent | set(hit)]
     if sample:
         v_show, dd_show = peak * (1 - lv), -lv
     else:
         v_show, dd_show = v, dd
+    n_lot = LOT * len(hit)
     lines = (["【這是範例信，不是真的觸發】大盤真的碰到時，信會長這樣：", ""] if sample else []) + [
-        f"👉 可以先買 {ETF[1]}（{ETF[0]}） {lots(amt, px)}，大約 {amt / 1e4:,.0f} 萬" + (f"（{px_note} {px:,.2f} 元）" if px else ""),
+        f"👉 可以先買 {ETF[1]}（{ETF[0]}） {n_lot} 張" + (f"（{px_note} {px:,.2f} 元，1 張約 {px * 1000 / 1e4:,.1f} 萬）" if px else ""),
         "",
         f"原因：盤中 {tm} 大盤 {v_show:,.0f} 點，離高點 {peak:,.0f} 點 {dd_show:.1%}，碰到「跌 {int(lv * 100)}%」這一檔。",
         "⚠️ 這是盤中觸及，收盤還沒確定：收盤可能又拉回來。要不要現在就買，你自己決定；也可以等今晚的收盤確認。",
-        "今晚 21:00 左右會用收盤價確認：收盤也跌破，就不會再寄同一檔的信；收盤拉回，這一檔先保留，之後收盤跌破也不會重複寄。",
-        "買了就不用再買第二次。",
+        "今晚 21:00 左右會用收盤價確認：這一檔不會再寄第二次，買了就不用再買。",
         "",
-        f"這一波買完這檔累計 {done * BUDGET / 10 / 1e4:,.0f} 萬，加碼預備金 {BUDGET / 1e4:,.0f} 萬還剩 {(10 - done) * BUDGET / 10 / 1e4:,.0f} 萬。",
-        (f"下一檔：大盤跌 {int(nxt[0] * 100)}%（約 {peak * (1 - nxt[0]):,.0f} 點）買 {PORTION[nxt[0]] * BUDGET / 10 / 1e4:,.0f} 萬。" if nxt else "這一波的加碼點都用完了。"),
+        (f"下一檔：大盤跌 {int(nxt[0] * 100)}%（約 {peak * (1 - nxt[0]):,.0f} 點）再買 {LOT} 張。" if nxt else "這一波的加碼點都用完了。"),
         "",
         "（30 年統計：跌了分批買，抱 2 年以上平均約 +20%；1 年內可能還會再跌。只是參考，不是投資建議。）"]
-    subj = f"{'【範例】' if sample else ''}⚡ 盤中觸及：大盤跌 {int(lv * 100)}%，可以先買 {ETF[1]} {lots(amt, px)}"
+    subj = f"{'【範例】' if sample else ''}⚡ 盤中觸及：大盤跌 {int(lv * 100)}%，可以先買 {ETF[1]} {n_lot} 張"
     body = "\n".join(lines)
     print("\n===== " + subj + " =====\n" + body)
     if sample:
