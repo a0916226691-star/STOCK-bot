@@ -1163,6 +1163,13 @@ def ir_watch(send_mail=True):
         upd.append((sid, ir["date"], ir["video"]))
     with ldb() as c:
         c.executemany("INSERT OR REPLACE INTO ir_seen VALUES (?,?,?)", upd)
+    try:                                                      # 排進收集佇列：ir.yml 每晚抓簡報、轉逐字稿，Claude 每晚分析
+        import 法說
+        for kind, nm, sid, ir in news:
+            法說.enqueue({"sid": sid, "name": nm, "date": ir["date"], "kind": "法說", "pdf": ir["pdf"], "video": ir["video"],
+                        "summary": ir["summary"], "place": ir["place"]})
+    except Exception as e:
+        print(f"法說會排進佇列失敗：{e}")
     if not news:
         print("法說會：沒有新的")
         return
@@ -1176,8 +1183,7 @@ def ir_watch(send_mail=True):
         if ir["video"]:
             lines.append(f"   影音：{ir['video']}")
         lines.append("")
-    lines += ["想知道法說會講了什麼（展望、毛利率、訂單、客戶），把影音或簡報連結丟給 Claude，會幫你聽完整理重點，",
-              "並對照四條警示判斷有沒有要注意的。"]
+    lines += ["系統會自動抓簡報、把影音轉成逐字稿，Claude 會分析「公司說的 vs 財報實際」有沒有出入，分析好另外寄信給你。"]
     body = "\n".join(lines)
     print(body)
     if send_mail:

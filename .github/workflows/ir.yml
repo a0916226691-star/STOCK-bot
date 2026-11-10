@@ -1,0 +1,39 @@
+name: IR Capture
+
+on:
+  schedule:
+    - cron: "43 13 * * *"   # 台灣時間每晚 21:43：收集持股法說會簡報、影音逐字稿、新一季財報（給 Claude 分析）
+    - cron: "13 17 * * *"   # 01:13 再跑一次（GitHub 排程常延遲；已收集的不會重做）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ir-capture
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          sudo apt-get update -q && sudo apt-get install -y -q ffmpeg poppler-utils >/dev/null
+          pip install -q requests pandas numpy lxml faster-whisper
+      - name: Capture
+        run: python 法說.py --capture
+      - name: Save
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "4189282+github-actions[bot]@users.noreply.github.com"
+          git add ir
+          if git diff --cached --quiet; then echo "No changes."; else
+            git commit -m "IR capture"
+            for i in 1 2 3; do git pull --rebase -X theirs origin ${{ github.ref_name }} && git push origin HEAD:${{ github.ref_name }} && break; git rebase --abort 2>/dev/null; sleep 10; done
+          fi

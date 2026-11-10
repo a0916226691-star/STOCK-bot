@@ -36,7 +36,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "4189282+github-actions[bot]@users.noreply.github.com"
-          git add output/longterm.db output/tw_radar.db output/dip_state.json
+          git add output/longterm.db output/tw_radar.db output/dip_state.json ir
           if git diff --cached --quiet; then echo "No changes."; else
             git commit -m "Save holdings watch"
             for i in 1 2 3; do git pull --rebase -X theirs origin ${{ github.ref_name }} && git push origin HEAD:${{ github.ref_name }} && break; git rebase --abort 2>/dev/null; sleep 10; done
