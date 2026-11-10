@@ -53,7 +53,99 @@
   "name": "材料*-KY",
   "date": "2026-11-06",
   "kind": "法說",
-  "status": "new",
-  "added": "2026-11-11 07:00"
+  "status": "captured",
+  "added": "2026-11-11 07:00",
+  "pdf": "https://mopsov.twse.com.tw/nas/STR/476320261106M001.pdf",
+  "video": "http://irconference.twse.com.tw/4763_48_20261106_ch.MP4",
+  "summary": "本公司受邀參加國票綜合證券股份有限公司舉辦之法說 會，說明本公司之營運概況、財務及業務相關資訊。",
+  "place": "國票證券法人部會議室（台北市南京東路五段188號15樓）",
+  "files": [
+   "ir/4763/2026-11-06_簡報.txt",
+   "ir/4763/2026-11-06_逐字稿.txt"
+  ]
+ },
+ {
+  "sid": "2383",
+  "name": "台光電",
+  "date": "2026-09-30",
+  "kind": "財報",
+  "quarter": "2026Q3",
+  "files": [
+   "ir/2383/財報_2026Q3.csv"
+  ],
+  "status": "captured",
+  "added": "2026-11-11 07:15"
+ },
+ {
+  "sid": "2368",
+  "name": "金像電",
+  "date": "2026-06-30",
+  "kind": "財報",
+  "quarter": "2026Q2",
+  "files": [
+   "ir/2368/財報_2026Q2.csv"
+  ],
+  "status": "captured",
+  "added": "2026-11-11 07:15"
+ },
+ {
+  "sid": "6197",
+  "name": "佳必琪",
+  "date": "2026-09-30",
+  "kind": "財報",
+  "quarter": "2026Q3",
+  "files": [
+   "ir/6197/財報_2026Q3.csv"
+  ],
+  "status": "captured",
+  "added": "2026-11-11 07:15"
+ },
+ {
+  "sid": "3293",
+  "name": "鈊象",
+  "date": "2026-09-30",
+  "kind": "財報",
+  "quarter": "2026Q3",
+  "files": [
+   "ir/3293/財報_2026Q3.csv"
+  ],
+  "status": "captured",
+  "added": "2026-11-11 07:15"
+ },
+ {
+  "sid": "4763",
+  "name": "材料*-KY",
+  "date": "2026-06-30",
+  "kind": "財報",
+  "quarter": "2026Q2",
+  "files": [
+   "ir/4763/財報_2026Q2.csv"
+  ],
+  "status": "captured",
+  "added": "2026-11-11 07:15"
+ },
+ {
+  "sid": "1808",
+  "name": "潤隆",
+  "date": "2026-09-30",
+  "kind": "財報",
+  "quarter": "2026Q3",
+  "files": [
+   "ir/1808/財報_2026Q3.csv"
+  ],
+  "status": "captured",
+  "added": "2026-11-11 07:15"
+ },
+ {
+  "sid": "1503",
+  "name": "士電",
+  "date": "2026-06-30",
+  "kind": "財報",
+  "quarter": "2026Q2",
+  "files": [
+   "ir/1503/財報_2026Q2.csv"
+  ],
+  "status": "captured",
+  "added": "2026-11-11 07:16"
  }
 ]
