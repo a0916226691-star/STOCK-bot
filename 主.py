@@ -2874,9 +2874,10 @@ def run(send_mail=True, collect_only=False):
         upsert("prices", quotes, QUOTE_COLS)
     for frame in collect_inst():
         upsert("institutional", frame, INST_COLS)
-    holders = collect_holders()
-    if not holders.empty:
-        upsert("holders", holders, HOLDER_COLS)
+    if not collect_only:                                   # 千張大戶只有舊版短線雷達用；11/10 使用者說不用了，每天只收資料時不再抓
+        holders = collect_holders()
+        if not holders.empty:
+            upsert("holders", holders, HOLDER_COLS)
     margin = collect_margin()
     if not margin.empty:
         upsert("margin", margin, MARGIN_COLS)
