@@ -1,0 +1,20 @@
+name: Probe4
+on:
+  push:
+    branches: [probe4]
+permissions:
+  contents: write
+jobs:
+  p:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get install -y -q poppler-utils >/dev/null
+          mkdir -p out
+          curl -sSL -A "Mozilla/5.0" -o out/ir.pdf "https://mopsov.twse.com.tw/nas/STR/238320261102M001.pdf"
+          file out/ir.pdf; pdfinfo out/ir.pdf | head -5
+          pdftotext -layout out/ir.pdf out/ir.txt; wc -c out/ir.txt
+          pdftoppm -r 60 -png out/ir.pdf out/p
+          git config user.name bot && git config user.email bot@x
+          git add -f out && git commit -qm pdf && git push -f origin HEAD:probe4
