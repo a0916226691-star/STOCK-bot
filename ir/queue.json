@@ -53,7 +53,7 @@
   "name": "材料*-KY",
   "date": "2026-11-06",
   "kind": "法說",
-  "status": "captured",
+  "status": "analyzed",
   "added": "2026-11-11 07:00",
   "pdf": "https://mopsov.twse.com.tw/nas/STR/476320261106M001.pdf",
   "video": "http://irconference.twse.com.tw/4763_48_20261106_ch.MP4",
@@ -61,7 +61,8 @@
   "place": "國票證券法人部會議室（台北市南京東路五段188號15樓）",
   "files": [
    "ir/4763/2026-11-06_簡報.txt",
-   "ir/4763/2026-11-06_逐字稿.txt"
+   "ir/4763/2026-11-06_逐字稿.txt",
+   "ir/4763/2026-11-06_分析.md"
   ]
  },
  {
@@ -71,9 +72,10 @@
   "kind": "財報",
   "quarter": "2026Q3",
   "files": [
-   "ir/2383/財報_2026Q3.csv"
+   "ir/2383/財報_2026Q3.csv",
+   "ir/2383/2026-09-30_分析.md"
   ],
-  "status": "captured",
+  "status": "analyzed",
   "added": "2026-11-11 07:15"
  },
  {
@@ -96,9 +98,10 @@
   "kind": "財報",
   "quarter": "2026Q3",
   "files": [
-   "ir/6197/財報_2026Q3.csv"
+   "ir/6197/財報_2026Q3.csv",
+   "ir/6197/2026-09-30_分析.md"
   ],
-  "status": "captured",
+  "status": "analyzed",
   "added": "2026-11-11 07:15"
  },
  {
@@ -108,9 +111,10 @@
   "kind": "財報",
   "quarter": "2026Q3",
   "files": [
-   "ir/3293/財報_2026Q3.csv"
+   "ir/3293/財報_2026Q3.csv",
+   "ir/3293/2026-09-30_分析.md"
   ],
-  "status": "captured",
+  "status": "analyzed",
   "added": "2026-11-11 07:15"
  },
  {
@@ -133,9 +137,10 @@
   "kind": "財報",
   "quarter": "2026Q3",
   "files": [
-   "ir/1808/財報_2026Q3.csv"
+   "ir/1808/財報_2026Q3.csv",
+   "ir/1808/2026-09-30_分析.md"
   ],
-  "status": "captured",
+  "status": "analyzed",
   "added": "2026-11-11 07:15"
  },
  {
