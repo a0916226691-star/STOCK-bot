@@ -1,0 +1,25 @@
+name: Probe5
+on:
+  push:
+    branches: [probe5]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  p:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1, 2]
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install requests && python tools/cf_fetch.py
+        env:
+          PART: ${{ matrix.part }}
+          NP: 3
+      - if: always()
+        run: |
+          git config user.name bot && git config user.email bot@x
+          git add -f output/cf_${{ matrix.part }}.csv && git commit -m "cf ${{ matrix.part }}" && for i in 1 2 3 4 5; do git pull --rebase && git push && break; sleep 20; done

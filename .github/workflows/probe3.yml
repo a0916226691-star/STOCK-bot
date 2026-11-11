@@ -1,7 +1,7 @@
 name: Probe3
 on:
   push:
-    branches: [probe3]
+    branches: [probe3-x]
   workflow_dispatch:
 permissions:
   contents: write
