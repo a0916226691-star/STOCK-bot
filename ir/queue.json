@@ -192,9 +192,10 @@
   "kind": "財報",
   "quarter": "2026Q3",
   "files": [
-   "ir/4763/財報_2026Q3.csv"
+   "ir/4763/財報_2026Q3.csv",
+   "ir/4763/2026-09-30_分析.md"
   ],
-  "status": "captured",
+  "status": "analyzed",
   "added": "2026-11-14 04:40"
  }
 ]
