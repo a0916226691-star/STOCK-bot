@@ -437,11 +437,11 @@ def fetch_twse_margin(d):
                  {"response": "json", "date": d, "selectType": "STOCK"}, timeout=20)
     if j.get("stat") != "OK":
         return empty
-    fields, raw = find_table(j, ["股票代號"])
-    id_name = "股票代號"
-    if not fields:
-        fields, raw = find_table(j, ["證券代號"])
-        id_name = "證券代號"
+    fields, raw, id_name = None, None, None
+    for id_name in ("代號", "股票代號", "證券代號"):          # 11/15 發現證交所欄位名稱是「代號」，舊程式只認另外兩個，上市融資一直沒收到
+        fields, raw = find_table(j, [id_name])
+        if fields:
+            break
     if not fields:
         print("MI_MARGN 找不到資料表，API 格式可能改了；回應欄位：", [k for k in j.keys()])
         return empty
