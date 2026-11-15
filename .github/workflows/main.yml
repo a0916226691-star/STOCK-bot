@@ -9,10 +9,6 @@ on:
         description: "回補最近幾天的上市歷史資料（第一次建議填 45；平常留 0）"
         required: false
         default: "0"
-      backfill_qfii:
-        description: "回補外資持股比例幾個日曆天（長線追蹤用，第一次填 365；平常留 0）"
-        required: false
-        default: "0"
       backfill_monthly:
         description: "回補 3 年月 K：填 TWSE（上市）或 TPEx（上櫃），一次一個；平常留空"
         required: false
@@ -22,7 +18,7 @@ on:
         required: false
         default: "0"
       backfill_prices:
-        description: "只回補上市股價（含高低價）幾個日曆天，並重算支撐掃描成績（例：365）；平常留 0"
+        description: "只回補上市股價（含高低價）幾個日曆天（例：365）；平常留 0"
         required: false
         default: "0"
 
@@ -61,7 +57,6 @@ jobs:
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
           BACKFILL_DAYS: ${{ github.event.inputs.backfill_days }}
           BACKFILL_PRICES: ${{ github.event.inputs.backfill_prices }}
-          BACKFILL_QFII: ${{ github.event.inputs.backfill_qfii }}
           BACKFILL_TPEX: ${{ github.event.inputs.backfill_tpex }}
           BACKFILL_MONTHLY: ${{ github.event.inputs.backfill_monthly }}
         run: |
@@ -73,10 +68,6 @@ jobs:
             python 主.py --collect-only --backfill-tpex "$BACKFILL_TPEX"
             exit 0
           fi
-          if [ -n "$BACKFILL_QFII" ] && [ "$BACKFILL_QFII" != "0" ]; then
-            python 主.py --collect-only --backfill-qfii "$BACKFILL_QFII"
-            exit 0
-          fi
           if [ -n "$BACKFILL_PRICES" ] && [ "$BACKFILL_PRICES" != "0" ]; then
             python 主.py --collect-only --backfill-prices "$BACKFILL_PRICES"
             exit 0
@@ -84,18 +75,9 @@ jobs:
           if [ -n "$BACKFILL_DAYS" ] && [ "$BACKFILL_DAYS" != "0" ]; then
             python 主.py --backfill "$BACKFILL_DAYS"
           else
-            # 11/3 起不寄短線信（5 年回測贏不了 0050），每天只收資料給長線用（股價、月 K、外資持股、歷史檔）
+            # 每天只收資料給長線用（股價、法人、融資、千張大戶、月 K、歷史檔），再跑大跌加碼器；短線雷達 11/15 起全部拿掉
             python 主.py --collect-only
           fi
-
-      # 低檔止跌掃描（谷底型）暫停：跟「法人確定進場才買」的風格不同。低檔.py 保留，要恢復就把下面幾行的 # 拿掉
-      # - name: Run low-zone scan
-      #   env:
-      #     GMAIL_USER: ${{ secrets.GMAIL_USER }}
-      #     GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-      #     RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
-      #   run: |
-      #     python 低檔.py
 
       - name: Check generated CSV files
         if: always()
