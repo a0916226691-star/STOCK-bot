@@ -2850,15 +2850,20 @@ def send_email(subject, body):
         return False
     msg = MIMEText(body, "plain", "utf-8")
     msg["From"], msg["To"], msg["Subject"] = user, to, subject
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
-            s.login(user, pwd)
-            s.send_message(msg)
-    except Exception as e:
-        print(f"寄信失敗：{e}")
-        return False
-    print("Email 已寄出")
-    return True
+    for i in range(3):                                     # Gmail 偶爾連線失敗：重試 3 次，警示才不會漏寄
+        try:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
+                s.login(user, pwd)
+                s.send_message(msg)
+            print("Email 已寄出")
+            return True
+        except smtplib.SMTPAuthenticationError as e:       # 密碼錯了重試也沒用
+            print(f"寄信失敗（Gmail 帳號或應用程式密碼錯誤）：{e}")
+            return False
+        except Exception as e:
+            print(f"寄信失敗（第 {i + 1} 次）：{e}")
+            time.sleep(20 * (i + 1))
+    return False
 
 
 # ───────────────────────── 主流程 ─────────────────────────
@@ -2878,10 +2883,11 @@ def run(send_mail=True, collect_only=False):
         holders = collect_holders()
         if not holders.empty:
             upsert("holders", holders, HOLDER_COLS)
-    margin = collect_margin()
-    if not margin.empty:
-        upsert("margin", margin, MARGIN_COLS)
-    collect_qfii()
+    if not collect_only:                                   # 融資、外資持股只有舊版短線雷達用；11/15 檢查後，每天只收資料時不再抓（資料庫也省空間）
+        margin = collect_margin()
+        if not margin.empty:
+            upsert("margin", margin, MARGIN_COLS)
+        collect_qfii()
     try:
         update_monthly_and_prune()
     except Exception as e:
