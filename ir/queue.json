@@ -197,5 +197,17 @@
   ],
   "status": "analyzed",
   "added": "2026-11-14 04:40"
+ },
+ {
+  "sid": "2383",
+  "name": "台光電",
+  "date": "2026-11-17",
+  "kind": "法說",
+  "pdf": "https://mopsov.twse.com.tw/nas/STR/238320261102M001.pdf",
+  "video": "",
+  "summary": "本公司受邀參加中信里昂證券線上法人說明會，說明本公司營運概況。",
+  "place": "線上會議",
+  "status": "new",
+  "added": "2026-11-17 05:03"
  }
 ]
