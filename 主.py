@@ -893,6 +893,30 @@ def fmt_now(c):
     return t
 
 
+# ───────────────────────── 寄信 ─────────────────────────
+def send_email(subject, body):
+    user, pwd, to = (os.getenv(k) for k in ("GMAIL_USER", "GMAIL_APP_PASSWORD", "RECIPIENT_EMAIL"))
+    if not (user and pwd and to):
+        print("未設定 Gmail 環境變數，略過寄信")
+        return False
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["From"], msg["To"], msg["Subject"] = user, to, subject
+    for i in range(3):                                     # Gmail 偶爾連線失敗：重試 3 次，警示才不會漏寄
+        try:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
+                s.login(user, pwd)
+                s.send_message(msg)
+            print("Email 已寄出")
+            return True
+        except smtplib.SMTPAuthenticationError as e:       # 密碼錯了重試也沒用
+            print(f"寄信失敗（Gmail 帳號或應用程式密碼錯誤）：{e}")
+            return False
+        except Exception as e:
+            print(f"寄信失敗（第 {i + 1} 次）：{e}")
+            time.sleep(20 * (i + 1))
+    return False
+
+
 # ───────────────────────── 主流程 ─────────────────────────
 def run(send_mail=True, collect_only=True):
     """每天收資料：上市上櫃股價、三大法人、融資融券、集保千張大戶（每週），更新月 K、存歷史檔、清理舊資料，最後跑大跌加碼器。
