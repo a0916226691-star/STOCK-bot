@@ -1,0 +1,13 @@
+name: Probe4
+on:
+  push:
+    branches: [probe4]
+jobs:
+  p:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: pip install -q pandas numpy requests lxml
+      - run: python 長線.py --valuation --no-email
