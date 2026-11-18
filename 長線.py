@@ -1051,8 +1051,29 @@ def analyst_news(sid, name, days=7):
     return sorted(out, reverse=True)[:6]
 
 
+def pe_lines(va, est, sc):
+    """本益比對照：現在（近四季 EPS）、用法人預估 EPS 算的預估本益比、法人目標價隱含的本益比、三情境估值隱含的本益比。"""
+    nm, p, eps = va[0], va[1], va[2]
+    out = [f"本益比：近四季 EPS {eps:.2f} 元 → 現在 {p / eps:.1f} 倍" if eps > 0 else "本益比：近四季虧損，不適用"]
+    eps_y = {y: x for y, x in (est or {}).get("eps", {}).items() if x.get("feMedian", 0) > 0}
+    if eps_y:
+        ny = min([y for y in eps_y if y > R.now_tw().year] or [max(eps_y)])   # 明年；沒有明年就用最近一年
+        e = eps_y[ny]
+        out.append(f"　用法人 {ny} 年 EPS（中位數 {e['feMedian']:.2f}，最低 {e['feLow']:.2f}～最高 {e['feHigh']:.2f}）算："
+                   f"預估本益比 {p / e['feMedian']:.1f} 倍（{p / e['feHigh']:.1f}～{p / e['feLow']:.1f} 倍）")
+        t = (est or {}).get("tp")
+        if t:
+            out.append(f"　法人目標價中位數 {t['feMedian']:,.0f} ÷ {ny} 年 EPS ＝ 法人給的本益比 {t['feMedian'] / e['feMedian']:.1f} 倍"
+                       f"（現在市場給 {p / e['feMedian']:.1f} 倍）")
+        out.append("　三情境估值換算本益比（÷ " + f"{ny} 年 EPS 中位數）：" +
+                   "｜".join(f"{k} {v / e['feMedian']:.1f} 倍" for k, v in sc.items()))
+    elif eps > 0:
+        out.append("　沒有法人 EPS 預估；三情境估值換算本益比（÷ 近四季 EPS）：" + "｜".join(f"{k} {v / eps:.1f} 倍" for k, v in sc.items()))
+    return out
+
+
 def valuation_report(send_mail=True):
-    """每週六下午：持股估值週報。每檔：股價、DCF 估值、三情境、法人目標價（家數、調升／調降）、這週法人有沒有改預估、相關新聞（原因）。"""
+    """每週六下午：持股估值週報。每檔：股價、DCF 估值、三情境、法人目標價（家數、調升／調降）、本益比對照（現在／法人預估／法人目標價隱含）、這週法人有沒有改預估、相關新聞（原因）。"""
     init_ldb()
     R.LONG_HOLDINGS.clear()
     R.load_holdings()
@@ -1090,6 +1111,7 @@ def valuation_report(send_mail=True):
             lines.append("法人目標價：沒有（或超過半年沒更新）")
         if est and est.get("eps"):
             lines.append("法人 EPS 預估（中位數）：" + "、".join(f"{y} 年 {x['feMedian']:.2f}（{x['numEst']} 家）" for y, x in sorted(est["eps"].items())))
+        lines += pe_lines(va, est, sc)
         wk = est_week(sid)
         lines.append(wk if wk else "本週法人：還沒有一週的紀錄可以比（週一到週五每晚會抓）")
         if g_an is not None:
