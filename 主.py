@@ -500,13 +500,19 @@ def collect_margin():
     try:
         with db() as conn:
             have = {r[0] for r in conn.execute("SELECT DISTINCT date FROM margin WHERE market='TWSE'")}
-        got = 0
+        got, errs = 0, 0
         for d in recent_trading_days(10):
-            if got >= 6:
+            if got >= 6 or errs >= 3:
                 break
             if fmt_date(d) in have:
                 continue
-            m = fetch_twse_margin(d)
+            try:                                   # 11/22：某一天被擋就整個中斷，改成跳過那天繼續抓前幾天
+                m = fetch_twse_margin(d)
+            except Exception as e:
+                print(f"TWSE 融資融券 {d} 失敗：{e}")
+                errs += 1
+                time.sleep(3)
+                continue
             if not m.empty:
                 frames.append(m)
                 got += 1
@@ -565,17 +571,31 @@ def collect_holders():
 
 
 def collect_inst():
+    """上市法人：補抓最近 10 個平日裡還沒存過的日子（最多 5 天）。
+    11/22 修正：以前只抓最新一天、遇到錯誤就停，某天被擋（11/20 早上）那天就永遠缺（11/19 上市法人漏掉）。"""
     frames = []
-    for d in recent_trading_days(8):
+    try:
+        with db() as conn:
+            have = {r[0] for r in conn.execute("SELECT DISTINCT date FROM institutional WHERE market='TWSE'")}
+    except Exception:
+        have = set()
+    got, errs = 0, 0
+    for d in recent_trading_days(10):
+        if got >= 5 or errs >= 3:
+            break
+        if fmt_date(d) in have:
+            continue
         try:
             tw = fetch_twse_inst(d)
         except Exception as e:
             print(f"TWSE 法人 {d} 失敗：{e}")
-            break
+            errs += 1
+            time.sleep(3)
+            continue
         if not tw.empty:
             print(f"TWSE 法人 {d}：{len(tw)} 檔")
             frames.append(tw)
-            break
+            got += 1
         time.sleep(1)
     try:
         tp = fetch_tpex_inst()
