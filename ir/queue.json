@@ -226,5 +226,17 @@
   ],
   "status": "analyzed",
   "added": "2026-11-17 07:04"
+ },
+ {
+  "sid": "2383",
+  "name": "台光電",
+  "date": "2026-11-24",
+  "kind": "法說",
+  "pdf": "https://mopsov.twse.com.tw/nas/STR/238320261102M001.pdf",
+  "video": "",
+  "summary": "本公司受邀參加Morgan Stanley舉辦之法人說明會，說明本公司之營運概況。",
+  "place": "台北",
+  "status": "new",
+  "added": "2026-11-24 06:40"
  }
 ]
