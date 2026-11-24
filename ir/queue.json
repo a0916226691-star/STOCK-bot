@@ -236,7 +236,10 @@
   "video": "",
   "summary": "本公司受邀參加Morgan Stanley舉辦之法人說明會，說明本公司之營運概況。",
   "place": "台北",
-  "status": "new",
-  "added": "2026-11-24 06:40"
+  "status": "captured",
+  "added": "2026-11-24 06:40",
+  "files": [
+   "ir/2383/2026-11-24_簡報.txt"
+  ]
  }
 ]
